@@ -1,0 +1,11 @@
+{
+    "display_name": "Story Tracker",
+    "loading_order": 19,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "User",
+    "version": "1.0.0",
+    "description": "Tracks time, location, character positions, and recent events to maintain narrative consistency."
+}
