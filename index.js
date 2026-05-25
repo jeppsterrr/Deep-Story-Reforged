@@ -46,9 +46,14 @@ var settings = {
     autoUpdateInterval: 3,
     injectToContext: true,
     showHistory: true,
-    showCityCountry: false
+    showCityCountry: false,
+    // --- Connection profile support ---
+    useConnectionProfile: false, // master toggle: route Story Tracker analysis through a separate profile
+    connectionProfile: "",       // name of the profile to use (empty = current/main profile)
+    _restoreProfile: ""          // internal: profile to restore if an analysis was interrupted by a reload
 };
 var extSettings = null, saveFn = null, scriptModule = null, genQuiet = null, translateFn = null;
+var runSlash = null; // executeSlashCommandsWithOptions — used to switch connection profiles
 var storyData = null; 
 var msgCounter = 0;
 var busy = false;
@@ -60,6 +65,13 @@ jQuery(async function () {
         extSettings = m.extension_settings; saveFn = m.saveSettingsDebounced;
         scriptModule = await import("../../../../script.js");
         if (typeof scriptModule.generateQuietPrompt === "function") genQuiet = scriptModule.generateQuietPrompt;
+
+        // Optional: slash-command runner, needed to switch connection profiles.
+        // Wrapped in its own try so a path change in ST never breaks the whole extension.
+        try {
+            var sc = await import("../../../slash-commands.js");
+            if (typeof sc.executeSlashCommandsWithOptions === "function") runSlash = sc.executeSlashCommandsWithOptions;
+        } catch (e) { console.warn("[Story Tracker] slash-commands.js not available, connection profile switching disabled.", e); }
         
         await initTranslation();
         loadSettings();
@@ -69,6 +81,11 @@ jQuery(async function () {
         buildSettingsPanel();
         buildChatButton();
         bindEvents();
+
+        // Safety net: restore the main profile if a previous analysis was interrupted
+        // by a page reload. Runs after a short delay so Connection Manager finishes loading.
+        setTimeout(function () { recoverProfileIfNeeded(); }, 1500);
+
         console.log("[Story Tracker] Loaded!");
     } catch (e) { console.error("[Story Tracker] Init error:", e); }
 });
@@ -115,6 +132,33 @@ function saveStoryData() {
     if (typeof scriptModule.saveMetadataDebounced === "function") scriptModule.saveMetadataDebounced();
 }
 
+// Fills the settings dropdown with available connection profiles.
+function populateProfileDropdown() {
+    var $sel = $("#st-s-profile");
+    if (!$sel.length) return;
+    var profiles = getProfileList();
+    var html = '<option value="">— Use current / main profile —</option>';
+    if (profiles.length === 0) {
+        html += '<option value="" disabled>(No profiles found — install/enable Connection Profiles)</option>';
+    } else {
+        profiles.forEach(function (p) {
+            var name = p && p.name ? p.name : "";
+            if (!name) return;
+            html += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
+        });
+    }
+    $sel.html(html);
+    // Restore the saved selection if it still exists.
+    var saved = settings.connectionProfile || "";
+    if (saved && profiles.some(function (p) { return p.name === saved; })) {
+        $sel.val(saved);
+    } else if (saved && profiles.length > 0) {
+        // Saved profile no longer exists — keep the value so the user notices, but fall back visually.
+        $sel.val("");
+    }
+}
+
+
 // --- LLM Logic ---
 function buildPrevStateText() {
     if (!storyData || !storyData._initialized) return "This is the INITIAL setup. Deduce starting parameters from the intro message.";
@@ -135,18 +179,117 @@ function buildPrevStateText() {
     return s + "(Update the time, check if location/weather changed, update character positions based on what they just did).";
 }
 
+// --- Connection Profile Support ---
+// Returns the array of saved connection profiles, or [] if Connection Manager isn't active.
+function getProfileList() {
+    try {
+        var cm = extSettings && extSettings.connectionManager;
+        if (!cm || !Array.isArray(cm.profiles)) return [];
+        return cm.profiles;
+    } catch (e) { return []; }
+}
+
+// Returns the name of the currently selected connection profile, or "" if none/unavailable.
+function getCurrentProfileName() {
+    try {
+        var cm = extSettings && extSettings.connectionManager;
+        if (!cm) return "";
+        var sel = cm.selectedProfile;
+        if (!sel) return "";
+        var found = (cm.profiles || []).find(function (p) { return p.id === sel; });
+        return found ? (found.name || "") : "";
+    } catch (e) { return ""; }
+}
+
+// True only if we actually can and should route analysis through a different profile.
+function shouldSwitchProfile() {
+    if (!settings.useConnectionProfile) return false;
+    if (!runSlash) return false;                       // slash runner not available
+    var target = (settings.connectionProfile || "").trim();
+    if (!target) return false;                         // no target chosen -> use main profile
+    if (getProfileList().length === 0) return false;   // Connection Manager not installed/enabled
+    var current = getCurrentProfileName();
+    if (current && current === target) return false;   // already on the target -> nothing to do
+    return true;
+}
+
+// Switch to a named profile via the official slash command and wait for it to settle.
+async function switchProfile(name) {
+    if (!runSlash || !name) return false;
+    try {
+        // Quote the name so profiles with spaces work correctly.
+        await runSlash('/profile "' + String(name).replace(/"/g, '\\"') + '"');
+        // Small settle delay: switching a profile updates API/model/preset asynchronously.
+        await new Promise(function (r) { setTimeout(r, 150); });
+        return true;
+    } catch (e) {
+        console.warn("[Story Tracker] Failed to switch to profile '" + name + "':", e);
+        return false;
+    }
+}
+
+// Run an async LLM task on the configured profile, then always restore the original profile.
+// If switching isn't needed/possible, the task simply runs on the current (main) profile.
+async function withConnectionProfile(task) {
+    if (!shouldSwitchProfile()) {
+        return await task();
+    }
+    var original = getCurrentProfileName();
+    var target = (settings.connectionProfile || "").trim();
+    var switched = false;
+    try {
+        switched = await switchProfile(target);
+        if (!switched) console.warn("[Story Tracker] Profile switch failed; running analysis on current profile.");
+        // Persist which profile we must return to, in case the page reloads mid-analysis
+        // (the finally block below would not run in that scenario).
+        if (switched && original && original !== target) {
+            settings._restoreProfile = original;
+            save();
+        }
+        return await task();
+    } finally {
+        // Always restore the user's main profile so the chat generation is never affected.
+        if (switched && original && original !== target) {
+            await switchProfile(original);
+        }
+        // Clear the recovery marker — restoration (or the attempt) is done.
+        if (settings._restoreProfile) { settings._restoreProfile = ""; save(); }
+    }
+}
+
+// Safety net: if a previous analysis was interrupted (e.g. page reload) while on the
+// tracker's profile, the marker survives in settings. On load, quietly switch back.
+async function recoverProfileIfNeeded() {
+    var pending = settings._restoreProfile;
+    if (!pending || !runSlash) return;
+    try {
+        var current = getCurrentProfileName();
+        if (current !== pending && getProfileList().some(function (p) { return p.name === pending; })) {
+            console.log("[Story Tracker] Recovering interrupted profile switch → restoring '" + pending + "'.");
+            await switchProfile(pending);
+        }
+    } catch (e) {
+        console.warn("[Story Tracker] Profile recovery failed:", e);
+    } finally {
+        settings._restoreProfile = ""; save();
+    }
+}
+
+
 async function doLLMUpdate() {
     if (!genQuiet) throw new Error("LLM generation not available.");
-    
+
     // Untranslate before sending to LLM for context accuracy
     let wasTr = storyData._translated;
     if (wasTr) untranslateData();
 
     var prompt = UPDATE_PROMPT.replace("{{PREVIOUS_STATE}}", buildPrevStateText());
-    
+
     console.log("[Story Tracker] Analyzing scene...");
-    var raw = await genQuiet(prompt);
-    
+    // Route the scene analysis through the configured connection profile (if any),
+    // then automatically restore the user's main profile when done.
+    var raw = await withConnectionProfile(function () { return genQuiet(prompt); });
+
     // Parse JSON safely
     var data = null;
     try { data = JSON.parse(raw); } 
@@ -178,7 +321,7 @@ async function doLLMUpdate() {
         try {
             console.log("[Story Tracker] City/country missing — running fallback inference...");
             var ccPrompt = CITY_COUNTRY_PROMPT.replace("{{LOCATION}}", storyData._origLocation || storyData.location || "Unknown");
-            var ccRaw = await genQuiet(ccPrompt);
+            var ccRaw = await withConnectionProfile(function () { return genQuiet(ccPrompt); });
             var ccData = null;
             try { ccData = JSON.parse(ccRaw); }
             catch(e) { var cm = ccRaw.match(/\{[\s\S]*?\}/); if (cm) { try { ccData = JSON.parse(cm[0]); } catch(ex){} } }
@@ -684,6 +827,14 @@ function buildSettingsPanel() {
     h += '<div class="da-srow"><label><small>Update every N msgs: <span id="st-interval-val"></span></small></label><input type="range" id="st-s-interval" min="1" max="20" step="1"></div>';
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-inject"><span>Inject Context into Prompt (Reduces Amnesia)</span></label></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-cityctry"><span>Show City / Country (LLM infers or invents)</span></label></div>';
+
+    // --- Connection Profile section ---
+    h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-useprofile"><span>Use a separate Connection Profile for analysis</span></label></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">Run Story Tracker\'s scene analysis on a cheaper model, then switch back to your main profile automatically. Requires the built-in <b>Connection Profiles</b> extension.</small></div>';
+    h += '<div class="da-srow" id="st-profile-row"><label><small>Analysis Profile:</small></label>';
+    h += '<div style="display:flex;gap:5px;align-items:center;"><select id="st-s-profile" class="text_pole" style="flex:1"></select>';
+    h += '<button class="menu_button" id="st-s-profile-refresh" title="Refresh profile list" style="flex:0 0 auto;"><i class="fa-solid fa-rotate"></i></button></div></div>';
+
     h += '<div class="da-srow da-srow-btns"><input type="button" class="menu_button" id="st-s-open" value="Open Tracker"></div></div></div>';
     $c.append(h);
 
@@ -719,6 +870,22 @@ function buildSettingsPanel() {
     
     $("#st-s-inject").prop("checked", settings.injectToContext).on("change", function() { settings.injectToContext = this.checked; save(); });
     $("#st-s-cityctry").prop("checked", settings.showCityCountry).on("change", function() { settings.showCityCountry = this.checked; save(); renderModal(); renderHUD(); });
+
+    // --- Connection Profile controls ---
+    $("#st-s-useprofile").prop("checked", settings.useConnectionProfile).on("change", function() {
+        settings.useConnectionProfile = this.checked;
+        save();
+        $("#st-profile-row").toggle(this.checked);
+    });
+    $("#st-profile-row").toggle(settings.useConnectionProfile);
+
+    populateProfileDropdown();
+    $("#st-s-profile").on("change", function() { settings.connectionProfile = this.value; save(); });
+    $("#st-s-profile-refresh").on("click", function() {
+        populateProfileDropdown();
+        if (typeof toastr !== "undefined") toastr.info("Connection profile list refreshed.");
+    });
+
     $("#st-s-open").on("click", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); });
 }
 
