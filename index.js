@@ -40,20 +40,20 @@ var settings = {
     enabled: true,
     showHUD: true,
     hudScale: 100,            
-    hudPosition: "bottom-right",
-	showChatButton: true,
+    showChatButton: true,
     autoUpdate: true,
     autoUpdateInterval: 3,
     injectToContext: true,
     showHistory: true,
     showCityCountry: false,
-    // --- Connection profile support ---
-    useConnectionProfile: false, // master toggle: route Story Tracker analysis through a separate profile
-    connectionProfile: "",       // name of the profile to use (empty = current/main profile)
-    _restoreProfile: ""          // internal: profile to restore if an analysis was interrupted by a reload
+    useConnectionProfile: false, 
+    connectionProfile: "",       
+    _restoreProfile: "",         
+    hudXPercent: null,        // Server-synchronized positions (0.0 to 1.0)
+    hudYPercent: null         // to remember placement across multiple browsers
 };
-var extSettings = null, saveFn = null, scriptModule = null, genQuiet = null, translateFn = null;
-var runSlash = null; // executeSlashCommandsWithOptions — used to switch connection profiles
+var extSettings = null, saveFn = null, saveMetaFn = null, scriptModule = null, genRaw = null, translateFn = null;
+var runSlash = null; 
 var storyData = null; 
 var msgCounter = 0;
 var busy = false;
@@ -62,12 +62,13 @@ var busy = false;
 jQuery(async function () {
     try {
         var m = await import("../../../extensions.js");
-        extSettings = m.extension_settings; saveFn = m.saveSettingsDebounced;
+        extSettings = m.extension_settings; 
+        saveFn = m.saveSettingsDebounced;
+        saveMetaFn = m.saveMetadataDebounced;
+        
         scriptModule = await import("../../../../script.js");
-        if (typeof scriptModule.generateQuietPrompt === "function") genQuiet = scriptModule.generateQuietPrompt;
+        if (typeof scriptModule.generateRaw === "function") genRaw = scriptModule.generateRaw;
 
-        // Optional: slash-command runner, needed to switch connection profiles.
-        // Wrapped in its own try so a path change in ST never breaks the whole extension.
         try {
             var sc = await import("../../../slash-commands.js");
             if (typeof sc.executeSlashCommandsWithOptions === "function") runSlash = sc.executeSlashCommandsWithOptions;
@@ -81,10 +82,14 @@ jQuery(async function () {
         buildSettingsPanel();
         buildChatButton();
         bindEvents();
+        registerStoryMacros();
 
-        // Safety net: restore the main profile if a previous analysis was interrupted
-        // by a page reload. Runs after a short delay so Connection Manager finishes loading.
         setTimeout(function () { recoverProfileIfNeeded(); }, 1500);
+
+        // Clamping check on browser screen changes or rotations
+        $(window).on("resize", function() {
+            applyHudStyle();
+        });
 
         console.log("[Story Tracker] Loaded!");
     } catch (e) { console.error("[Story Tracker] Init error:", e); }
@@ -107,7 +112,9 @@ function makeDefaultData() {
         city: "Unknown", country: "Unknown",
         temperature: "Unknown", weather: "Unknown",
         characters: [], recent_events: "Story just started.",
-        history: [], _initialized: false, _msgCount: 0
+        history: [], _initialized: false, _msgCount: 0,
+        autoUpdate: settings.autoUpdate,
+        autoUpdateInterval: settings.autoUpdateInterval
     };
 }
 
@@ -118,6 +125,8 @@ function loadStoryData() {
         storyData = stored;
         msgCounter = storyData._msgCount || 0;
         if (!storyData.history) storyData.history = [];
+        if (storyData.autoUpdate === undefined) storyData.autoUpdate = settings.autoUpdate;
+        if (storyData.autoUpdateInterval === undefined) storyData.autoUpdateInterval = settings.autoUpdateInterval;
     } else {
         storyData = makeDefaultData();
         if (meta) meta[DATA_KEY] = storyData;
@@ -125,14 +134,35 @@ function loadStoryData() {
     }
 }
 
+// --- Dynamic Viewport Border Calculations ---
+function clampHudPosition(x, y) {
+    var $h = $("#st-hud");
+    if (!$h.length) return { x: x, y: y };
+
+    var hudWidth = $h.outerWidth() || 260;
+    var hudHeight = $h.outerHeight() || 200;
+
+    var margin = 10;
+    var maxX = window.innerWidth - hudWidth - margin;
+    var maxY = window.innerHeight - hudHeight - margin;
+
+    var clampedX = Math.max(margin, Math.min(x, maxX));
+    var clampedY = Math.max(margin, Math.min(y, maxY));
+
+    return { x: clampedX, y: clampedY };
+}
+
 function saveStoryData() {
     if (!scriptModule || !scriptModule.chat_metadata) return;
     storyData._msgCount = msgCounter;
     scriptModule.chat_metadata[DATA_KEY] = storyData;
-    if (typeof scriptModule.saveMetadataDebounced === "function") scriptModule.saveMetadataDebounced();
+    if (typeof saveMetaFn === "function") {
+        saveMetaFn();
+    } else if (typeof scriptModule.saveMetadataDebounced === "function") {
+        scriptModule.saveMetadataDebounced();
+    }
 }
 
-// Fills the settings dropdown with available connection profiles.
 function populateProfileDropdown() {
     var $sel = $("#st-s-profile");
     if (!$sel.length) return;
@@ -148,12 +178,10 @@ function populateProfileDropdown() {
         });
     }
     $sel.html(html);
-    // Restore the saved selection if it still exists.
     var saved = settings.connectionProfile || "";
     if (saved && profiles.some(function (p) { return p.name === saved; })) {
         $sel.val(saved);
     } else if (saved && profiles.length > 0) {
-        // Saved profile no longer exists — keep the value so the user notices, but fall back visually.
         $sel.val("");
     }
 }
@@ -165,7 +193,6 @@ function buildPrevStateText() {
     let s = "PREVIOUS STATE:\nTime: " + storyData.time + " | Date: " + storyData.date + " | Location: " + (storyData._origLocation || storyData.location) + "\n";
     s += "City: " + (storyData._origCity || storyData.city || "Unknown") + " | Country/Realm: " + (storyData._origCountry || storyData.country || "Unknown") + "\n";
     s += "Temperature: " + (storyData._origTemperature || storyData.temperature || "Unknown") + " | Weather: " + (storyData._origWeather || storyData.weather || "Unknown") + "\n";
-    // Include current outfit from Inventory so the LLM never forgets what is worn
     var outfit = getInventoryOutfit();
     if (outfit && outfit.userEquipped.length > 0) {
         var outfitStr = outfit.userEquipped.map(function(it) { return it.label + ": " + it.name; }).join(", ");
@@ -180,7 +207,6 @@ function buildPrevStateText() {
 }
 
 // --- Connection Profile Support ---
-// Returns the array of saved connection profiles, or [] if Connection Manager isn't active.
 function getProfileList() {
     try {
         var cm = extSettings && extSettings.connectionManager;
@@ -189,7 +215,6 @@ function getProfileList() {
     } catch (e) { return []; }
 }
 
-// Returns the name of the currently selected connection profile, or "" if none/unavailable.
 function getCurrentProfileName() {
     try {
         var cm = extSettings && extSettings.connectionManager;
@@ -201,25 +226,21 @@ function getCurrentProfileName() {
     } catch (e) { return ""; }
 }
 
-// True only if we actually can and should route analysis through a different profile.
 function shouldSwitchProfile() {
     if (!settings.useConnectionProfile) return false;
-    if (!runSlash) return false;                       // slash runner not available
+    if (!runSlash) return false;                       
     var target = (settings.connectionProfile || "").trim();
-    if (!target) return false;                         // no target chosen -> use main profile
-    if (getProfileList().length === 0) return false;   // Connection Manager not installed/enabled
+    if (!target) return false;                         
+    if (getProfileList().length === 0) return false;   
     var current = getCurrentProfileName();
-    if (current && current === target) return false;   // already on the target -> nothing to do
+    if (current && current === target) return false;   
     return true;
 }
 
-// Switch to a named profile via the official slash command and wait for it to settle.
 async function switchProfile(name) {
     if (!runSlash || !name) return false;
     try {
-        // Quote the name so profiles with spaces work correctly.
         await runSlash('/profile "' + String(name).replace(/"/g, '\\"') + '"');
-        // Small settle delay: switching a profile updates API/model/preset asynchronously.
         await new Promise(function (r) { setTimeout(r, 150); });
         return true;
     } catch (e) {
@@ -228,8 +249,6 @@ async function switchProfile(name) {
     }
 }
 
-// Run an async LLM task on the configured profile, then always restore the original profile.
-// If switching isn't needed/possible, the task simply runs on the current (main) profile.
 async function withConnectionProfile(task) {
     if (!shouldSwitchProfile()) {
         return await task();
@@ -240,25 +259,19 @@ async function withConnectionProfile(task) {
     try {
         switched = await switchProfile(target);
         if (!switched) console.warn("[Story Tracker] Profile switch failed; running analysis on current profile.");
-        // Persist which profile we must return to, in case the page reloads mid-analysis
-        // (the finally block below would not run in that scenario).
         if (switched && original && original !== target) {
             settings._restoreProfile = original;
             save();
         }
         return await task();
     } finally {
-        // Always restore the user's main profile so the chat generation is never affected.
         if (switched && original && original !== target) {
             await switchProfile(original);
         }
-        // Clear the recovery marker — restoration (or the attempt) is done.
         if (settings._restoreProfile) { settings._restoreProfile = ""; save(); }
     }
 }
 
-// Safety net: if a previous analysis was interrupted (e.g. page reload) while on the
-// tracker's profile, the marker survives in settings. On load, quietly switch back.
 async function recoverProfileIfNeeded() {
     var pending = settings._restoreProfile;
     if (!pending || !runSlash) return;
@@ -277,20 +290,40 @@ async function recoverProfileIfNeeded() {
 
 
 async function doLLMUpdate() {
-    if (!genQuiet) throw new Error("LLM generation not available.");
+    if (!genRaw) throw new Error("Raw LLM generation not available.");
 
-    // Untranslate before sending to LLM for context accuracy
     let wasTr = storyData._translated;
     if (wasTr) untranslateData();
 
-    var prompt = UPDATE_PROMPT.replace("{{PREVIOUS_STATE}}", buildPrevStateText());
+    var baseInstruction = UPDATE_PROMPT.replace("{{PREVIOUS_STATE}}", buildPrevStateText());
 
-    console.log("[Story Tracker] Analyzing scene...");
-    // Route the scene analysis through the configured connection profile (if any),
-    // then automatically restore the user's main profile when done.
-    var raw = await withConnectionProfile(function () { return genQuiet(prompt); });
+    // Fetch live context safely
+    var originalChat = (scriptModule && scriptModule.chat) ? scriptModule.chat : [];
+    var last5 = originalChat.slice(-5);
 
-    // Parse JSON safely
+    // Format last 5 messages as text to run a clean out-of-band analysis prompt
+    var chatHistoryContextText = "";
+    last5.forEach(function(msg) {
+        var senderName = msg.is_user ? "User" : (msg.name || "Char");
+        var msgText = msg.mes || "";
+        chatHistoryContextText += senderName + ": " + msgText + "\n";
+    });
+
+    var finalPrompt = "[THE CHAT HISTORY SO FAR (LAST 5 MESSAGES ONLY)]:\n" + chatHistoryContextText + "\n" + baseInstruction;
+
+    console.log("[Story Tracker] Analyzing scene via raw generation...");
+    var raw = await withConnectionProfile(async function () {
+        try {
+            return await genRaw({
+                prompt: finalPrompt,
+                quietToLoud: true
+            });
+        } catch (e) {
+            // Legacy SillyTavern generateRaw argument fallback support
+            return await genRaw(finalPrompt, null, false, true);
+        }
+    });
+
     var data = null;
     try { data = JSON.parse(raw); } 
     catch(e) {
@@ -300,12 +333,10 @@ async function doLLMUpdate() {
     
     if (!data || !data.time) throw new Error("Failed to parse LLM response.");
 
-    // Apply data
     storyData.time = data.time || storyData.time;
     storyData.date = data.date || storyData.date;
     storyData.location = data.location || storyData.location;
 
-    // City / country: treat "Unknown" (case-insensitive) as missing — will trigger fallback below
     let isBlank = v => !v || v.trim().toLowerCase() === "unknown" || v.trim() === "";
     storyData.city    = !isBlank(data.city)    ? data.city    : (isBlank(storyData.city)    ? null : storyData.city);
     storyData.country = !isBlank(data.country) ? data.country : (isBlank(storyData.country) ? null : storyData.country);
@@ -316,12 +347,21 @@ async function doLLMUpdate() {
     storyData.recent_events = data.recent_events || "";
     storyData._initialized = true;
 
-    // Fallback: if city or country still missing, ask LLM specifically for them
     if (settings.showCityCountry && (isBlank(storyData.city) || isBlank(storyData.country))) {
         try {
             console.log("[Story Tracker] City/country missing — running fallback inference...");
             var ccPrompt = CITY_COUNTRY_PROMPT.replace("{{LOCATION}}", storyData._origLocation || storyData.location || "Unknown");
-            var ccRaw = await withConnectionProfile(function () { return genQuiet(ccPrompt); });
+            var finalCcPrompt = "[THE CHAT HISTORY SO FAR (LAST 5 MESSAGES ONLY)]:\n" + chatHistoryContextText + "\n" + ccPrompt;
+            var ccRaw = await withConnectionProfile(async function () {
+                try {
+                    return await genRaw({
+                        prompt: finalCcPrompt,
+                        quietToLoud: true
+                    });
+                } catch (e) {
+                    return await genRaw(finalCcPrompt, null, false, true);
+                }
+            });
             var ccData = null;
             try { ccData = JSON.parse(ccRaw); }
             catch(e) { var cm = ccRaw.match(/\{[\s\S]*?\}/); if (cm) { try { ccData = JSON.parse(cm[0]); } catch(ex){} } }
@@ -332,11 +372,9 @@ async function doLLMUpdate() {
         } catch(fe) { console.warn("[Story Tracker] City/country fallback failed:", fe); }
     }
 
-    // Ensure display-safe values
     if (isBlank(storyData.city))    storyData.city    = "Unknown";
     if (isBlank(storyData.country)) storyData.country = "Unknown";
 
-    // Save to history (keep last 20)
     storyData.history.unshift({
         msg: msgCounter,
         time: storyData.time,
@@ -349,7 +387,7 @@ async function doLLMUpdate() {
     if (storyData.history.length > 20) storyData.history.pop();
 
     saveStoryData();
-    syncToCharTracker(); // Sync data with Character Tracker
+    syncToCharTracker(); 
 
     if (wasTr) await translateData();
 }
@@ -360,9 +398,8 @@ function syncToCharTracker() {
         var meta = scriptModule ? scriptModule.chat_metadata : null;
         if (!meta) return;
         var ct = meta["char_tracker"];
-        if (!ct) return; // Character Tracker not yet initialized
+        if (!ct) return; 
 
-        // Parse date from "DD/MM/YYYY" format
         var day = 1, month = 1, year = 2024;
         var parts = (storyData.date || "").split(/[\/\-\.]/);
         if (parts.length >= 3) {
@@ -371,7 +408,6 @@ function syncToCharTracker() {
             year  = parseInt(parts[2], 10) || 2024;
         }
 
-        // Update sharedTime
         var container = ct._isGroup ? ct : ct;
         if (!container.sharedTime) container.sharedTime = {};
         container.sharedTime.time  = storyData.time  || "--:--";
@@ -380,7 +416,6 @@ function syncToCharTracker() {
         container.sharedTime.year  = year;
         container._timeInitialized = true;
 
-        // Update location
         if (ct._isGroup) {
             var activeChar = ct._activeChar;
             if (activeChar && ct.characters && ct.characters[activeChar]) {
@@ -390,7 +425,9 @@ function syncToCharTracker() {
             ct.location = storyData.location;
         }
 
-        if (typeof scriptModule.saveMetadataDebounced === "function")
+        if (typeof saveMetaFn === "function")
+            saveMetaFn();
+        else if (typeof scriptModule.saveMetadataDebounced === "function")
             scriptModule.saveMetadataDebounced();
 
         console.log("[Story Tracker] Synced time/location → Character Tracker");
@@ -410,7 +447,6 @@ function getInventoryOutfit() {
         var inv = meta["inv_data"];
         if (!inv || !inv.equipped) return null;
 
-        // Use original (untranslated) names when available for LLM injection
         var eq = (inv._translated && inv._orig) ? inv._orig.equipped : inv.equipped;
 
         var userEquipped = [];
@@ -428,7 +464,6 @@ function getInventoryOutfit() {
             }
         }
 
-        // Items currently held by the AI character
         var charItems = (inv.charItems || []).map(function(ci) {
             return { name: ci.name, heldBy: ci.heldBy || "Character" };
         });
@@ -444,7 +479,6 @@ function getInventoryOutfit() {
 function injectContextToChat() {
     if (!settings.enabled || !settings.injectToContext || !storyData || !storyData._initialized) return;
     
-    // Always inject original (untranslated) data to LLM
     let loc = storyData._origLocation || storyData.location;
     let ev = storyData._origEvents || storyData.recent_events;
     
@@ -465,7 +499,6 @@ function injectContextToChat() {
 
     let inj = `[Scene Context: Time: ${storyData.time}, Date: ${storyData.date}\nLocation: ${loc}${cityCountryStr}\nTemperature: ${storyData._origTemperature || storyData.temperature || "Unknown"} | Weather: ${storyData._origWeather || storyData.weather || "Unknown"}\nPositions: ${charsText}\nRecent: ${ev}`;
 
-    // Append outfit from Inventory if available
     var outfit = getInventoryOutfit();
     if (outfit && outfit.userEquipped.length > 0) {
         var outfitStr = outfit.userEquipped.map(function(it) { return it.label + ": " + it.name; }).join(", ");
@@ -493,30 +526,42 @@ function bindEvents() {
     es.on(et.CHAT_CHANGED, function() {
         loadStoryData();
         renderModal(); renderHUD();
+        updateSettingsUI();
     });
     
 	$(document).on("ST_FORCE_RENDER", function() {
         loadStoryData();
         renderModal(); 
         renderHUD();
+        updateSettingsUI();
     });
 
-    // Re-render instantly when Inventory equipment changes (equip / unequip / drop)
     $(document).on("INV_EQUIPMENT_CHANGED", function() {
         renderModal();
         renderHUD();
         if (settings.enabled && settings.injectToContext) injectContextToChat();
     });
 
-    let handleMsg = async function() {
+    let lastProcessedMsgId = null;
+    let handleMsg = async function(messageId, type) {
+        // Only count normal generations: ignore swipes
+        if (type === 'swipe') return;
+        // Intercept duplicate calls across RECEIVED and RENDERED events
+        if (messageId === lastProcessedMsgId) return;
+        lastProcessedMsgId = messageId;
+
         if (!settings.enabled || busy) return;
+
+        let autoUpdate = (storyData && storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
+        let autoUpdateInterval = (storyData && storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
+
         msgCounter++;
         saveStoryData();
         
-        // Initial setup on 1st message, or auto-update
-        let isFirstMsg = scriptModule.chat.length <= 2 && !storyData._initialized;
+        let chatLen = (scriptModule && scriptModule.chat) ? scriptModule.chat.length : 0;
+        let isFirstMsg = chatLen <= 2 && !storyData._initialized;
         
-        if (isFirstMsg || (settings.autoUpdate && msgCounter % settings.autoUpdateInterval === 0)) {
+        if (isFirstMsg || (autoUpdate && msgCounter % autoUpdateInterval === 0)) {
             busy = true;
             try {
                 await doLLMUpdate();
@@ -535,6 +580,53 @@ function bindEvents() {
 
 // --- UI Rendering ---
 function esc(t) { var d = document.createElement("div"); d.textContent = t; return d.innerHTML; }
+
+// --- Custom Macro Registration ---
+function registerStoryMacros() {
+    try {
+        var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function") 
+            ? SillyTavern.getContext() 
+            : null;
+
+        if (context && context.macros && typeof context.macros.register === "function") {
+            var macroDefs = [
+                { name: 'story_time', key: 'time' },
+                { name: 'story_date', key: 'date' },
+                { name: 'story_location', key: 'location' },
+                { name: 'story_weather', key: 'weather' },
+                { name: 'story_temp', key: 'temperature' },
+                { name: 'story_city', key: 'city' },
+                { name: 'story_country', key: 'country' },
+                { name: 'story_events', key: 'recent_events' }
+            ];
+
+            macroDefs.forEach(function(m) {
+                try {
+                    // Modern SillyTavern Context API uses options object structure
+                    context.macros.register(m.name, {
+                        handler: function() {
+                            return (storyData && storyData[m.key]) ? storyData[m.key] : "Unknown";
+                        },
+                        category: "Story Tracker",
+                        description: "Tracked narrative value for " + m.key
+                    });
+                } catch(e) {
+                    // Fallback for legacy SillyTavern versions that directly expect a function callback
+                    try {
+                        context.macros.register(m.name, function() {
+                            return (storyData && storyData[m.key]) ? storyData[m.key] : "Unknown";
+                        });
+                    } catch(ex) {
+                        console.warn("[Story Tracker] Legacy macro fallback registration failed for " + m.name, ex);
+                    }
+                }
+            });
+            console.log("[Story Tracker] Custom global macros registered successfully!");
+        }
+    } catch (e) {
+        console.warn("[Story Tracker] Error initializing custom macros registry:", e);
+    }
+}
 
 function getDayOfWeek(dateStr) {
     if (!dateStr || dateStr === "Unknown") return "";
@@ -576,11 +668,11 @@ function buildModal() {
     
     h += '<div class="st-section"><div class="st-sec-title"><i class="fa-solid fa-users"></i> Character Positions</div><div class="st-char-list" id="st-val-chars"></div></div>';
     h += '<div class="st-section"><div class="st-sec-title"><i class="fa-solid fa-scroll"></i> Recent Events (Summary)</div><div class="st-summary-box" id="st-val-events"></div></div>';
-    h += '</div></div>'; // end tab 1
+    h += '</div></div>'; 
     
     h += '<div id="st-tab-history" style="display:none;"><div id="st-history-list"></div></div>';
     
-    h += '</div>'; // end body
+    h += '</div>'; 
     h += '<div class="st-footer"><button class="menu_button" id="st-f-update"><i class="fa-solid fa-bolt"></i> Update Now</button><div class="st-auto-info" id="st-auto-info"></div></div>';
     h += '</div></div>';
     document.body.insertAdjacentHTML("beforeend", h);
@@ -607,7 +699,6 @@ function renderModal() {
         $("#st-val-dow").text(dow || "Unknown");
         $("#st-val-loc").text(storyData.location);
         
-        // City / Country row — shown only when setting is enabled
         if (settings.showCityCountry) {
             let city = storyData.city || "Unknown";
             let country = storyData.country || "Unknown";
@@ -632,7 +723,6 @@ function renderModal() {
             storyData.characters.forEach(c => {
                 var stateText = c.state;
 
-                // Append user outfit as plain text
                 if (outfit && outfit.userEquipped.length > 0) {
                     var isUser = (userName && c.name.toLowerCase() === userName.toLowerCase()) ||
                                  c.name.toLowerCase() === "user" ||
@@ -644,7 +734,6 @@ function renderModal() {
                     }
                 }
 
-                // Append held items for AI characters as plain text
                 if (outfit && outfit.charItems.length > 0) {
                     var held = outfit.charItems.filter(ci => ci.heldBy && ci.heldBy.toLowerCase() === c.name.toLowerCase());
                     if (held.length > 0) {
@@ -657,9 +746,8 @@ function renderModal() {
             });
         }
         $("#st-val-chars").html(cHtml || "<i>No characters detected.</i>");
-    }   // end storyData._initialized else block
+    }   
     
-    // History render
     let hHtml = "";
     if (storyData.history && storyData.history.length > 0) {
         storyData.history.forEach((h, i) => {
@@ -676,9 +764,25 @@ function renderModal() {
     syncTranslateBtn();
 }
 
+function updateSettingsUI() {
+    if (!storyData) return;
+
+    let autoUpdate = (storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
+    let autoUpdateInterval = (storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
+
+    $("#st-s-auto").prop("checked", autoUpdate);
+    $("#st-s-interval").val(autoUpdateInterval);
+    $("#st-interval-val").text(autoUpdateInterval);
+
+    renderAutoInfo();
+}
+
 function renderAutoInfo() {
-    if(!settings.autoUpdate) { $("#st-auto-info").text("Auto-update: OFF"); return; }
-    let rem = settings.autoUpdateInterval - (msgCounter % settings.autoUpdateInterval);
+    let autoUpdate = (storyData && storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
+    let autoUpdateInterval = (storyData && storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
+
+    if(!autoUpdate) { $("#st-auto-info").text("Auto-update: OFF"); return; }
+    let rem = autoUpdateInterval - (msgCounter % autoUpdateInterval);
     $("#st-auto-info").text(`Auto-update in ${rem} msg(s)`);
 }
 
@@ -698,27 +802,152 @@ async function doManualUpdate() {
 // --- HUD ---
 function buildHUD() {
     if (document.getElementById("st-hud")) return;
-    let h = `<div id="st-hud" class="st-hud st-hud-pos-${settings.hudPosition}"><div class="st-hud-head"><i class="fa-solid fa-book"></i> Tracker <i style="margin-left:auto" class="fa-solid fa-chevron-up"></i></div><div class="st-hud-body" id="st-hud-body"></div></div>`;
+    let h = `<div id="st-hud" class="st-hud st-hud-collapsed">
+        <div class="st-hud-head">
+            <i class="fa-solid fa-book-open-reader"></i>
+            <span class="st-hud-head-text" style="margin-left: 6px;">Tracker</span>
+            <i style="margin-left:auto" class="fa-solid fa-chevron-up"></i>
+        </div>
+        <div class="st-hud-body" id="st-hud-body"></div>
+    </div>`;
     document.body.insertAdjacentHTML("beforeend", h);
-    $(document).on("click", ".st-hud-head", function() { $("#st-hud").toggleClass("st-hud-collapsed"); });
-    $(document).on("click", "#st-hud-body", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); });
+    
+    $(document).on("click", ".st-hud-head", function() { 
+        if ($("#st-hud").attr("data-dragging") === "true") return;
+        $("#st-hud").toggleClass("st-hud-collapsed"); 
+    });
+    $(document).on("click", "#st-hud-body", function() { 
+        if ($("#st-hud").attr("data-dragging") === "true") return;
+        loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); 
+    });
+
+    var hudEl = document.getElementById("st-hud");
+    makeHudDraggable(hudEl);
+
     renderHUD();
 }
 
 function applyHudStyle() {
     var $h = $("#st-hud");
-    $h.removeClass("st-hud-pos-bottom-right st-hud-pos-bottom-left st-hud-pos-top-right st-hud-pos-top-left").addClass(`st-hud-pos-${settings.hudPosition}`);
-    
+    if (!$h.length) return;
+
     var scale = (settings.hudScale || 100) / 100;
-    var origin = "bottom right";
-    if (settings.hudPosition === "bottom-left") origin = "bottom left";
-    if (settings.hudPosition === "top-right") origin = "top right";
-    if (settings.hudPosition === "top-left") origin = "top left";
+    var origin = "top right";
+
+    // If synchronized percentage-based coordinates exist in settings
+    if (settings.hudXPercent !== null && settings.hudYPercent !== null) {
+        let x = settings.hudXPercent * window.innerWidth;
+        let y = settings.hudYPercent * window.innerHeight;
+        
+        let clamped = clampHudPosition(x, y);
+
+        $h.css({
+            "left": `${clamped.x}px`,
+            "top": `${clamped.y}px`,
+            "right": "auto",
+            "bottom": "auto"
+        });
+
+        // Compute alignment transform origin dynamically depending on viewport position
+        let oX = (clamped.x + $h.outerWidth() / 2) > window.innerWidth / 2 ? "right" : "left";
+        let oY = (clamped.y + $h.outerHeight() / 2) > window.innerHeight / 2 ? "bottom" : "top";
+        origin = `${oY} ${oX}`;
+    } else {
+        $h.css({
+            "left": "",
+            "top": "",
+            "right": "",
+            "bottom": ""
+        });
+    }
 
     $h.css({
         "transform": `scale(${scale})`,
         "transform-origin": origin
     });
+}
+
+// --- Draggable Handler (Multi-Device Percentage-based Position Synchronization — Unbounded drag, Drop clamped) ---
+function makeHudDraggable(el) {
+    let isDragging = false;
+    let startX, startY, initialX, initialY;
+    
+    const onDown = (e) => {
+        // Prevent dragging interaction on input elements or when interacting with modal buttons
+        if (e.target.closest('button, input, select, textarea, a, .st-hud-body')) return;
+        
+        const clientX = e.clientX || e.touches?.[0]?.clientX;
+        const clientY = e.clientY || e.touches?.[0]?.clientY;
+        if (clientX === undefined) return;
+        
+        isDragging = false;
+        el.removeAttribute('data-dragging');
+        startX = clientX;
+        startY = clientY;
+        
+        const rect = el.getBoundingClientRect();
+        initialX = rect.left;
+        initialY = rect.top;
+
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        document.addEventListener('touchmove', onMove, { passive: false });
+        document.addEventListener('touchend', onUp);
+    };
+
+    const onMove = (e) => {
+        const clientX = e.clientX || e.touches?.[0]?.clientX;
+        const clientY = e.clientY || e.touches?.[0]?.clientY;
+        if (clientX === undefined) return;
+
+        const dx = clientX - startX;
+        const dy = clientY - startY;
+
+        // Minimum pixel travel to count as drag
+        if (!isDragging && Math.sqrt(dx*dx + dy*dy) > 5) {
+            isDragging = true;
+            el.setAttribute('data-dragging', 'true');
+        }
+
+        if (isDragging) {
+            e.preventDefault();
+            let newX = initialX + dx;
+            let newY = initialY + dy;
+            
+            // Unclamped values are assigned during active drag to prevent laggy edge-bumping
+            el.style.left = `${newX}px`;
+            el.style.top = `${newY}px`;
+            el.style.right = 'auto';
+            el.style.bottom = 'auto';
+        }
+    };
+
+    const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend', onUp);
+        
+        if (isDragging) {
+            const rect = el.getBoundingClientRect();
+            
+            // Borders are applied gracefully only when dragging stops, keeping it visible
+            let clamped = clampHudPosition(rect.left, rect.top);
+            
+            settings.hudXPercent = clamped.x / window.innerWidth;
+            settings.hudYPercent = clamped.y / window.innerHeight;
+            save();
+            applyHudStyle();
+        }
+        
+        setTimeout(() => { 
+            isDragging = false; 
+            el.removeAttribute('data-dragging'); 
+        }, 50);
+    };
+
+    el.addEventListener('mousedown', onDown);
+    el.addEventListener('touchstart', onDown, { passive: true });
 }
 
 function renderHUD() {
@@ -761,7 +990,6 @@ function renderHUD() {
         storyData.characters.slice(0, 3).forEach(c => {
             var hudStateText = c.state;
 
-            // Append user outfit as plain text
             if (hudOutfit && hudOutfit.userEquipped.length > 0) {
                 var isUser = (hudUserName && c.name.toLowerCase() === hudUserName.toLowerCase()) ||
                              c.name.toLowerCase() === "user" ||
@@ -773,7 +1001,6 @@ function renderHUD() {
                 }
             }
 
-            // Append held items for AI characters as plain text
             if (hudOutfit && hudOutfit.charItems.length > 0) {
                 var hudHeld = hudOutfit.charItems.filter(ci => ci.heldBy && ci.heldBy.toLowerCase() === c.name.toLowerCase());
                 if (hudHeld.length > 0) {
@@ -795,7 +1022,7 @@ function buildChatButton() {
     if (!document.getElementById("st-trigger")) {
         var btn = '<div id="st-trigger" class="st-trigger interactable" title="Story Tracker"><i class="fa-solid fa-book-open-reader"></i></div>';
         var $l = $("#leftSendForm"); if ($l.length) $l.append(btn); else $("#send_form").prepend(btn);
-        $(document).on("click", "#st-trigger", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); });
+        $(document).on("click", "#st-trigger", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); updateSettingsUI(); });
     }
     toggleChatButtonVisibility();
 }
@@ -818,7 +1045,6 @@ function buildSettingsPanel() {
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-on"><span>Enable Extension</span></label></div>';
     
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-hud"><span>Show HUD Widget</span></label></div>';
-    h += '<div class="da-srow" id="st-pos-row"><label><small>HUD Position:</small></label><select id="st-s-pos" class="text_pole"><option value="bottom-right">Bottom Right</option><option value="bottom-left">Bottom Left</option><option value="top-right">Top Right</option><option value="top-left">Top Left</option></select></div>';
     h += '<div class="da-srow" id="st-scale-row"><label><small>HUD Scale: <span id="st-scale-val"></span>%</small></label><input type="range" id="st-s-scale" min="50" max="200" step="5"></div>';
     
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-chatbtn"><span>Show Icon in Chat Panel</span></label></div>';
@@ -828,7 +1054,6 @@ function buildSettingsPanel() {
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-inject"><span>Inject Context into Prompt (Reduces Amnesia)</span></label></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-cityctry"><span>Show City / Country (LLM infers or invents)</span></label></div>';
 
-    // --- Connection Profile section ---
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-useprofile"><span>Use a separate Connection Profile for analysis</span></label></div>';
     h += '<div class="da-srow"><small style="opacity:.7">Run Story Tracker\'s scene analysis on a cheaper model, then switch back to your main profile automatically. Requires the built-in <b>Connection Profiles</b> extension.</small></div>';
     h += '<div class="da-srow" id="st-profile-row"><label><small>Analysis Profile:</small></label>';
@@ -844,11 +1069,9 @@ function buildSettingsPanel() {
     
     $("#st-s-hud").prop("checked", settings.showHUD).on("change", function() { 
         settings.showHUD = this.checked; save(); renderHUD(); 
-        $("#st-pos-row, #st-scale-row").toggle(this.checked);
+        $("#st-scale-row").toggle(this.checked);
     });
-    $("#st-pos-row, #st-scale-row").toggle(settings.showHUD);
-    
-    $("#st-s-pos").val(settings.hudPosition).on("change", function() { settings.hudPosition = this.value; save(); applyHudStyle(); });
+    $("#st-scale-row").toggle(settings.showHUD);
     
     $("#st-s-scale").val(settings.hudScale).on("input", function() { 
         settings.hudScale = parseInt(this.value, 10); 
@@ -864,14 +1087,32 @@ function buildSettingsPanel() {
         toggleChatButtonVisibility(); 
     });
     
-    $("#st-s-auto").prop("checked", settings.autoUpdate).on("change", function() { settings.autoUpdate = this.checked; save(); renderModal(); });
-    $("#st-s-interval").val(settings.autoUpdateInterval).on("input", function() { settings.autoUpdateInterval = parseInt(this.value, 10); $("#st-interval-val").text(this.value); save(); renderModal(); });
-    $("#st-interval-val").text(settings.autoUpdateInterval);
+    $("#st-s-auto").on("change", function() { 
+        let val = this.checked;
+        if (storyData) {
+            storyData.autoUpdate = val;
+            saveStoryData();
+        }
+        settings.autoUpdate = val; // Also acts as default for future chats
+        save(); 
+        renderModal(); 
+    });
+
+    $("#st-s-interval").on("input", function() { 
+        let val = parseInt(this.value, 10); 
+        $("#st-interval-val").text(val); 
+        if (storyData) {
+            storyData.autoUpdateInterval = val;
+            saveStoryData();
+        }
+        settings.autoUpdateInterval = val; // Also acts as default for future chats
+        save(); 
+        renderModal(); 
+    });
     
     $("#st-s-inject").prop("checked", settings.injectToContext).on("change", function() { settings.injectToContext = this.checked; save(); });
     $("#st-s-cityctry").prop("checked", settings.showCityCountry).on("change", function() { settings.showCityCountry = this.checked; save(); renderModal(); renderHUD(); });
 
-    // --- Connection Profile controls ---
     $("#st-s-useprofile").prop("checked", settings.useConnectionProfile).on("change", function() {
         settings.useConnectionProfile = this.checked;
         save();
@@ -887,6 +1128,8 @@ function buildSettingsPanel() {
     });
 
     $("#st-s-open").on("click", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); });
+
+    updateSettingsUI();
 }
 
 // --- Translation ---
