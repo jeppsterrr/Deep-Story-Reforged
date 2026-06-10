@@ -140,6 +140,11 @@ If a page reload interrupts the analysis mid-switch, Story Tracker detects this 
 - Translate extension support.
 - Character Tracker extension sync.
 
+###1.0.1
+-Forked over from main extension
+-Added a floating icon to save space
+-Fixed UI bleeding over the edges on mobile screens.
+
 ---
 
 ## 📄 License
