@@ -56,6 +56,7 @@ var extSettings = null, saveFn = null, saveMetaFn = null, scriptModule = null, g
 var runSlash = null; 
 var storyData = null; 
 var msgCounter = 0;
+var lastCountedMsgId = -1; // highest chat message ID counted so far (drives the "no swipes/regens/dupes" filter)
 var busy = false;
 
 // --- Init ---
@@ -118,6 +119,20 @@ function isChatOpen() {
     }
 }
 
+// Resolves the live chat array the same resilient way isChatOpen() does,
+// so message-id lookups work whether SillyTavern.getContext() is available
+// or we have to fall back to the imported script module.
+function getLiveChat() {
+    try {
+        var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function")
+            ? SillyTavern.getContext()
+            : null;
+        return (context && context.chat) ? context.chat : (scriptModule ? scriptModule.chat : null);
+    } catch (e) {
+        return null;
+    }
+}
+
 // --- Data Management ---
 function loadSettings() {
     if(extSettings) {
@@ -136,6 +151,7 @@ function makeDefaultData() {
         temperature: "Unknown", weather: "Unknown",
         characters: [], recent_events: "Story just started.",
         history: [], _initialized: false, _msgCount: 0,
+        _lastCountedMsgId: -1, // no chat messages counted yet
         autoUpdate: settings.autoUpdate,
         autoUpdateInterval: settings.autoUpdateInterval
     };
@@ -154,10 +170,20 @@ function loadStoryData() {
         if (!storyData.history) storyData.history = [];
         if (storyData.autoUpdate === undefined) storyData.autoUpdate = settings.autoUpdate;
         if (storyData.autoUpdateInterval === undefined) storyData.autoUpdateInterval = settings.autoUpdateInterval;
+
+        if (typeof storyData._lastCountedMsgId !== "number") {
+            // Save predates id-based tracking: treat every message already in
+            // the chat as already accounted for, so we don't retroactively
+            // recount history or mistake the next swipe/regen for a new message.
+            var liveChat = getLiveChat();
+            storyData._lastCountedMsgId = (liveChat && liveChat.length) ? liveChat.length - 1 : -1;
+        }
+        lastCountedMsgId = storyData._lastCountedMsgId;
     } else {
         storyData = makeDefaultData();
         if (meta) meta[DATA_KEY] = storyData;
         msgCounter = 0;
+        lastCountedMsgId = storyData._lastCountedMsgId;
     }
 }
 
@@ -182,6 +208,7 @@ function clampHudPosition(x, y) {
 function saveStoryData() {
     if (!isChatOpen() || !scriptModule || !scriptModule.chat_metadata) return;
     storyData._msgCount = msgCounter;
+    storyData._lastCountedMsgId = lastCountedMsgId;
     scriptModule.chat_metadata[DATA_KEY] = storyData;
     if (typeof saveMetaFn === "function") {
         saveMetaFn();
@@ -579,13 +606,37 @@ function bindEvents() {
         if (settings.enabled && settings.injectToContext) injectContextToChat();
     });
 
-    let lastProcessedMsgId = null;
     let handleMsg = async function(messageId, type) {
-        // Only count normal generations: ignore swipes
-        if (type === 'swipe') return;
-        // Intercept duplicate calls across RECEIVED and RENDERED events
-        if (messageId === lastProcessedMsgId) return;
-        lastProcessedMsgId = messageId;
+        // Normalize to a real chat-array index. If whatever fired this event
+        // (SillyTavern itself, or another extension) didn't give us a usable
+        // id, there's nothing reliable to count.
+        var id = Number(messageId);
+        if (!Number.isInteger(id) || id < 0) return;
+
+        // THE authoritative filter: only an id strictly higher than the last
+        // one we counted is a genuinely NEW, never-before-seen message.
+        // Swipes, regenerations, and "continue" all reuse the id of the
+        // message they're modifying rather than creating a new one, so this
+        // single check excludes all of them — and it does so regardless of
+        // what (if anything) "type" is set to. That's what makes this work
+        // with other extensions that generate messages too, not just
+        // SillyTavern's own generation flow: as long as a finished message
+        // lands in the chat with a new id, it gets counted exactly once.
+        if (id <= lastCountedMsgId) return;
+
+        // Confirm the message is actually finished — present in the live
+        // chat array with real text — before counting it. This guards
+        // against anything that fires the event a beat before the message
+        // content is fully populated.
+        var liveChat = getLiveChat();
+        var msgObj = liveChat ? liveChat[id] : null;
+        if (!msgObj || typeof msgObj.mes !== "string" || !msgObj.mes.trim()) return;
+
+        // Claim this id immediately, even if the extension is currently
+        // disabled — otherwise a later swipe/regen on this same message
+        // could get miscounted as "new" once the extension is re-enabled.
+        lastCountedMsgId = id;
+        saveStoryData();
 
         if (!settings.enabled || busy) return;
 
