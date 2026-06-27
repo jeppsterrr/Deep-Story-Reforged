@@ -1984,6 +1984,10 @@ function trimWorldEvents() {
 }
 
 async function runManualWorldTick() {
+    if (!settings.enabled) {
+        if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
+        return;
+    }
     if (worldBusy) return;
     if (!settings.worldEnabled) {
         if (typeof toastr !== "undefined") toastr.warning("World Agent is disabled. Enable it in settings first.");
@@ -2232,6 +2236,10 @@ function applyRelationshipDecay() {
 }
 
 async function runManualRelationshipAnalysis() {
+    if (!settings.enabled) {
+        if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
+        return;
+    }
     if (relsBusy) return;
     if (anyBusy() && !relsBusy) {
         if (typeof toastr !== "undefined") toastr.warning("Another agent is running. Please wait.");
