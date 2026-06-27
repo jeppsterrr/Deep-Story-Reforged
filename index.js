@@ -158,16 +158,12 @@ var settings = {
     accentG: 160,
     accentB: 64,
 
-    // Agent Timing — delay (ms) between sequential agent calls after a message.
-    // Increase to 3000–5000 on slow/local backends (Termux, low-VRAM local models).
-    agentDelay: 1500,
-
     // World Agent Settings
     worldEnabled: false,
     useWorldProfile: false,
     worldConnectionProfile: "",
     worldTickFrequency: "1h", // "1h", "3h", "1d", "manual"
-    maxWorldTicks: 3,
+    maxWorldTicks: 6,
     injectWorldContext: false,
 
     // Relationship Tracker Settings
@@ -186,13 +182,10 @@ var worldData = null;
 var relationshipData = null;
 var msgCounter = 0;
 var lastCountedMsgId = -1; // highest chat message ID counted so far (drives the "no swipes/regens/dupes" filter)
-var busy = false;             // scene tracker lock
-var worldBusy = false;        // world agent lock
-var relsBusy = false;         // relationship tracker lock
-var relMsgCounter = 0;        // counts messages since last relationship checkpoint
-var handleMsgRunning = false; // top-level guard: drops overlapping handleMsg calls caused by
-                              // ST firing both CHARACTER_MESSAGE_RENDERED and MESSAGE_RECEIVED
-                              // for the same message, preventing double world/rel agent runs.
+var busy = false;       // scene tracker lock
+var worldBusy = false;  // world agent lock
+var relsBusy = false;   // relationship tracker lock
+var relMsgCounter = 0;  // counts messages since last relationship checkpoint
 
 // Global lock - returns true if ANY agent is currently generating.
 // Prevents concurrent API requests when multiple agents fire at once.
@@ -1028,73 +1021,74 @@ function bindEvents() {
         lastCountedMsgId = id;
         saveStoryData();
 
-        if (!settings.enabled) return;
+        if (!settings.enabled) {
+            if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
+            return;
+        }
 
-        // TOP-LEVEL GUARD: SillyTavern fires both CHARACTER_MESSAGE_RENDERED and MESSAGE_RECEIVED
-        // for the same message. Without this, the second event enters handleMsg while the first is
-        // still awaiting an agent, causing duplicate world ticks and relationship runs (the ghost
-        // double-call bug). If any agent chain is already running, drop this call entirely.
-        if (handleMsgRunning || anyBusy()) return;
+        if (busy) return;
 
         if (!isChatOpen()) {
             console.warn("[Story Tracker] Event ignored: No active chat is open.");
             return;
         }
 
-        handleMsgRunning = true;
-        try {
-            let autoUpdate = (storyData && storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
-            let autoUpdateInterval = (storyData && storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
+        let autoUpdate = (storyData && storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
+        let autoUpdateInterval = (storyData && storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
 
-            msgCounter++;
-            relMsgCounter++;
-            saveStoryData();
+        msgCounter++;
+        relMsgCounter++;
+        saveStoryData();
+        
+        // Run agents sequentially to avoid concurrent API requests on rate-limited backends.
+        // Each agent awaits the previous one and waits an extra 1.5s gap before firing.
+        var needsSceneUpdate = autoUpdate && msgCounter > 0 && msgCounter % autoUpdateInterval === 0;
+        var needsWorldTick   = settings.enabled && settings.worldEnabled;
+        var needsRelUpdate   = settings.relationsEnabled && settings.relationsAutoUpdate && !relsBusy &&
+                               relMsgCounter > 0 && relMsgCounter % (settings.relAutoInterval || 5) === 0;
 
-            // Configurable delay between sequential agent calls.
-            // Users on slow/local backends (Termux, low-VRAM) can raise this in settings.
-            var delay = (settings.agentDelay != null && settings.agentDelay >= 0) ? settings.agentDelay : 1500;
+        if (needsSceneUpdate) {
+            busy = true;
+            setHudStatus("Scene...");
+            if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing scene...", "", { timeOut: 0, extendedTimeOut: 0 });
+            try {
+                await doLLMUpdate();
+                renderModal(); renderHUD();
+            } catch(e) { console.error(e); }
+            busy = false;
+            clearHudStatus();
+            if (typeof toastr !== "undefined") toastr.clear();
+        } else {
+            renderAutoInfo();
+        }
 
-            // Run agents sequentially to avoid concurrent API requests on rate-limited backends.
-            // Each agent awaits the previous one before firing.
-            var needsSceneUpdate = autoUpdate && msgCounter > 0 && msgCounter % autoUpdateInterval === 0;
-            var needsWorldTick   = settings.enabled && settings.worldEnabled;
-            var needsRelUpdate   = settings.relationsEnabled && settings.relationsAutoUpdate &&
-                                   relMsgCounter > 0 && relMsgCounter % (settings.relAutoInterval || 5) === 0;
+        if (needsWorldTick) {
+            await new Promise(function(r) { setTimeout(r, 1500); });
+            setHudStatus("World...");
+            if (typeof toastr !== "undefined") toastr.info("Story Tracker: Running world tick...", "", { timeOut: 0, extendedTimeOut: 0 });
+            await checkAndRunWorldTicks();
+            clearHudStatus();
+            if (typeof toastr !== "undefined") toastr.clear();
+        }
 
-            if (needsSceneUpdate) {
-                busy = true;
-                try {
-                    await doLLMUpdate();
-                    renderModal(); renderHUD();
-                } catch(e) { console.error("[Story Tracker] Scene update failed:", e); }
-                busy = false;
-            } else {
-                renderAutoInfo();
+        if (needsRelUpdate) {
+            await new Promise(function(r) { setTimeout(r, 1500); });
+            setHudStatus("Relations...");
+            if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing relationships...", "", { timeOut: 0, extendedTimeOut: 0 });
+            try {
+                await doRelationshipUpdate();
+                if ($("#st-tab-relations").is(":visible")) renderRelationshipGraph();
+                clearHudStatus();
+                if (typeof toastr !== "undefined") { toastr.clear(); toastr.info("Relationships updated."); }
+            } catch(e) {
+                clearHudStatus();
+                if (typeof toastr !== "undefined") toastr.clear();
+                console.error("[Story Tracker] Auto relationship update failed:", e);
             }
-
-            if (needsWorldTick) {
-                await new Promise(function(r) { setTimeout(r, delay); });
-                await checkAndRunWorldTicks();
-            }
-
-            if (needsRelUpdate) {
-                await new Promise(function(r) { setTimeout(r, delay); });
-                relsBusy = true;
-                try {
-                    await doRelationshipUpdate();
-                    if ($("#st-tab-relations").is(":visible")) renderRelationshipGraph();
-                    renderHUD();
-                    if (typeof toastr !== "undefined") toastr.info("Relationships updated.");
-                } catch(e) { console.error("[Story Tracker] Auto relationship update failed:", e); }
-                finally { relsBusy = false; }
-            }
-        } finally {
-            handleMsgRunning = false;
         }
     };
 
     es.on(et.CHARACTER_MESSAGE_RENDERED, handleMsg);
-    es.on(et.MESSAGE_RECEIVED, handleMsg);
     es.on(et.GENERATION_STARTED, function() { if (settings.enabled) injectContextToChat(); });
 }
 
@@ -1558,8 +1552,6 @@ function updateSettingsUI() {
     $("#st-s-world-freq").val(settings.worldTickFrequency);
     $("#st-s-max-ticks").val(settings.maxWorldTicks);
     $("#st-max-ticks-val").text(settings.maxWorldTicks);
-    $("#st-s-agent-delay").val(settings.agentDelay != null ? settings.agentDelay : 1500);
-    $("#st-agent-delay-val").text((settings.agentDelay != null ? settings.agentDelay : 1500) + "ms");
 
     // Sync Relationship Tracker settings
     $("#st-s-rel-on").prop("checked", settings.relationsEnabled);
@@ -1723,6 +1715,8 @@ async function doManualUpdate() {
 
     busy = true;
     var $b = $("#st-f-update").prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Analyzing...');
+    setHudStatus("Scene...");
+    if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing scene...", "", { timeOut: 0, extendedTimeOut: 0 });
     try {
         await doLLMUpdate();
         
@@ -1731,8 +1725,9 @@ async function doManualUpdate() {
         saveStoryData();
         
         renderModal(); renderHUD();
-        if(typeof toastr !== "undefined") toastr.success("Story updated!");
-    } catch(e) { if(typeof toastr !== "undefined") toastr.error(e.message); }
+        clearHudStatus();
+        if(typeof toastr !== "undefined") { toastr.clear(); toastr.success("Story updated!"); }
+    } catch(e) { clearHudStatus(); if (typeof toastr !== "undefined") { toastr.clear(); toastr.error(e.message); } }
     busy = false;
     $b.prop("disabled", false).html('<i class="fa-solid fa-pen"></i> Update now');
 }
@@ -2031,13 +2026,17 @@ async function runManualWorldTick() {
 
     worldBusy = true;
     var $btn = $("#st-world-btn-tick").prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Ticking...');
+    setHudStatus("World...");
+    if (typeof toastr !== "undefined") toastr.info("Story Tracker: Running world tick...", "", { timeOut: 0, extendedTimeOut: 0 });
     try {
         await runSingleWorldTick(tickTimeStr, tickDateStr);
         renderModal(); renderHUD();
-        if (typeof toastr !== "undefined") toastr.success("World tick generated!");
+        clearHudStatus();
+        if (typeof toastr !== "undefined") { toastr.clear(); toastr.success("World tick generated!"); }
 
     } catch(e) {
-        if (typeof toastr !== "undefined") toastr.error("World tick failed: " + e.message);
+        clearHudStatus();
+        if (typeof toastr !== "undefined") { toastr.clear(); toastr.error("World tick failed: " + e.message); }
     } finally {
         worldBusy = false;
         $btn.prop("disabled", false).html('<i class="fa-solid fa-play"></i> Run World Tick');
@@ -2279,13 +2278,17 @@ async function runManualRelationshipAnalysis() {
     loadRelationshipData();
     relsBusy = true;
     var $btn = $("#st-rel-btn-analyze").prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Analyzing...');
+    setHudStatus("Relations...");
+    if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing relationships...", "", { timeOut: 0, extendedTimeOut: 0 });
     try {
         await doRelationshipUpdate();
         renderRelationshipGraph();
         renderHUD();
-        if (typeof toastr !== "undefined") toastr.success("Relationships analyzed!");
+        clearHudStatus();
+        if (typeof toastr !== "undefined") { toastr.clear(); toastr.success("Relationships analyzed!"); }
     } catch(e) {
-        if (typeof toastr !== "undefined") toastr.error("Relationship analysis failed: " + e.message);
+        clearHudStatus();
+        if (typeof toastr !== "undefined") { toastr.clear(); toastr.error("Relationship analysis failed: " + e.message); }
         console.error("[Story Tracker] Manual relationship analysis error:", e);
     } finally {
         relsBusy = false;
@@ -2542,12 +2545,24 @@ function renderRelationshipGraph() {
 }
 
 // --- HUD ---
+function setHudStatus(label) {
+    var $s = $("#st-hud-status");
+    $s.html('<i class="fa-solid fa-spinner fa-spin"></i> ' + label).show();
+    $("#st-hud").addClass("st-hud-busy");
+}
+
+function clearHudStatus() {
+    $("#st-hud-status").hide().html("");
+    $("#st-hud").removeClass("st-hud-busy");
+}
+
 function buildHUD() {
     if (document.getElementById("st-hud")) return;
     let h = `<div id="st-hud" class="st-hud st-hud-collapsed">
         <div class="st-hud-head">
             <i class="fa-solid fa-book-open-reader"></i>
             <span class="st-hud-head-text" style="margin-left: 6px;">Tracker</span>
+            <span id="st-hud-status" style="margin-left:6px;font-size:9px;opacity:.75;display:none;"></span>
             <i style="margin-left:auto" class="fa-solid fa-chevron-up"></i>
         </div>
         <div class="st-hud-body" id="st-hud-body"></div>
@@ -2851,12 +2866,6 @@ function buildSettingsPanel() {
     h += '<div class="da-srow" id="st-max-ticks-row"><label><small>Maximum Tick Catchup: <span id="st-max-ticks-val"></span></small></label>' +
          '<input type="range" id="st-s-max-ticks" min="1" max="24" step="1"></div>';
 
-    // Agent Delay setting — controls the pause between sequential agent calls.
-    // Users on slow/local backends (Termux, low-VRAM models) should raise this.
-    h += '<div class="da-srow"><label><small>Agent Delay between calls: <span id="st-agent-delay-val"></span></small></label>' +
-         '<input type="range" id="st-s-agent-delay" min="500" max="10000" step="500"></div>';
-    h += '<div class="da-srow"><small style="opacity:.65;">&#x26A1; Raise to 3000–5000 ms if using a slow local model (Termux / low-VRAM). Default 1500 ms is fine for most APIs.</small></div>';
-
     // Relationship Tracker Settings
     h += '<hr><div class="da-srow"><b>Relationship Tracker</b></div>';
     h += '<div class="da-srow"><small style="opacity:.7">Tracks character bonds and how they evolve. Runs on its own message interval using checkpoints \u2014 only new messages since the last analysis are sent each time.</small></div>';
@@ -2986,14 +2995,6 @@ function buildSettingsPanel() {
         save();
     });
     $("#st-max-ticks-val").text(settings.maxWorldTicks);
-
-    // Agent Delay binding
-    $("#st-s-agent-delay").val(settings.agentDelay != null ? settings.agentDelay : 1500).on("input", function() {
-        settings.agentDelay = parseInt(this.value, 10);
-        $("#st-agent-delay-val").text(this.value + "ms");
-        save();
-    });
-    $("#st-agent-delay-val").text((settings.agentDelay != null ? settings.agentDelay : 1500) + "ms");
 
     // Relationship Tracker Settings Element Bindings
     $("#st-s-rel-on").prop("checked", settings.relationsEnabled).on("change", function() {
