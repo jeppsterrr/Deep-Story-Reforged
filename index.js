@@ -1043,7 +1043,7 @@ function bindEvents() {
         // Run agents sequentially to avoid concurrent API requests on rate-limited backends.
         // Each agent awaits the previous one and waits an extra 1.5s gap before firing.
         var needsSceneUpdate = autoUpdate && msgCounter > 0 && msgCounter % autoUpdateInterval === 0;
-        var needsWorldTick   = settings.worldEnabled;
+        var needsWorldTick   = settings.enabled && settings.worldEnabled;
         var needsRelUpdate   = settings.relationsEnabled && settings.relationsAutoUpdate && !relsBusy &&
                                relMsgCounter > 0 && relMsgCounter % (settings.relAutoInterval || 5) === 0;
 
@@ -3057,17 +3057,6 @@ function checkAndRunWorldTicks() {
                 renderModal(); renderHUD();
                 if (typeof toastr !== "undefined") toastr.info(`World simulated: ${ticksToRun} tick(s) processed.`);
 
-                // Auto-trigger relationship analysis after world tick if enabled
-                if (settings.relationsEnabled && settings.relationsAutoUpdate) {
-                    setTimeout(async function() {
-                        try {
-                            await doRelationshipUpdate();
-                            if ($("#st-tab-relations").is(":visible")) renderRelationshipGraph();
-                        } catch(e) {
-                            console.error("[Story Tracker] Post-tick relationship update failed:", e);
-                        }
-                    }, 400);
-                }
             } catch(e) {
                 console.error("[Story Tracker] World tick evaluation crashed:", e);
             } finally {
