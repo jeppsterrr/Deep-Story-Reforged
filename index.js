@@ -1009,14 +1009,19 @@ function bindEvents() {
         if (settings.enabled && settings.injectToContext) injectContextToChat();
     });
 
-    let handleMsg = async function(messageId, type) {
-        var id = Number(messageId);
-        if (!Number.isInteger(id) || id < 0) return;
+    let handleMsg = async function(type) {
+        // GENERATION_ENDED doesn't pass a message ID - we derive it from the chat array
+        var liveChat = getLiveChat();
+        if (!liveChat || liveChat.length === 0) return;
 
+        // Only process AI (character) messages, not user messages
+        var lastMsg = liveChat[liveChat.length - 1];
+        if (!lastMsg || lastMsg.is_user) return;
+
+        var id = liveChat.length - 1;
         if (id <= lastCountedMsgId) return;
 
-        var liveChat = getLiveChat();
-        var msgObj = liveChat ? liveChat[id] : null;
+        var msgObj = lastMsg;
         if (!msgObj || typeof msgObj.mes !== "string" || !msgObj.mes.trim()) return;
 
         lastCountedMsgId = id;
@@ -1090,7 +1095,7 @@ function bindEvents() {
         }
     };
 
-    es.on(et.CHARACTER_MESSAGE_RENDERED, handleMsg);
+    es.on(et.GENERATION_ENDED, handleMsg);
     es.on(et.GENERATION_STARTED, function() { if (settings.enabled) injectContextToChat(); });
 }
 
