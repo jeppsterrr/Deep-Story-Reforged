@@ -1021,10 +1021,7 @@ function bindEvents() {
         lastCountedMsgId = id;
         saveStoryData();
 
-        if (!settings.enabled) {
-            if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
-            return;
-        }
+        if (!settings.enabled) return;
 
         if (busy) return;
 
