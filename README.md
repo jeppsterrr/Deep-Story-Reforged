@@ -160,7 +160,6 @@ If a page reload interrupts a mid-switch, Story Tracker detects this on the next
 |---|---|
 | **Character Tracker** | Time, date, and location data is pushed automatically on each scene update. |
 | **Inventory** | Equipped outfits and held items are pulled into character lines and injected into the LLM prompt. |
-| **Translate** | Location, events, and character states can be displayed in your target language. |
 | **Connection Profiles** | Optional — required only if you want to use separate profiles for scene analysis, world ticks, or relationship updates. |
 
 ---
