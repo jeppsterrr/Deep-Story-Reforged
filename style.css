@@ -447,8 +447,8 @@
 
 .st-hud {
     position: fixed !important;
-    bottom: 90px !important;
-    right: 20px !important;
+    bottom: 90px;
+    right: 20px;
     z-index: 9989 !important;
     width: 260px !important;
     background: var(--st-journal-bg) !important;
@@ -458,8 +458,7 @@
     -webkit-backdrop-filter: blur(25px) !important;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6) !important;
     transition: width 0.2s ease, height 0.2s ease, border-radius 0.2s ease,
-                background 0.2s ease, left 0s !important, top 0s !important,
-                right 0s !important, bottom 0s !important;
+                background 0.2s ease, left 0s, top 0s, right 0s, bottom 0s !important;
     user-select: none !important;
     touch-action: none !important;
 }
