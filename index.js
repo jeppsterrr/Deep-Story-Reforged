@@ -112,6 +112,57 @@ var WORLD_PROMPT =
     "}\n" +
     "]";
 
+// Batched World Progression prompt - used when a time skip requires multiple ticks worth of
+// offscreen events. Generates them all in ONE call instead of one call per tick, saving cost
+// and avoiding repeated near-identical context. Still grounded in the same scene/chat context
+// so events stay organic and logically connected to what's happening onscreen.
+var WORLD_BATCH_PROMPT =
+    "[OOC: You are the World Progression Agent simulation engine. A larger gap of in-story time has passed.\n" +
+    "Analyze the current story context and simulate what has happened offscreen across this ENTIRE period, broken into the specific intervals listed below.\n\n" +
+    "TIME GAP TO COVER:\n" +
+    "- From: {{START_TIME}} {{START_DATE}}\n" +
+    "- To: {{END_TIME}} {{END_DATE}}\n" +
+    "- Generate offscreen events for EACH of these specific timestamps, in order: {{INTERVAL_LIST}}\n\n" +
+    "CURRENT SCENE DETAILS (what's happening onscreen RIGHT NOW, at the end of the gap):\n" +
+    "- Current Location: {{CURRENT_LOCATION}}\n" +
+    "- Recent Events: {{RECENT_EVENTS}}\n\n" +
+    "RECENTLY INTERACTED NPCs (characters the user has directly encountered in recent scenes - PRIORITIZE these in your npc_updates):\n" +
+    "{{INTERACTED_NPCS}}\n\n" +
+    "PAST HISTORY TIMELINE (Recorded chronology of the story's progression):\n" +
+    "{{PAST_HISTORY_TIMELINE}}\n\n" +
+    "RECENT CHAT HISTORY (use this to understand the RP's current narrative thread):\n" +
+    "{{RECENT_CHAT_HISTORY}}\n\n" +
+    "WORLD SUMMARY BEFORE THIS GAP:\n" +
+    "{{WORLD_SUMMARY}}\n\n" +
+    "NPC STATES BEFORE THIS GAP:\n" +
+    "{{NPC_STATES}}\n\n" +
+    "PENDING REVEALS BEFORE THIS GAP:\n" +
+    "{{PENDING_REVEALS}}\n\n" +
+    "Simulate what happens in the wider world outside the active scene across this whole period. Follow these STRICT guidelines:\n" +
+    "1. DO NOT narrate the ongoing scene, write dialogue, or speak as {{user}} or current active characters.\n" +
+    "2. Focus entirely on offscreen events, faction movements, weather developments, offscreen NPC actions, or logical background consequences of the main story.\n" +
+    "3. FOLLOW THE RP NARRATIVE: Your world updates must feel organically connected to the actual story thread shown in the Recent Chat History. Do not generate random unrelated global events.\n" +
+    "4. PRIORITIZE INTERACTED NPCs: For every NPC listed in 'RECENTLY INTERACTED NPCs', include at least one npc_update describing what they did across this gap, as a natural continuation of their last interaction.\n" +
+    "5. PRIORITIZE the existing World Summary, NPC States, and Pending Reveals as the baseline. Advance these logically and CONTINUOUSLY across the gap - later intervals should build on earlier ones, not repeat them.\n" +
+    "6. EVENTS PER INTERVAL: Produce at least one event for EACH timestamp listed in 'TIME GAP TO COVER'. You may include more than one event per interval if multiple things happen in parallel, but do not skip an interval entirely unless truly nothing of note occurred (a quiet interval is fine - represent it with a low-importance event).\n" +
+    "7. NO REPETITION: Do not repeat the same event or NPC action across multiple intervals. Each interval should show clear progression from the last.\n" +
+    "8. PROSE STYLE GUIDELINE: Write in a grounded, chronicle-like historical voice. Avoid flowery adjectives. Keep statements physically observable and logically consistent.\n" +
+    "9. REALISTIC PACING & TRAVEL TIME: Do not rush or compress time unrealistically. News and messengers travel at realistic speed.\n" +
+    "10. STRICT TIME VALIDATION: In the 'events' array, the 'time' field MUST be a valid 24-hour time format (HH:MM), matching one of the listed intervals or logically falling within the gap. Minutes (MM) MUST be between '00' and '59'.\n" +
+    "11. Provide the result strictly as a valid JSON object matching the requested schema.\n\n" +
+    "Respond ONLY with valid JSON using this format:\n" +
+    "{\n" +
+    "  \"summary\": \"A short, updated synthesis of the overall world state outside the immediate scene, reflecting the FULL gap. Reference specific story elements from the recent chat.\",\n" +
+    "  \"events\": [\n" +
+    "    { \"event\": \"Describe offscreen event details\", \"importance\": 5, \"time\": \"HH:MM\", \"date\": \"DD/MM/YYYY\" }\n" +
+    "  ],\n" +
+    "  \"npc_updates\": [\n" +
+    "    { \"name\": \"NPC name\", \"change\": \"What this NPC did across the gap, as a continuation of their last interaction\" }\n" +
+    "  ],\n" +
+    "  \"pending_reveals\": [\"A secret or rumor connected to recent story events that is developing but not yet known to the main characters\"]\n" +
+    "}\n" +
+    "]";
+
 // Relationship Dynamics Tracker prompt — runs after world tick (or manually)
 var RELATIONSHIP_PROMPT =
     "[OOC: You are a Relationship Dynamics Tracker for a roleplay narrative. Analyze the recent chat and extract character relationship data.\n\n" +
@@ -1983,6 +2034,184 @@ async function runSingleWorldTick(timeStr, dateStr) {
     saveWorldData();
 }
 
+// Batched world tick - covers MULTIPLE intervals in a single LLM call instead of one call per tick.
+// Used by checkAndRunWorldTicks when a catchup gap spans more than 1 interval, to save cost/time
+// while still grounding events in the same scene/chat context so they feel organic.
+async function runBatchWorldTick(intervalList, startTimeStr, startDateStr, endTimeStr, endDateStr) {
+    if (!genRaw) throw new Error("Raw LLM generation not available.");
+
+    var tickDateObj = parseRpDateTime(endTimeStr, endDateStr);
+
+    var sumBefore = worldData.worldSummary || "No world summary yet.";
+    var revealsBefore = (worldData.pendingReveals || []).join("\n") || "None.";
+
+    var npcStatesText = "";
+    if (worldData.npcStates && worldData.npcStates.length > 0) {
+        var recentNPCNames = new Set(extractRecentNPCsFromChat((scriptModule && scriptModule.chat) ? scriptModule.chat : [], 30));
+        var sortedNPCs = worldData.npcStates.slice().sort(function(a, b) {
+            var aRecent = recentNPCNames.has(a.name) ? 1 : 0;
+            var bRecent = recentNPCNames.has(b.name) ? 1 : 0;
+            return bRecent - aRecent;
+        });
+        var cappedNPCs = sortedNPCs.slice(0, 20);
+        npcStatesText = cappedNPCs.map(function(n) { return "- " + n.name + ": " + n.change; }).join("\n");
+        if (worldData.npcStates.length > 20) {
+            npcStatesText += "\n(" + (worldData.npcStates.length - 20) + " additional NPCs omitted - showing most recently active)";
+        }
+    } else {
+        npcStatesText = "No tracked NPCs yet.";
+    }
+
+    var originalChat = (scriptModule && scriptModule.chat) ? scriptModule.chat : [];
+    var worldLastCheckpoint = -1;
+    if (worldData._worldCheckpointIdx != null) {
+        var wcpIdx = worldData._worldCheckpointIdx;
+        var wcpAnchor = worldData._worldCheckpointAnchor || "";
+        var wcpMsg = originalChat[wcpIdx];
+        var wcpText = (wcpMsg && wcpMsg.mes) ? String(wcpMsg.mes).slice(0, 40) : "";
+        if (wcpAnchor && wcpText === wcpAnchor) {
+            worldLastCheckpoint = wcpIdx;
+        } else {
+            console.warn("[Story Tracker] World checkpoint anchor mismatch - falling back to last 15 messages.");
+        }
+    }
+    var worldMsgs = worldLastCheckpoint >= 0
+        ? originalChat.slice(worldLastCheckpoint + 1)
+        : originalChat.slice(-15);
+    if (worldMsgs.length < 3) worldMsgs = originalChat.slice(-3);
+    var chatHistoryText = "";
+    worldMsgs.forEach(function(msg) {
+        var senderName = msg.is_user ? (scriptModule && scriptModule.name1 ? scriptModule.name1 : "{{user}}") : (msg.name || "Char");
+        var msgText = (msg.mes || "").trim();
+        chatHistoryText += senderName + ": " + msgText + "\n";
+    });
+    if (!chatHistoryText.trim()) chatHistoryText = "No recent messages.";
+
+    var historyTimelineText = "";
+    if (storyData && storyData.history && storyData.history.length > 0) {
+        var reversedHist = [...storyData.history].reverse();
+        var addedCount = 0;
+        var HISTORY_INJECT_CAP = 12;
+        reversedHist.forEach(function(h) {
+            if (addedCount >= HISTORY_INJECT_CAP) return;
+            var entryDateObj = parseRpDateTime(h.time, h.date);
+            if (entryDateObj && tickDateObj && entryDateObj.getTime() <= tickDateObj.getTime()) {
+                historyTimelineText += `- Time: ${h.time} | Date: ${h.date} (Event: ${h.events})\n`;
+                addedCount++;
+            }
+        });
+        if (addedCount === 0) {
+            historyTimelineText = "No past history recorded before this tick.";
+        }
+    } else {
+        historyTimelineText = "No past history recorded yet.";
+    }
+
+    var currentLoc = (storyData && storyData.location) ? storyData.location : "Unknown";
+    var recentEv = (storyData && storyData.recent_events) ? storyData.recent_events : "None.";
+
+    var recentNPCs = extractRecentNPCsFromChat(originalChat, 15);
+    var interactedNPCsText = recentNPCs.length > 0
+        ? recentNPCs.map(function(n) { return "- " + n; }).join("\n")
+        : "None identified - generate general world updates.";
+
+    var intervalListText = intervalList.map(function(iv) { return iv.time + " " + iv.date; }).join(", ");
+
+    var prompt = WORLD_BATCH_PROMPT
+        .replace("{{START_TIME}}", startTimeStr)
+        .replace("{{START_DATE}}", startDateStr)
+        .replace("{{END_TIME}}", endTimeStr)
+        .replace("{{END_DATE}}", endDateStr)
+        .replace("{{INTERVAL_LIST}}", intervalListText)
+        .replace("{{CURRENT_LOCATION}}", currentLoc)
+        .replace("{{RECENT_EVENTS}}", recentEv)
+        .replace("{{INTERACTED_NPCS}}", interactedNPCsText)
+        .replace("{{PAST_HISTORY_TIMELINE}}", historyTimelineText)
+        .replace("{{RECENT_CHAT_HISTORY}}", chatHistoryText)
+        .replace("{{WORLD_SUMMARY}}", sumBefore)
+        .replace("{{NPC_STATES}}", npcStatesText)
+        .replace("{{PENDING_REVEALS}}", revealsBefore);
+
+    console.log("[Story Tracker] Executing batched World Agent simulation (" + intervalList.length + " intervals)...");
+    var raw = await withWorldConnectionProfile(async function () {
+        try {
+            return await genRaw({ prompt: prompt, quietToLoud: true });
+        } catch (e) {
+            return await genRaw(prompt, null, false, true);
+        }
+    });
+
+    var data = cleanAndParseJSON(raw);
+    if (!data || !data.summary) {
+        throw new Error("Invalid batched World Agent response object.");
+    }
+
+    worldData.worldSummary = data.summary;
+    worldData.lastTickTime = endTimeStr;
+    worldData.lastTickDate = endDateStr;
+    worldData._initialized = true;
+
+    if (Array.isArray(data.events)) {
+        data.events.forEach(function(e) {
+            if (e && e.event) {
+                if (isDuplicateEvent(e.event)) {
+                    console.log("[Story Tracker] Duplicate world event skipped:", e.event);
+                    return;
+                }
+                var eventTime = sanitizeTimeStr(e.time, endTimeStr);
+                var eventDate = sanitizeDateStr(e.date, endDateStr);
+
+                // Clamp events that fall outside the gap being covered (before start or after end)
+                var eventDateObj = parseRpDateTime(eventTime, eventDate);
+                if (eventDateObj && tickDateObj && eventDateObj.getTime() > tickDateObj.getTime()) {
+                    eventTime = endTimeStr;
+                    eventDate = endDateStr;
+                }
+
+                worldData.worldEvents.unshift({
+                    time: eventTime,
+                    date: eventDate,
+                    event: e.event,
+                    importance: parseInt(e.importance, 10) || 5
+                });
+            }
+        });
+    }
+
+    if (Array.isArray(data.npc_updates)) {
+        data.npc_updates.forEach(function(npc) {
+            if (npc && npc.name && npc.change) {
+                var existing = worldData.npcStates.find(n => n.name.toLowerCase() === npc.name.toLowerCase());
+                if (existing) {
+                    existing.change = npc.change;
+                } else {
+                    worldData.npcStates.push({ name: npc.name, change: npc.change });
+                }
+            }
+        });
+    }
+
+    if (Array.isArray(data.pending_reveals)) {
+        data.pending_reveals.forEach(function(rev) {
+            if (rev && !worldData.pendingReveals.includes(rev)) {
+                worldData.pendingReveals.push(rev);
+            }
+        });
+        if (worldData.pendingReveals.length > 15) {
+            worldData.pendingReveals = worldData.pendingReveals.slice(-15);
+        }
+    }
+
+    if (originalChat.length > 0) {
+        var lastWorldMsg = originalChat[originalChat.length - 1];
+        worldData._worldCheckpointIdx = originalChat.length - 1;
+        worldData._worldCheckpointAnchor = (lastWorldMsg && lastWorldMsg.mes)
+            ? String(lastWorldMsg.mes).slice(0, 40) : "";
+    }
+    trimWorldEvents();
+    saveWorldData();
+}
+
 function trimWorldEvents() {
     if (!worldData || !worldData.worldEvents || worldData.worldEvents.length <= 15) return;
 
@@ -3110,15 +3339,28 @@ function checkAndRunWorldTicks() {
         (async function() {
             worldBusy = true;
             try {
-                for (var i = 0; i < ticksToRun; i++) {
-                    // Back-calculate tick timestamps to step chronologically
-                    var tickTimeOffsetMs = (i + 1) * thresholdHours * 60 * 60 * 1000;
+                if (ticksToRun === 1) {
+                    // Single tick - use the standard one-call-per-tick path
+                    var tickTimeOffsetMs = thresholdHours * 60 * 60 * 1000;
                     var tickDateObj = new Date(lastDateObj.getTime() + tickTimeOffsetMs);
-                    
                     var tickTimeStr = padZero(tickDateObj.getHours()) + ":" + padZero(tickDateObj.getMinutes());
                     var tickDateStr = padZero(tickDateObj.getDate()) + "/" + padZero(tickDateObj.getMonth() + 1) + "/" + tickDateObj.getFullYear();
-
                     await runSingleWorldTick(tickTimeStr, tickDateStr);
+                } else {
+                    // Multiple ticks needed (catchup) - batch them into ONE LLM call instead of
+                    // calling runSingleWorldTick repeatedly. Saves cost/time while still asking
+                    // for one event per interval so the world progresses logically, not vaguely.
+                    var intervalList = [];
+                    for (var i = 0; i < ticksToRun; i++) {
+                        var ivOffsetMs = (i + 1) * thresholdHours * 60 * 60 * 1000;
+                        var ivDateObj = new Date(lastDateObj.getTime() + ivOffsetMs);
+                        intervalList.push({
+                            time: padZero(ivDateObj.getHours()) + ":" + padZero(ivDateObj.getMinutes()),
+                            date: padZero(ivDateObj.getDate()) + "/" + padZero(ivDateObj.getMonth() + 1) + "/" + ivDateObj.getFullYear()
+                        });
+                    }
+                    var lastInterval = intervalList[intervalList.length - 1];
+                    await runBatchWorldTick(intervalList, lastTime, lastDate, lastInterval.time, lastInterval.date);
                 }
                 renderModal(); renderHUD();
                 if (typeof toastr !== "undefined") toastr.info(`World simulated: ${ticksToRun} tick(s) processed.`);
