@@ -866,15 +866,45 @@ function shouldSwitchProfile() {
     return true;
 }
 
+// Surfaces whatever extra detail is attached to a failed genRaw() call.
+// A bare "Bad Request" Error doesn't tell us *why* the backend rejected the
+// request, so we dig into common places that detail might live.
+function logGenRawFailure(context, e, profileName) {
+    var detail = {
+        message: e && e.message,
+        status: e && (e.status || e.statusCode),
+        response: e && e.response,
+        cause: e && e.cause,
+        body: e && e.body,
+        activeProfile: profileName || getCurrentProfileName(),
+    };
+    console.warn("[Story Tracker] genRaw object-form call failed (" + context + "), falling back to legacy call signature:", e, detail);
+}
+
 async function switchProfile(name) {
     if (!runSlash || !name) return false;
     if (!profileExists(name)) {
         console.warn("[Story Tracker] Connection profile '" + name + "' was not found in the profile list; skipping switch and using the currently active profile instead.");
         return false;
     }
+    var t0 = performance.now();
     try {
         await runSlash('/profile "' + String(name).replace(/"/g, '\\"') + '"');
-        await new Promise(function (r) { setTimeout(r, 150); });
+        // Poll for the switch to actually take effect instead of trusting a fixed delay,
+        // since different profile pairs (e.g. different API sources) can take very
+        // different amounts of time to fully activate.
+        var attempts = 0;
+        while (getCurrentProfileName() !== name && attempts < 20) {
+            await new Promise(function (r) { setTimeout(r, 100); });
+            attempts++;
+        }
+        var elapsed = Math.round(performance.now() - t0);
+        var finalProfile = getCurrentProfileName();
+        if (finalProfile !== name) {
+            console.warn("[Story Tracker] Profile switch to '" + name + "' did not confirm after " + elapsed + "ms (" + attempts + " poll attempts). Current profile is still '" + finalProfile + "'. Proceeding anyway.");
+        } else {
+            console.log("[Story Tracker] Profile switch to '" + name + "' confirmed after " + elapsed + "ms (" + attempts + " poll attempts).");
+        }
         return true;
     } catch (e) {
         console.warn("[Story Tracker] Failed to switch to profile '" + name + "':", e);
@@ -1931,7 +1961,7 @@ async function doLLMUpdate() {
         try {
             return await genRaw({ prompt: prompt, quietToLoud: true });
         } catch(e) {
-            console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e);
+            logGenRawFailure("scene update", e);
             return await genRaw(prompt, null, false, true);
         }
     });
@@ -1958,7 +1988,7 @@ async function doLLMUpdate() {
             var ccPrompt = CITY_COUNTRY_PROMPT.replace("{{LOCATION}}", storyData.location || "Unknown");
             var ccRaw = await withConnectionProfile(async function() {
                 try { return await genRaw({ prompt: ccPrompt, quietToLoud: true }); }
-                catch(e) { console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e); return await genRaw(ccPrompt, null, false, true); }
+                catch(e) { logGenRawFailure("city/country fallback", e); return await genRaw(ccPrompt, null, false, true); }
             });
             var ccData = cleanAndParseJSON(ccRaw);
             if (ccData) {
@@ -2216,7 +2246,7 @@ async function runSingleWorldTick(timeStr, dateStr) {
                 quietToLoud: true
             });
         } catch (e) {
-            console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e);
+            logGenRawFailure("world agent", e);
             return await genRaw(prompt, null, false, true);
         }
     });
@@ -2399,7 +2429,7 @@ async function runBatchWorldTick(intervalList, startTimeStr, startDateStr, endTi
         try {
             return await genRaw({ prompt: prompt, quietToLoud: true });
         } catch (e) {
-            console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e);
+            logGenRawFailure("batched world agent", e);
             return await genRaw(prompt, null, false, true);
         }
     });
@@ -2615,7 +2645,7 @@ async function doRelationshipUpdate() {
     console.log("[Story Tracker] Running relationship analysis...");
     var raw = await withRelConnectionProfile(async function() {
         try { return await genRaw({ prompt: prompt, quietToLoud: true }); }
-        catch(e) { console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e); return await genRaw(prompt, null, false, true); }
+        catch(e) { logGenRawFailure("relationship tracker", e); return await genRaw(prompt, null, false, true); }
     });
 
     var data = cleanAndParseJSON(raw);
