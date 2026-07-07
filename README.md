@@ -10,8 +10,13 @@ Originally created by [virgilianshailer](https://github.com/virgilianshailer). T
 
 1. In SillyTavern, open **Extensions → Install Extension**.
 2. Paste the URL of this repository and click **Install**.
-3. https://github.com/jeppsterrr/Deep-Story-Reforged
 
+   ```
+   https://github.com/jeppsterrr/Deep-Story-Reforged
+
+   ```
+
+  
 Or install manually:
 
 ```
