@@ -6,6 +6,6 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Jeppsterrr (forked from virgilianshailer)",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "description": "Tracks scene context, world progression, and character relationships to maintain narrative consistency."
 }

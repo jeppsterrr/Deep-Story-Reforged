@@ -3,204 +3,84 @@
  * Keeps track of Time, Date, Location, Character Positions, and Recent Events.
  * Reduces amnesia by injecting scene context into LLM prompts.
  * Includes World Progression Agent subsystem.
+ *
+ * FILE STRUCTURE (as of the module split): this file is a classic (non-module)
+ * script — SillyTavern loads it directly, not as `type="module"` — so it can't
+ * use static `import`. Everything that used to live here as one 5300-line file
+ * now lives in real ES modules loaded via dynamic `import()` inside the
+ * bootstrap below, same technique already used for TimelineEngine/Scheduler/
+ * EventQueue/SceneAgent/WorldAgent/RelationshipAgent:
+ *
+ *   Store.js       — shared mutable state (settings, storyData, worldData,
+ *                     relationshipData, busy flags, the agent module handles).
+ *                     Every other module reads/writes through this instead of
+ *                     bare top-level `var`s, since ES modules don't share this
+ *                     file's classic-script global scope.
+ *   Persistence.js — load/save for settings and per-chat data.
+ *   ProfileSession.js — connection-profile switching for the 3 trackers.
+ *   Pipeline.js    — the actual message-handling brain: Scheduler/EventQueue
+ *                     dispatch, and the Scene/World/Relationship tracker calls.
+ *   HUD.js         — the floating snapshot widget (redesigned; see its header).
+ *   LLMResponseParser.js — robust JSON extraction from model responses.
+ *
+ * What's LEFT in this file: settings defaults, the bootstrap that wires
+ * everything together, and the UI that was always specific to this file
+ * anyway — the main modal (journal/world/relationships/settings tabs), the
+ * relationship graph, and the settings panel. These reach the modules above
+ * through the `Store`/`Persistence`/`ProfileSession`/`Pipeline`/`HUD` handles
+ * set up in the bootstrap, exactly like the pre-split code already reached
+ * TimelineEngine/WorldAgent/etc. through module handles of the same shape.
+ * A few small UI-only helpers (getInventoryOutfit, renderModal, syncToCharTracker,
+ * etc.) stay here and are reached FROM those modules via `window.<fn>()`, since
+ * a classic script can't be an `import` target the other direction.
  */
 
-var MODULE = "story-tracker";
-var DATA_KEY = "story_tracker_data";
-var WORLD_KEY = "story_world_data";
-var RELATIONSHIP_KEY = "story_relationship_data";
+// --- Expose UI-only helpers on window ---------------------------------------
+// index.js's header comment above assumes this file runs as a classic
+// (non-module) <script>, where a top-level `function foo(){}` becomes
+// `window.foo` for free. In practice SillyTavern loads extension entry
+// points via dynamic `import()`, which always evaluates the file as a real
+// ES module — and inside a module, top-level function declarations are
+// module-scoped only; they never leak onto `window`. HUD.js and Pipeline.js
+// are separate ES modules that reach these UI-only helpers via
+// `window.renderModal()` / `window.getInventoryOutfit()` / etc. (since a
+// classic script can't be an `import` target the other direction — see the
+// header comment), so without this explicit attachment those calls throw
+// "window.<fn> is not a function" the moment the calling module fires.
+// getDayOfWeek was the one exception that didn't outright crash — HUD.js
+// guards it with `window.getDayOfWeek ? window.getDayOfWeek(...) : null` —
+// but that meant the HUD's day-of-week display silently never rendered;
+// it's included here too so it actually works instead of quietly no-op'ing.
+// Safe to do up here despite the definitions appearing later in the file:
+// function declarations are hoisted to the top of their enclosing scope
+// (module top-level, in this case), so all four already exist by the time
+// this line runs.
+window.renderModal = renderModal;
+window.getInventoryOutfit = getInventoryOutfit;
+window.syncToCharTracker = syncToCharTracker;
+window.updateSettingsUI = updateSettingsUI;
+window.renderAutoInfo = renderAutoInfo;
+window.renderRelationshipGraph = renderRelationshipGraph;
+window.getDayOfWeek = getDayOfWeek;
 
-// Helper to reliably sanitize and extract JSON from model responses containing thought or formatting tags
-function cleanAndParseJSON(rawStr) {
-    if (!rawStr || typeof rawStr !== "string") return null;
-    let str = rawStr.trim();
-    
-    // Remove custom CoT structures (e.g. <|channel>thought ... <channel|>)
-    str = str.replace(/<\|channel>thought[\s\S]*?<channel\|>/gi, "");
-    str = str.replace(/<channel[\s\S]*?channel>/gi, "");
-    str = str.replace(/<[^>]+thought[\s\S]*?>[\s\S]*?<\/[^>]+>/gi, "");
-    
-    // Strip standard markdown blocks
-    str = str.replace(/```json\s*([\s\S]*?)\s*```/gi, "$1");
-    str = str.replace(/```\s*([\s\S]*?)\s*```/gi, "$1");
-    
-    try {
-        return JSON.parse(str.trim());
-    } catch (e) {
-        var m = str.match(/\{[\s\S]*\}/);
-        if (m) {
-            try {
-                return JSON.parse(m[0]);
-            } catch (ex) {
-                return null;
-            }
-        }
-    }
-    return null;
-}
-
-// --- Prompts ---
-var UPDATE_PROMPT = 
-    "[OOC: You are a narrative assistant. Analyze the roleplay chat so far and determine the current scene context.\n\n" +
-    "1. TIMELINE & LOCATION: Deduce the current Time (HH:MM), Date (DD/MM/YYYY or similar format), specific Location, current Temperature (e.g. '18°C' or '64°F'), and Weather conditions (e.g. 'Clear', 'Rainy', 'Overcast', 'Snowing', 'Stormy', 'Hot', 'Foggy'). If indoors or weather is unspecified, infer from context or write 'Unknown'. Time MUST progress logically based on recent actions.\n" +
-    "2. CITY & COUNTRY — MANDATORY, NEVER USE 'Unknown': You MUST always fill both 'city' and 'country' fields with a real or invented name. Rules:\n" +
-    "   - Real-world setting → use the actual city and country (e.g. 'Paris' / 'France').\n" +
-    "   - Fantasy / sci-fi / fictional world → INVENT fitting names based on the story tone, character names, culture, architecture, language style. Be creative and specific (e.g. 'Myrenveld' / 'Sovereign Realms of Drak'hara').\n" +
-    "   - Known fictional universe (Westeros, Middle-earth, etc.) → use canonical place names.\n" +
-    "   - Setting is ambiguous or unspecified → make your BEST GUESS or freely invent. 'Unknown' is NOT an acceptable value under any circumstances.\n" +
-    "3. CHARACTER POSITIONS: List every character present in the current scene (including {{user}} the player). Use the player's actual name as it appears in the chat - NOT the word 'User'. State exactly where they are and what their physical posture/action is right now.\n" +
-    "4. RECENT EVENTS: Write a brief, factual 1-2 sentence summary of what just changed or happened in the last few messages. Use the player's actual name, not 'User'.\n\n" +
-    "{{PREVIOUS_STATE}}\n\n" +
-    "Respond ONLY with valid JSON in the story's language. IMPORTANT: In the characters array, use the player's actual name from the chat - never write 'User'. Use this exact structure (city and country MUST be non-empty strings, never 'Unknown'):\n" +
-    "{\"time\":\"14:30\", \"date\":\"15/06/2024\", \"location\":\"Living room\", \"city\":\"Myrenveld\", \"country\":\"Sovereign Realms of Drak'hara\", \"temperature\":\"18°C\", \"weather\":\"Cloudy\", \"characters\":[{\"name\":\"Jepp\", \"state\":\"sitting on floor\"}, {\"name\":\"Char1\", \"state\":\"standing near Jepp\"}], \"recent_events\":\"Char1 entered the living room and spoke to Jepp.\"}\n" +
-    "]";
-
-// Fallback prompt — used when city/country is still unknown after main update
-var CITY_COUNTRY_PROMPT =
-    "[OOC: Based on the roleplay chat so far, determine the city/settlement and country/realm of the current scene.\n\n" +
-    "Current known location: {{LOCATION}}\n\n" +
-    "Rules (STRICTLY FOLLOW):\n" +
-    "- If this is a real-world setting: provide the actual city and country.\n" +
-    "- If this is a fantasy, sci-fi, or fictional world: INVENT a creative, fitting city name and realm/country name that matches the story's tone, culture, and character names. Be specific — never use generic placeholders.\n" +
-    "- If you recognize a known fictional universe (Westeros, Middle-earth, Star Wars, etc.): use canonical place names.\n" +
-    "- 'Unknown' is FORBIDDEN. You MUST always output a real or invented name.\n\n" +
-    "Respond ONLY with valid JSON: {\"city\": \"CityName\", \"country\": \"CountryOrRealm\"}\n" +
-    "]";
-
-// World Progression simulation prompt
-var WORLD_PROMPT = 
-    "[OOC: You are the World Progression Agent simulation engine. Analyze the current story context and simulate what has happened offscreen during this time period.\n\n" +
-    "CURRENT SCENE DETAILS:\n" +
-    "- Current Time: {{CURRENT_TIME}}\n" +
-    "- Current Date: {{CURRENT_DATE}}\n" +
-    "- Current Location: {{CURRENT_LOCATION}}\n" +
-    "- Recent Events: {{RECENT_EVENTS}}\n\n" +
-    "RECENTLY INTERACTED NPCs (characters the user has directly encountered in recent scenes — PRIORITIZE these in your npc_updates):\n" +
-    "{{INTERACTED_NPCS}}\n\n" +
-    "PAST HISTORY TIMELINE (Recorded chronology of the story's progression):\n" +
-    "{{PAST_HISTORY_TIMELINE}}\n\n" +
-    "RECENT CHAT HISTORY (LAST 10 MESSAGES — use this to understand the RP's current narrative thread):\n" +
-    "{{RECENT_CHAT_HISTORY}}\n\n" +
-    "WORLD SUMMARY BEFORE THIS TICK:\n" +
-    "{{WORLD_SUMMARY}}\n\n" +
-    "NPC STATES BEFORE THIS TICK:\n" +
-    "{{NPC_STATES}}\n\n" +
-    "PENDING REVEALS BEFORE THIS TICK:\n" +
-    "{{PENDING_REVEALS}}\n\n" +
-    "Simulate what happens in the wider world outside the active scene during this period. Follow these STRICT guidelines:\n" +
-    "1. DO NOT narrate the ongoing scene, write dialogue, or speak as {{user}} or current active characters.\n" +
-    "2. Focus entirely on offscreen events, faction movements, weather developments, offscreen NPC actions, or logical background consequences of the main story.\n" +
-    "3. FOLLOW THE RP NARRATIVE: Your world updates must feel organically connected to the actual story thread shown in the Recent Chat History. If the characters are in a tavern talking to a merchant, the world tick should reflect that context (e.g., what is that merchant's guild doing, what rumors are circulating, what other patrons overheard). Do not generate random unrelated global events.\n" +
-    "4. PRIORITIZE INTERACTED NPCs: For every NPC listed in the 'RECENTLY INTERACTED NPCs' section, you MUST include an npc_update entry describing what they are doing offscreen after their last interaction. These updates should feel like natural continuations of the conversation or event that occurred.\n" +
-    "5. PRIORITIZE the existing World Summary, offscreen NPC States, and Pending Reveals as the primary baseline. Advance these background states logically based on the passage of time and the events/consequences of the Recent Chat History.\n" +
-    "6. Check the provided PAST HISTORY TIMELINE to align your simulated offscreen events with those exact timestamps. For each event in the 'events' array, you must provide a 'time' and 'date' field matching one of the timestamps from the history timeline or logically fitting within it.\n" +
-    "7. PROSE STYLE GUIDELINE: Write in a grounded, chronicle-like historical voice. Avoid flowery adjectives. Keep statements physically observable and logically consistent. Focus on strategy, logistics, movements, and faction developments.\n" +
-    "8. REALISTIC PACING & TRAVEL TIME: Do not rush or compress time. If a character leaves a scene or moves between locations offscreen, enforce realistic physical transit times. News and messengers travel at realistic speed.\n" +
-    "9. NO CHRONOLOGICAL COMPRESSION: Multiple events in the 'events' array must represent parallel offscreen developments in different areas, NOT sequential steps of a single action chain.\n" +
-    "10. STRICT TIME VALIDATION: In the 'events' array, the 'time' field MUST be a valid 24-hour time format (HH:MM). Minutes (MM) MUST strictly be between '00' and '59'. If unsure, use the tick's current time ({{CURRENT_TIME}}) directly.\n" +
-    "11. Provide the result strictly as a valid JSON object matching the requested schema.\n\n" +
-    "Respond ONLY with valid JSON using this format:\n" +
-    "{\n" +
-    "  \"summary\": \"A short, updated synthesis of the overall world state outside the immediate scene. Reference specific story elements from the recent chat.\",\n" +
-    "  \"events\": [\n" +
-    "    { \"event\": \"Describe offscreen event details\", \"importance\": 5, \"time\": \"HH:MM\", \"date\": \"DD/MM/YYYY\" }\n" +
-    "  ],\n" +
-    "  \"npc_updates\": [\n" +
-    "    { \"name\": \"NPC name\", \"change\": \"What this NPC is doing offscreen after their last interaction — must feel like a natural continuation\" }\n" +
-    "  ],\n" +
-    "  \"pending_reveals\": [\"A secret or rumor connected to recent story events that is developing but not yet known to the main characters\"]\n" +
-    "}\n" +
-    "]";
-
-// Batched World Progression prompt - used when a time skip requires multiple ticks worth of
-// offscreen events. Generates them all in ONE call instead of one call per tick, saving cost
-// and avoiding repeated near-identical context. Still grounded in the same scene/chat context
-// so events stay organic and logically connected to what's happening onscreen.
-var WORLD_BATCH_PROMPT =
-    "[OOC: You are the World Progression Agent simulation engine. A larger gap of in-story time has passed.\n" +
-    "Analyze the current story context and simulate what has happened offscreen across this ENTIRE period, broken into the specific intervals listed below.\n\n" +
-    "TIME GAP TO COVER:\n" +
-    "- From: {{START_TIME}} {{START_DATE}}\n" +
-    "- To: {{END_TIME}} {{END_DATE}}\n" +
-    "- Generate offscreen events for EACH of these specific timestamps, in order: {{INTERVAL_LIST}}\n\n" +
-    "CURRENT SCENE DETAILS (what's happening onscreen RIGHT NOW, at the end of the gap):\n" +
-    "- Current Location: {{CURRENT_LOCATION}}\n" +
-    "- Recent Events: {{RECENT_EVENTS}}\n\n" +
-    "RECENTLY INTERACTED NPCs (characters the user has directly encountered in recent scenes - PRIORITIZE these in your npc_updates):\n" +
-    "{{INTERACTED_NPCS}}\n\n" +
-    "PAST HISTORY TIMELINE (Recorded chronology of the story's progression):\n" +
-    "{{PAST_HISTORY_TIMELINE}}\n\n" +
-    "RECENT CHAT HISTORY (use this to understand the RP's current narrative thread):\n" +
-    "{{RECENT_CHAT_HISTORY}}\n\n" +
-    "WORLD SUMMARY BEFORE THIS GAP:\n" +
-    "{{WORLD_SUMMARY}}\n\n" +
-    "NPC STATES BEFORE THIS GAP:\n" +
-    "{{NPC_STATES}}\n\n" +
-    "PENDING REVEALS BEFORE THIS GAP:\n" +
-    "{{PENDING_REVEALS}}\n\n" +
-    "Simulate what happens in the wider world outside the active scene across this whole period. Follow these STRICT guidelines:\n" +
-    "1. DO NOT narrate the ongoing scene, write dialogue, or speak as {{user}} or current active characters.\n" +
-    "2. Focus entirely on offscreen events, faction movements, weather developments, offscreen NPC actions, or logical background consequences of the main story.\n" +
-    "3. FOLLOW THE RP NARRATIVE: Your world updates must feel organically connected to the actual story thread shown in the Recent Chat History. Do not generate random unrelated global events.\n" +
-    "4. PRIORITIZE INTERACTED NPCs: For every NPC listed in 'RECENTLY INTERACTED NPCs', include at least one npc_update describing what they did across this gap, as a natural continuation of their last interaction.\n" +
-    "5. PRIORITIZE the existing World Summary, NPC States, and Pending Reveals as the baseline. Advance these logically and CONTINUOUSLY across the gap - later intervals should build on earlier ones, not repeat them.\n" +
-    "6. EVENTS PER INTERVAL: Produce at least one event for EACH timestamp listed in 'TIME GAP TO COVER'. You may include more than one event per interval if multiple things happen in parallel, but do not skip an interval entirely unless truly nothing of note occurred (a quiet interval is fine - represent it with a low-importance event).\n" +
-    "7. NO REPETITION: Do not repeat the same event or NPC action across multiple intervals. Each interval should show clear progression from the last.\n" +
-    "8. PROSE STYLE GUIDELINE: Write in a grounded, chronicle-like historical voice. Avoid flowery adjectives. Keep statements physically observable and logically consistent.\n" +
-    "9. REALISTIC PACING & TRAVEL TIME: Do not rush or compress time unrealistically. News and messengers travel at realistic speed.\n" +
-    "10. STRICT TIME VALIDATION: In the 'events' array, the 'time' field MUST be a valid 24-hour time format (HH:MM), matching one of the listed intervals or logically falling within the gap. Minutes (MM) MUST be between '00' and '59'.\n" +
-    "11. Provide the result strictly as a valid JSON object matching the requested schema.\n\n" +
-    "Respond ONLY with valid JSON using this format:\n" +
-    "{\n" +
-    "  \"summary\": \"A short, updated synthesis of the overall world state outside the immediate scene, reflecting the FULL gap. Reference specific story elements from the recent chat.\",\n" +
-    "  \"events\": [\n" +
-    "    { \"event\": \"Describe offscreen event details\", \"importance\": 5, \"time\": \"HH:MM\", \"date\": \"DD/MM/YYYY\" }\n" +
-    "  ],\n" +
-    "  \"npc_updates\": [\n" +
-    "    { \"name\": \"NPC name\", \"change\": \"What this NPC did across the gap, as a continuation of their last interaction\" }\n" +
-    "  ],\n" +
-    "  \"pending_reveals\": [\"A secret or rumor connected to recent story events that is developing but not yet known to the main characters\"]\n" +
-    "}\n" +
-    "]";
-
-// Relationship Dynamics Tracker prompt — runs after world tick (or manually)
-var RELATIONSHIP_PROMPT =
-    "[OOC: You are a Relationship Dynamics Tracker for a roleplay narrative. Analyze the recent chat and extract character relationship data.\n\n" +
-    "CHARACTERS CURRENTLY IN SCENE:\n{{SCENE_CHARACTERS}}\n\n" +
-    "EXISTING TRACKED RELATIONSHIPS (evolve these — do NOT replace stable ones without evidence):\n{{EXISTING_RELATIONSHIPS}}\n\n" +
-    "RECENT CHAT HISTORY (LAST 15 MESSAGES — identify relationship interactions here):\n{{RECENT_CHAT}}\n\n" +
-    "Instructions:\n" +
-    "1. Identify all meaningful relationships between named characters evidenced in the recent chat.\n" +
-    "2. For each pair that interacts or is referenced, determine the relationship type and current emotional strength.\n" +
-    "3. If a relationship already exists in the baseline, UPDATE its strength and summary based on new evidence — show evolution.\n" +
-    "4. Only include pairs with meaningful narrative evidence. Do NOT invent connections not shown in the text.\n" +
-    "5. 'strength' is a decimal from -1.0 (completely hostile/broken) to 1.0 (deeply bonded/loving). 0.0 = neutral.\n" +
-    "6. 'type' must be exactly one of: romance, friendship, family, alliance, rivalry, hostile, mentor, neutral.\n" +
-    "7. 'change' should be a single concise sentence describing what CHANGED, or 'Stable' if unchanged.\n" +
-    "8. Always use the exact character names as they appear in the chat (case-sensitive).\n\n" +
-    "Respond ONLY with valid JSON (no markdown, no preamble):\n" +
-    "{\n" +
-    "  \"relationships\": [\n" +
-    "    { \"from\": \"CharA\", \"to\": \"CharB\", \"type\": \"friendship\", \"strength\": 0.6, \"summary\": \"Brief description of their current dynamic\", \"change\": \"What changed or Stable\" }\n" +
-    "  ]\n" +
-    "}\n" +
-    "]";
-
-// --- State Variables ---
-var settings = {
+var DEFAULT_SETTINGS = {
     enabled: true,
     showHUD: true,
-    hudScale: 100,            
+    hudScale: 100,
+    hudTimeTint: true,        // subtle HUD background tint that follows the RP clock (see HUD.js)
     showChatButton: true,
     autoUpdate: true,
-    autoUpdateInterval: 3,
-    injectToContext: true,
-    showHistory: true,
     showCityCountry: false,
     useConnectionProfile: false, 
     connectionProfile: "",       
     _restoreProfile: "",
     _restoreWorldProfile: "",
+    // Single marker for the unified cross-tracker profile session (see runTrackerProfileSession)
+    // that replaced the three separate switch-then-immediately-restore wrappers below. Same
+    // crash-recovery purpose as the three _restore* fields above (interrupted page reload
+    // mid-switch), just one field instead of three since there's now only ever one "original
+    // profile to go back to" per pipeline run, however many trackers/targets it touches.
+    _restoreTrackerProfile: "",
     hudLeft: null,            // Saved HUD position — raw CSS pixels (null = use stylesheet default)
     hudTop:  null,
 
@@ -210,14 +90,38 @@ var settings = {
     accentB: 64,
 
     // World Agent Settings
+    // "enabled" now covers BOTH running the agent AND injecting its context — the old separate
+    // injectWorldContext checkbox is gone. If any of these are off, that tracker neither runs
+    // nor injects, same as before but with one fewer setting to misconfigure.
     worldEnabled: false,
     useWorldProfile: false,
     worldConnectionProfile: "",
-    worldTickFrequency: "1h", // "1h", "3h", "1d", "manual"
-    maxWorldTicks: 6,
-    injectWorldContext: false,
+    maxWorldTicks: 3, // per-tier catchup cap, passed to Scheduler.evaluate() as maxCatchupTicks
 
-    // Relationship Tracker Settings
+    // When multiple world tiers are due on the same message (common after a big time
+    // skip), OFF (default) runs them one at a time, same behavior as before — safest
+    // for accounts on tight per-minute rate limits. ON runs npc/weather/faction
+    // concurrently (they don't depend on each other's fresh output this tick) and only
+    // runs world afterward, since world's prompt wants faction's just-produced events.
+    // Opt-in because concurrent calls mean concurrent rate-limit consumption.
+    parallelWorldTiers: false,
+
+    // Seasonal grounding — a light, optional line of context ("current season: winter")
+    // fed into the Weather and World tier prompts, computed from the real RP calendar
+    // date. "none" disables it entirely (e.g. for settings with no real-season mapping).
+    seasonHemisphere: "northern", // "northern" | "southern" | "none"
+
+    // Scheduler tier intervals, in RP-MINUTES. Internal to the "World" category in the settings
+    // panel (per the 3-category decision: Scene/World/Relationship) — these are the advanced
+    // knobs behind the single "World" toggle, not separate top-level enable switches.
+    sceneTierMinutes: 5,
+    npcTierMinutes: 30,
+    weatherTierMinutes: 1440,
+    factionTierMinutes: 360,
+    worldTierMinutes: 1440,
+
+    // Relationship Tracker Settings — stays on its own message-count cadence, decoupled from
+    // the RP-clock Scheduler tiers (explicit decision: message count is best for relationships).
     relationsEnabled: false,
     relationsAutoUpdate: true,
     relAutoInterval: 5,
@@ -225,118 +129,117 @@ var settings = {
     useRelProfile: false,
     relConnectionProfile: "",
     _restoreRelProfile: "",
-    injectRelationsContext: false
-};
-var extSettings = null, saveFn = null, saveMetaFn = null, scriptModule = null, genRaw = null;
-var runSlash = null; 
-var storyData = null; 
-var worldData = null;
-var relationshipData = null;
-var msgCounter = 0;
-var lastCountedMsgId = -1; // highest chat message ID counted so far (drives the "no swipes/regens/dupes" filter)
-var busy = false;       // scene tracker lock
-var worldBusy = false;  // world agent lock
-var relsBusy = false;   // relationship tracker lock
-var relMsgCounter = 0;  // counts messages since last relationship checkpoint
 
-// Global lock - returns true if ANY agent is currently generating.
-// Prevents concurrent API requests when multiple agents fire at once.
-function anyBusy() { return busy || worldBusy || relsBusy; }
+    // Time Mode — how the LLM decides real elapsed time. The clock ALWAYS advances a flat
+    // 1 minute per message on its own regardless of mode (advanceBaseline) — that's purely
+    // cosmetic continuity so the HUD never looks frozen. Which of the two modes below is
+    // active decides what, if anything, OVERRIDES that flat tick with a real LLM-reasoned
+    // duration:
+    //
+    //  "message" (default) — cadence-based, same philosophy as the Relationship tracker's
+    //  message-interval mode. Every messageModeInterval messages, ONE LLM call reviews the
+    //  whole batch since the last check-in and decides its total real elapsed time (using
+    //  TimelineEngine's pacing-example guide to stay grounded), replacing the flat ticks
+    //  that accumulated during that batch.
+    //
+    //  "smart" — event-driven. A cheap local trigger (TimelineEngine.detectTimeSkipTrigger)
+    //  scans every message for genuine time-skip language and, only when it fires, calls
+    //  the LLM immediately to resolve that one message on the spot.
+    //
+    // Both modes share the same resolver contract (elapsed / schedule / advance_to_event /
+    // none) and the same sanity ceiling — the LLM only ever proposes a duration, JS still
+    // does the actual date math and enforces the cap either way.
+    timeMode: "message",
+    messageModeInterval: 5,
+    // Extra Smart Time trigger phrases, one per line (settings textarea). Fuzzy-matched
+    // alongside the built-in lexicon by TimelineEngine.detectTimeSkipTrigger — and the
+    // only way the trigger can fire for non-English RP, since the built-ins are
+    // English-only. Stored as the raw textarea string; parsed on use.
+    customSkipPhrases: ""
+};
+// Module handles populated by the bootstrap below — declared at top level (classic-script
+// global scope) so every retained function in this file, hoisted above or below this line,
+// can see them. Same mechanism the original file already relied on for TimelineEngine/
+// WorldAgent/etc. being set inside the init closure but read by functions declared outside it.
+var Store, Persistence, ProfileSession, Pipeline, HUD, LLMResponseParser;
 
 // --- Init ---
 jQuery(async function () {
     try {
-        var m = await import("../../../extensions.js");
-        extSettings = m.extension_settings; 
-        saveFn = m.saveSettingsDebounced;
-        saveMetaFn = m.saveMetadataDebounced;
-        
-        scriptModule = await import("../../../../script.js");
-        if (typeof scriptModule.generateRaw === "function") genRaw = scriptModule.generateRaw;
+        Store = await import("./Store.js");
+        Persistence = await import("./Persistence.js");
+        ProfileSession = await import("./ProfileSession.js");
+        Pipeline = await import("./Pipeline.js");
+        HUD = await import("./HUD.js");
+        LLMResponseParser = await import("./LLMResponseParser.js");
 
+        var m = await import("../../../extensions.js");
+        var extSettings = m.extension_settings;
+        var saveFn = m.saveSettingsDebounced;
+        var saveMetaFn = m.saveMetadataDebounced;
+
+        var scriptModule = await import("../../../../script.js");
+        var genRaw = (typeof scriptModule.generateRaw === "function") ? scriptModule.generateRaw : null;
+
+        var runSlash = null;
         try {
             var sc = await import("../../../slash-commands.js");
             if (typeof sc.executeSlashCommandsWithOptions === "function") runSlash = sc.executeSlashCommandsWithOptions;
         } catch (e) { console.warn("[Story Tracker] slash-commands.js not available, connection profile switching disabled.", e); }
-        
-        loadSettings();
+
+        Store.setBootstrap({
+            extSettings: extSettings, saveFn: saveFn, saveMetaFn: saveMetaFn,
+            scriptModule: scriptModule, genRaw: genRaw, runSlash: runSlash,
+        });
+
+        // --- Timeline Engine rewrite: pure JS simulation-authority modules ---
+        // Loaded as sibling ES modules via relative dynamic import — no manifest
+        // change needed, SillyTavern serves the whole extension folder statically.
+        var TimelineEngine = await import("./TimelineEngine.js");
+        var Scheduler = await import("./Scheduler.js");
+        var EventQueue = await import("./EventQueue.js");
+        var SceneAgent = await import("./SceneAgent.js");
+        var WorldAgent = await import("./WorldAgent.js");
+        var RelationshipAgent = await import("./RelationshipAgent.js");
+        Store.setAgentModules({
+            TimelineEngine: TimelineEngine, Scheduler: Scheduler, EventQueue: EventQueue,
+            SceneAgent: SceneAgent, WorldAgent: WorldAgent, RelationshipAgent: RelationshipAgent,
+        });
+
+        Persistence.loadSettings(DEFAULT_SETTINGS);
         applyCustomAccentColor();
-        
+
         buildModal();
-        buildHUD();
+        HUD.buildHUD();
         buildSettingsPanel();
         buildChatButton();
-        bindEvents();
+        Pipeline.bindEvents();
         registerStoryMacros();
 
-        setTimeout(function () { recoverProfileIfNeeded(); }, 1500);
+        // Load per-chat data for whatever chat is ALREADY open at init time —
+        // bindEvents only reacts to future CHAT_CHANGED events, so without this,
+        // a chat opened before the extension finished loading stayed untracked
+        // (null storyData) until the user switched chats or opened the modal.
+        if (Store.isChatOpen()) {
+            Persistence.loadStoryData();
+            HUD.renderHUD();
+        }
+
+        setTimeout(function () { ProfileSession.recoverProfileIfNeeded(); }, 1500);
 
         // Clamping check on browser screen changes or rotations
         $(window).on("resize", function() {
-            applyHudStyle();
+            HUD.applyHudStyle();
         });
 
         console.log("[Story Tracker] Loaded!");
     } catch (e) { console.error("[Story Tracker] Init error:", e); }
 });
 
-// --- Active Chat Failsafe Check ---
-function isChatOpen() {
-    try {
-        var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function") 
-            ? SillyTavern.getContext() 
-            : null;
-        var chat = (context && context.chat) ? context.chat : (scriptModule ? scriptModule.chat : null);
-        var chatId = (context && context.chatId) ? context.chatId : (scriptModule ? scriptModule.chatId : null);
-        var charId = (context && context.characterId !== undefined) ? context.characterId : (scriptModule ? scriptModule.this_chid : null);
-        var groupId = (context && context.groupId !== undefined) ? context.groupId : (scriptModule ? scriptModule.groupId : null);
-
-        if (!chat || chat.length === 0 || !chatId) {
-            return false;
-        }
-        if (charId === null && groupId === null) {
-            return false;
-        }
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
-// Resolves the live chat array the same resilient way isChatOpen() does
-function getLiveChat() {
-    try {
-        var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function")
-            ? SillyTavern.getContext()
-            : null;
-        return (context && context.chat) ? context.chat : (scriptModule ? scriptModule.chat : null);
-    } catch (e) {
-        return null;
-    }
-}
-
-// --- Data Management ---
-function loadSettings() {
-    if(extSettings) {
-        if(!extSettings[MODULE]) extSettings[MODULE] = {};
-        Object.assign(settings, Object.assign({}, settings, extSettings[MODULE]));
-        extSettings[MODULE] = settings;
-    }
-}
-
-function save() {
-    // saveFn comes from extensions.js — if that module doesn't export saveSettingsDebounced
-    // (it's normally on script.js), fall back to scriptModule which we always import.
-    if (typeof saveFn === "function") return saveFn();
-    if (scriptModule && typeof scriptModule.saveSettingsDebounced === "function") {
-        return scriptModule.saveSettingsDebounced();
-    }
-}
-
 function applyCustomAccentColor() {
-    var r = (settings && settings.accentR !== undefined) ? settings.accentR : 216;
-    var g = (settings && settings.accentG !== undefined) ? settings.accentG : 160;
-    var b = (settings && settings.accentB !== undefined) ? settings.accentB : 64;
+    var r = (Store.settings && Store.settings.accentR !== undefined) ? Store.settings.accentR : 216;
+    var g = (Store.settings && Store.settings.accentG !== undefined) ? Store.settings.accentG : 160;
+    var b = (Store.settings && Store.settings.accentB !== undefined) ? Store.settings.accentB : 64;
     
     document.documentElement.style.setProperty('--st-custom-accent', `rgb(${r}, ${g}, ${b})`);
     document.documentElement.style.setProperty('--st-custom-accent-alpha', `rgba(${r}, ${g}, ${b}, 0.12)`);
@@ -352,991 +255,11 @@ function applyCustomAccentColor() {
     $("#st-rgb-preview").css("background-color", `rgb(${r}, ${g}, ${b})`);
 }
 
-function getRandomTime() {
-    var h = Math.floor(Math.random() * 24);
-    var m = Math.floor(Math.random() * 60);
-    return padZero(h) + ":" + padZero(m);
-}
-
-// --- Time and Date Sanitization Helpers ---
-function sanitizeTimeStr(timeStr, fallbackTimeStr) {
-    if (typeof timeStr !== "string") return fallbackTimeStr || "12:00";
-    timeStr = timeStr.trim();
-    var m = timeStr.match(/^(\d{1,2})[:\.](\d{1,2})$/);
-    if (!m) return fallbackTimeStr || "12:00";
-    
-    var hh = parseInt(m[1], 10);
-    var mm = parseInt(m[2], 10);
-    
-    if (isNaN(hh) || hh < 0 || hh > 23) hh = 0;
-    if (isNaN(mm) || mm < 0 || mm > 59) {
-        if (fallbackTimeStr) {
-            var fallbackParts = fallbackTimeStr.split(":");
-            if (fallbackParts.length >= 2) {
-                var fMin = parseInt(fallbackParts[1], 10);
-                mm = (!isNaN(fMin) && fMin >= 0 && fMin <= 59) ? fMin : 0;
-            } else {
-                mm = 0;
-            }
-        } else {
-            mm = 0;
-        }
-    }
-    
-    return padZero(hh) + ":" + padZero(mm);
-}
-
-function sanitizeDateStr(dateStr, fallbackDateStr) {
-    if (typeof dateStr !== "string") return fallbackDateStr || "01/01/2026";
-    dateStr = dateStr.trim();
-    var parts = dateStr.split(/[\/\-\.,]/).map(s => s.trim()).filter(Boolean);
-    if (parts.length < 3) return fallbackDateStr || "01/01/2026";
-    
-    var day = parseInt(parts[0], 10);
-    var month = parseInt(parts[1], 10);
-    var year = parseInt(parts[2], 10);
-    
-    if (isNaN(day) || day < 1 || day > 31) day = 1;
-    if (isNaN(month) || month < 1 || month > 12) month = 1;
-    if (isNaN(year) || year < 1000) year = 2026;
-    
-    return padZero(day) + "/" + padZero(month) + "/" + year;
-}
-
-function getRandomDate() {
-    // Generate a random date between Jan 1, 2020 and Dec 31, 2026
-    var start = new Date(2020, 0, 1).getTime();
-    var end = new Date(2026, 11, 31).getTime();
-    var randomTime = start + Math.random() * (end - start);
-    var d = new Date(randomTime);
-    return padZero(d.getDate()) + "/" + padZero(d.getMonth() + 1) + "/" + d.getFullYear();
-}
-
-function makeDefaultData() {
-    return {
-        time: getRandomTime(), 
-        date: getRandomDate(), 
-        location: "Unknown",
-        city: "Unknown", country: "Unknown",
-        temperature: "Unknown", weather: "Unknown",
-        characters: [], recent_events: "Story just started.",
-        history: [], _initialized: false, _msgCount: 0, _relMsgCount: 0, _historyCount: 0,
-        _lastCountedMsgId: -1, // no chat messages counted yet
-        autoUpdate: settings.autoUpdate,
-        autoUpdateInterval: settings.autoUpdateInterval
-    };
-}
-
-function makeDefaultWorldData() {
-    return {
-        enabled: false,
-        lastTickHour: 0,
-        lastTickDay: 0,
-        lastTickTime: "",
-        lastTickDate: "",
-        worldEvents: [],
-        regions: [],
-        npcStates: [],
-        pendingReveals: [],
-        worldSummary: "",
-        _initialized: false
-    };
-}
-
-function makeDefaultRelationshipData() {
-    return {
-        nodes: [],   // { id, name }
-        edges: [],   // { from, to, type, strength, summary, change, history: [{msg, summary, strength}] }
-        _initialized: false
-    };
-}
-
-// --- Character name normalization / matching (relationship tracker dedup) ---
-// The LLM doesn't always refer to a character the same way between calls
-// ("Ara Vorn" vs "Lt. Ara Vorn" vs "Lieutenant Ara Vorn"), which used to create
-// duplicate nodes/edges since matching was a raw case-sensitive string compare.
-var NAME_TITLE_PREFIXES = [
-    "lt\\.?\\s*cmdr\\.?", "lt\\.?\\s*col\\.?", "lieutenant\\s*commander", "lieutenant\\s*colonel",
-    "lieutenant", "lt\\.?", "commander", "cmdr\\.?", "captain", "capt\\.?",
-    "colonel", "col\\.?", "major", "maj\\.?", "sergeant", "sgt\\.?",
-    "general", "gen\\.?", "admiral", "adm\\.?", "ensign", "private", "pvt\\.?",
-    "doctor", "dr\\.?", "professor", "prof\\.?", "mister", "mr\\.?", "mrs\\.?", "ms\\.?", "miss",
-    "sir", "lady", "lord", "dame"
-];
-var NAME_TITLE_REGEX = new RegExp("^(" + NAME_TITLE_PREFIXES.join("|") + ")\\.?\\s+", "i");
-
-// Strips rank/title prefixes and normalizes casing/punctuation so the same
-// character resolves to the same key regardless of how a given call phrased it.
-function normalizeNameKey(name) {
-    if (!name) return "";
-    var n = String(name).trim();
-    var prev;
-    do {
-        prev = n;
-        n = n.replace(NAME_TITLE_REGEX, "").trim();
-    } while (n !== prev && n.length > 0);
-    return n.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-}
-
-function nameTokens(normName) {
-    return normName ? normName.split(" ").filter(Boolean) : [];
-}
-
-// True if two already-normalized names plausibly refer to the same character:
-// identical, one is fully contained in the other word-for-word (handles a
-// stripped title leaving a shorter form, e.g. "thalos drayne" inside what was
-// "lt cmdr thalos drayne"), or they share 2+ significant name tokens.
-function namesLikelyMatch(normA, normB) {
-    if (!normA || !normB) return false;
-    if (normA === normB) return true;
-
-    var tokensA = nameTokens(normA);
-    var tokensB = nameTokens(normB);
-    if (tokensA.length === 0 || tokensB.length === 0) return false;
-
-    var shorter = tokensA.length <= tokensB.length ? tokensA : tokensB;
-    var longer  = tokensA.length <= tokensB.length ? tokensB : tokensA;
-    var longerStr  = " " + longer.join(" ") + " ";
-    var shorterStr = " " + shorter.join(" ") + " ";
-    if (longerStr.indexOf(shorterStr) !== -1) return true;
-
-    if (tokensA.length >= 2 && tokensB.length >= 2) {
-        var setB = {};
-        tokensB.forEach(function(t) { setB[t] = true; });
-        var shared = tokensA.filter(function(t) { return setB[t]; }).length;
-        if (shared >= 2) return true;
-    }
-    return false;
-}
-
-// Looks up whether `name` matches an already-known relationship node under a
-// different phrasing, and if so returns that node's canonical display name
-// (upgrading it to the longer/more detailed variant). Returns `name` unchanged
-// if no existing node matches, signaling a genuinely new character.
-function resolveCanonicalName(name) {
-    if (!name || !relationshipData) return name;
-    var norm = normalizeNameKey(name);
-    if (!norm) return name;
-
-    var nodes = relationshipData.nodes || [];
-    for (var i = 0; i < nodes.length; i++) {
-        var existingNorm = normalizeNameKey(nodes[i].name);
-        if (namesLikelyMatch(norm, existingNorm)) {
-            if (String(name).length > String(nodes[i].name).length) nodes[i].name = name;
-            return nodes[i].name;
-        }
-    }
-    return name;
-}
-
-// One-time cleanup for save data created before name normalization existed:
-// merges any nodes/edges that refer to the same character under different
-// name variants. Safe to call on every load - it's a no-op once clean.
-function dedupeRelationshipNodes() {
-    if (!relationshipData || !relationshipData.nodes || relationshipData.nodes.length < 2) return;
-
-    var nodes = relationshipData.nodes;
-    var canonicalMap = {};
-    var merged = [];
-
-    nodes.forEach(function(node) {
-        if (!node || !node.name) return;
-        var norm = normalizeNameKey(node.name);
-        var match = merged.find(function(m) { return namesLikelyMatch(norm, normalizeNameKey(m.name)); });
-        if (match) {
-            if (String(node.name).length > String(match.name).length) match.name = node.name;
-            canonicalMap[node.name] = match.name;
-        } else {
-            merged.push({ id: node.name, name: node.name });
-            canonicalMap[node.name] = node.name;
-        }
-    });
-
-    if (merged.length === nodes.length) return; // nothing to merge
-
-    relationshipData.nodes = merged;
-
-    // Re-key edges to canonical names and merge any that now collide
-    var edgeMap = {};
-    (relationshipData.edges || []).forEach(function(e) {
-        if (!e) return;
-        var from = canonicalMap[e.from] || e.from;
-        var to = canonicalMap[e.to] || e.to;
-        if (!from || !to || from === to) return; // collapsed onto the same character
-
-        var keyA = from < to ? from : to;
-        var keyB = from < to ? to : from;
-        var key = keyA + "::" + keyB;
-
-        e.from = keyA;
-        e.to = keyB;
-
-        var existingEdge = edgeMap[key];
-        if (!existingEdge || (e.history || []).length > (existingEdge.history || []).length) {
-            edgeMap[key] = e;
-        }
-    });
-
-    relationshipData.edges = Object.keys(edgeMap).map(function(k) { return edgeMap[k]; });
-    console.log("[Story Tracker] Deduplicated relationship nodes: " + nodes.length + " -> " + merged.length);
-    saveRelationshipData();
-}
-
-function loadStoryData() {
-    if (!isChatOpen()) {
-        storyData = null;
-        worldData = null;
-        return;
-    }
-    var meta = scriptModule ? scriptModule.chat_metadata : null;
-    var stored = (meta && meta[DATA_KEY]) ? meta[DATA_KEY] : null;
-    if (stored) {
-        storyData = stored;
-        msgCounter = storyData._msgCount || 0;
-        relMsgCounter = storyData._relMsgCount || 0;
-        if (!storyData.history) storyData.history = [];
-        if (storyData.autoUpdate === undefined) storyData.autoUpdate = settings.autoUpdate;
-        if (storyData.autoUpdateInterval === undefined) storyData.autoUpdateInterval = settings.autoUpdateInterval;
-
-        if (typeof storyData._lastCountedMsgId !== "number") {
-            var liveChat = getLiveChat();
-            storyData._lastCountedMsgId = (liveChat && liveChat.length) ? liveChat.length - 1 : -1;
-        }
-        lastCountedMsgId = storyData._lastCountedMsgId;
-    } else {
-        storyData = makeDefaultData();
-        if (meta) meta[DATA_KEY] = storyData;
-        msgCounter = 0;
-        lastCountedMsgId = storyData._lastCountedMsgId;
-    }
-    loadWorldData();
-    loadRelationshipData();
-}
-
-function loadWorldData() {
-    if (!isChatOpen()) {
-        worldData = null;
-        return;
-    }
-    var meta = scriptModule ? scriptModule.chat_metadata : null;
-    var stored = (meta && meta[WORLD_KEY]) ? meta[WORLD_KEY] : null;
-    if (stored) {
-        worldData = stored;
-        if (!worldData.worldEvents) worldData.worldEvents = [];
-        if (!worldData.regions) worldData.regions = [];
-        if (!worldData.npcStates) worldData.npcStates = [];
-        if (!worldData.pendingReveals) worldData.pendingReveals = [];
-    } else {
-        worldData = makeDefaultWorldData();
-        if (meta) meta[WORLD_KEY] = worldData;
-    }
-}
-
-function loadRelationshipData() {
-    if (!isChatOpen()) { relationshipData = null; return; }
-    var meta = scriptModule ? scriptModule.chat_metadata : null;
-    var stored = (meta && meta[RELATIONSHIP_KEY]) ? meta[RELATIONSHIP_KEY] : null;
-    if (stored) {
-        relationshipData = stored;
-        if (!relationshipData.nodes) relationshipData.nodes = [];
-        if (!relationshipData.edges) relationshipData.edges = [];
-        dedupeRelationshipNodes();
-    } else {
-        relationshipData = makeDefaultRelationshipData();
-        if (meta) meta[RELATIONSHIP_KEY] = relationshipData;
-    }
-}
-
-function saveRelationshipData() {
-    if (!isChatOpen() || !scriptModule || !scriptModule.chat_metadata) return;
-    scriptModule.chat_metadata[RELATIONSHIP_KEY] = relationshipData;
-    if (typeof saveMetaFn === "function") {
-        saveMetaFn();
-    } else if (typeof scriptModule.saveMetadataDebounced === "function") {
-        scriptModule.saveMetadataDebounced();
-    }
-}
-
-// --- Dynamic Viewport Border Calculations ---
-
-// Measure safe-area-inset values by injecting a throwaway element
-// (CSS custom properties don't resolve to numeric px in getComputedStyle on all engines)
-function getSafeAreaInsets() {
-    try {
-        var el = document.createElement("div");
-        el.style.cssText =
-            "position:fixed;top:env(safe-area-inset-top,0px);left:env(safe-area-inset-left,0px);" +
-            "width:env(safe-area-inset-right,0px);height:env(safe-area-inset-bottom,0px);" +
-            "pointer-events:none;visibility:hidden;z-index:-1;";
-        document.body.appendChild(el);
-        var rect = el.getBoundingClientRect();
-        var s = {
-            top:    rect.top,
-            left:   rect.left,
-            right:  parseFloat(getComputedStyle(el).width)  || 0,
-            bottom: parseFloat(getComputedStyle(el).height) || 0
-        };
-        document.body.removeChild(el);
-        return s;
-    } catch(e) {
-        return { top: 0, bottom: 0, left: 0, right: 0 };
-    }
-}
-
-function clampHudPosition(x, y) {
-    var $h = $("#st-hud");
-    if (!$h.length) return { x: x, y: y };
-
-    var hudWidth  = $h.outerWidth()  || 260;
-    var hudHeight = $h.outerHeight() || 200;
-    var safe      = getSafeAreaInsets();
-
-    var margin = 10;
-    var minX = Math.max(margin, safe.left   + margin);
-    var minY = Math.max(margin, safe.top    + margin);
-    var maxX = window.innerWidth  - hudWidth  - Math.max(margin, safe.right  + margin);
-    var maxY = window.innerHeight - hudHeight - Math.max(margin, safe.bottom + margin);
-
-    return {
-        x: Math.max(minX, Math.min(x, maxX)),
-        y: Math.max(minY, Math.min(y, maxY))
-    };
-}
-
-function saveStoryData() {
-    if (!isChatOpen() || !scriptModule || !scriptModule.chat_metadata) return;
-    storyData._msgCount = msgCounter;
-    storyData._relMsgCount = relMsgCounter;
-    storyData._lastCountedMsgId = lastCountedMsgId;
-    scriptModule.chat_metadata[DATA_KEY] = storyData;
-    if (typeof saveMetaFn === "function") {
-        saveMetaFn();
-    } else if (typeof scriptModule.saveMetadataDebounced === "function") {
-        scriptModule.saveMetadataDebounced();
-    }
-}
-
-// Helper to logically parse dates using strict European formatting standard (DD/MM/YYYY) first
-function parseRpDateTime(timeStr, dateStr) {
-    if (!timeStr || !dateStr || timeStr === "--:--" || dateStr === "Unknown") return null;
-    
-    // Structured parsing fallbacks (strictly treat as DD/MM/YYYY first to prevent US format locale bias)
-    var tParts = timeStr.split(":");
-    if (tParts.length < 2) return null;
-    var hour = parseInt(tParts[0], 10);
-    var min = parseInt(tParts[1], 10);
-    if (isNaN(hour) || isNaN(min)) return null;
-
-    var dParts = dateStr.split(/[\/\-\.,]/).map(s => s.trim()).filter(Boolean);
-    if (dParts.length >= 3) {
-        var day = parseInt(dParts[0], 10);
-        var month = parseInt(dParts[1], 10);
-        var year = parseInt(dParts[2], 10);
-
-        if (!isNaN(day) && !isNaN(month) && !isNaN(year)) {
-            var d = new Date(year, month - 1, day, hour, min, 0, 0);
-            if (!isNaN(d.getTime())) return d;
-        }
-    }
-    
-    // Try browser-native parser as a last resort
-    var nativeParsed = new Date(dateStr + " " + timeStr);
-    if (!isNaN(nativeParsed.getTime())) return nativeParsed;
-
-    return null;
-}
-
-function saveWorldData() {
-    if (!isChatOpen() || !scriptModule || !scriptModule.chat_metadata) return;
-    scriptModule.chat_metadata[WORLD_KEY] = worldData;
-    if (typeof saveMetaFn === "function") {
-        saveMetaFn();
-    } else if (typeof scriptModule.saveMetadataDebounced === "function") {
-        scriptModule.saveMetadataDebounced();
-    }
-}
-
-function populateProfileDropdown() {
-    var profiles = getProfileList();
-
-    // Context Analysis Profile
-    var $sel = $("#st-s-profile");
-    if ($sel.length) {
-        var html = '<option value="">— Use current / main profile —</option>';
-        if (profiles.length === 0) {
-            html += '<option value="" disabled>(No profiles found — install/enable Connection Profiles)</option>';
-        } else {
-            profiles.forEach(function (p) {
-                var name = p && p.name ? p.name : "";
-                if (!name) return;
-                html += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
-            });
-        }
-        $sel.html(html);
-        var saved = settings.connectionProfile || "";
-        if (saved && profiles.some(function (p) { return p.name === saved; })) {
-            $sel.val(saved);
-        } else if (saved && profiles.length > 0) {
-            $sel.val("");
-        }
-    }
-
-    // World Agent Profile
-    var $selWorld = $("#st-s-world-profile");
-    if ($selWorld.length) {
-        var htmlWorld = '<option value="">— Use current / main profile —</option>';
-        if (profiles.length === 0) {
-            htmlWorld += '<option value="" disabled>(No profiles found)</option>';
-        } else {
-            profiles.forEach(function (p) {
-                var name = p && p.name ? p.name : "";
-                if (!name) return;
-                htmlWorld += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
-            });
-        }
-        $selWorld.html(htmlWorld);
-        var savedWorld = settings.worldConnectionProfile || "";
-        if (savedWorld && profiles.some(function (p) { return p.name === savedWorld; })) {
-            $selWorld.val(savedWorld);
-        } else if (savedWorld && profiles.length > 0) {
-            $selWorld.val("");
-        }
-    }
-
-    // Relationship Tracker Profile
-    var $selRel = $("#st-s-rel-profile");
-    if ($selRel.length) {
-        var htmlRel = '<option value="">- Use current / main profile -</option>';
-        if (profiles.length === 0) {
-            htmlRel += '<option value="" disabled>(No profiles found)</option>';
-        } else {
-            profiles.forEach(function (p) {
-                var name = p && p.name ? p.name : "";
-                if (!name) return;
-                htmlRel += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
-            });
-        }
-        $selRel.html(htmlRel);
-        var savedRel = settings.relConnectionProfile || "";
-        if (savedRel && profiles.some(function (p) { return p.name === savedRel; })) {
-            $selRel.val(savedRel);
-        } else if (savedRel && profiles.length > 0) {
-            $selRel.val("");
-        }
-    }
-}
-
-// --- Connection Profile Support ---
-function getProfileList() {
-    try {
-        var cm = extSettings && extSettings.connectionManager;
-        if (!cm || !Array.isArray(cm.profiles)) return [];
-        return cm.profiles;
-    } catch (e) { return []; }
-}
-
-function getCurrentProfileName() {
-    try {
-        var cm = extSettings && extSettings.connectionManager;
-        if (!cm) return "";
-        var sel = cm.selectedProfile;
-        if (!sel) return "";
-        var found = (cm.profiles || []).find(function (p) { return p.id === sel; });
-        return found ? (found.name || "") : "";
-    } catch (e) { return ""; }
-}
-
-// Confirms a profile name actually exists before we try to switch to it.
-// Switching to a name ConnectionManager doesn't recognize sends a slash
-// command that fails to resolve a target element/profile, which can leave
-// the active connection in a broken state for the generation call that follows.
-function profileExists(name) {
-    if (!name) return false;
-    return getProfileList().some(function (p) { return p.name === name; });
-}
-
-function shouldSwitchProfile() {
-    if (!settings.useConnectionProfile) return false;
-    if (!runSlash) return false;                       
-    var target = (settings.connectionProfile || "").trim();
-    if (!target) return false;                         
-    if (getProfileList().length === 0) return false;   
-    var current = getCurrentProfileName();
-    if (current && current === target) return false;   
-    return true;
-}
-
-async function switchProfile(name) {
-    if (!runSlash || !name) return false;
-    if (!profileExists(name)) {
-        console.warn("[Story Tracker] Connection profile '" + name + "' was not found in the profile list; skipping switch and using the currently active profile instead.");
-        return false;
-    }
-    try {
-        await runSlash('/profile "' + String(name).replace(/"/g, '\\"') + '"');
-        await new Promise(function (r) { setTimeout(r, 150); });
-        return true;
-    } catch (e) {
-        console.warn("[Story Tracker] Failed to switch to profile '" + name + "':", e);
-        return false;
-    }
-}
-
-async function withConnectionProfile(task) {
-    if (!shouldSwitchProfile()) {
-        return await task();
-    }
-    var original = getCurrentProfileName();
-    var target = (settings.connectionProfile || "").trim();
-    var switched = false;
-    try {
-        switched = await switchProfile(target);
-        if (!switched) console.warn("[Story Tracker] Profile switch failed; running analysis on current profile.");
-        if (switched && original && original !== target) {
-            settings._restoreProfile = original;
-            save();
-        }
-        return await task();
-    } finally {
-        if (switched && original && original !== target) {
-            await switchProfile(original);
-        }
-        if (settings._restoreProfile) { settings._restoreProfile = ""; save(); }
-    }
-}
-
-async function withWorldConnectionProfile(task) {
-    if (!settings.useWorldProfile || !runSlash) {
-        return await task();
-    }
-    var original = getCurrentProfileName();
-    var target = (settings.worldConnectionProfile || "").trim();
-    var switched = false;
-    try {
-        switched = await switchProfile(target);
-        if (!switched) console.warn("[Story Tracker] World Connection Profile switch failed; running simulation on current profile.");
-        if (switched && original && original !== target) {
-            settings._restoreWorldProfile = original;
-            save();
-        }
-        return await task();
-    } finally {
-        if (switched && original && original !== target) {
-            await switchProfile(original);
-        }
-        if (settings._restoreWorldProfile) { settings._restoreWorldProfile = ""; save(); }
-    }
-}
-
-async function withRelConnectionProfile(task) {
-    if (!settings.useRelProfile || !runSlash) {
-        return await task();
-    }
-    var original = getCurrentProfileName();
-    var target = (settings.relConnectionProfile || "").trim();
-    var switched = false;
-    try {
-        switched = await switchProfile(target);
-        if (!switched) console.warn("[Story Tracker] Relationship Connection Profile switch failed; running on current profile.");
-        if (switched && original && original !== target) {
-            settings._restoreRelProfile = original;
-            save();
-        }
-        return await task();
-    } finally {
-        if (switched && original && original !== target) {
-            await switchProfile(original);
-        }
-        if (settings._restoreRelProfile) { settings._restoreRelProfile = ""; save(); }
-    }
-}
-
-async function recoverProfileIfNeeded() {
-    var pending = settings._restoreProfile;
-    if (pending && runSlash) {
-        try {
-            var current = getCurrentProfileName();
-            if (current !== pending && getProfileList().some(function (p) { return p.name === pending; })) {
-                console.log("[Story Tracker] Recovering interrupted profile switch → restoring '" + pending + "'.");
-                await switchProfile(pending);
-            }
-        } catch (e) {
-            console.warn("[Story Tracker] Profile recovery failed:", e);
-        } finally {
-            settings._restoreProfile = ""; save();
-        }
-    }
-
-    var pendingRel = settings._restoreRelProfile;
-    if (pendingRel && runSlash) {
-        try {
-            await switchProfile(pendingRel);
-        } catch(e) { console.warn("[Story Tracker] Relationship profile recovery failed:", e); }
-        settings._restoreRelProfile = ""; save();
-    }
-
-    var pendingWorld = settings._restoreWorldProfile;
-    if (pendingWorld && runSlash) {
-        try {
-            var currentWorld = getCurrentProfileName();
-            if (currentWorld !== pendingWorld && getProfileList().some(function (p) { return p.name === pendingWorld; })) {
-                console.log("[Story Tracker] Recovering interrupted world profile switch → restoring '" + pendingWorld + "'.");
-                await switchProfile(pendingWorld);
-            }
-        } catch (e) {
-            console.warn("[Story Tracker] World profile recovery failed:", e);
-        } finally {
-            settings._restoreWorldProfile = ""; save();
-        }
-    }
-}
-
-// --- Prompts Context helpers ---
-function buildPrevStateText() {
-    if (!storyData) return "";
-    let s = "";
-    if (!storyData._initialized) {
-        s = "This is the INITIAL setup. Use this suggested starting timeline as your baseline unless the intro message/context explicitly dictates otherwise:\n" +
-            "Time: " + storyData.time + " | Date: " + storyData.date + "\n\n";
-    } else {
-        s = "PREVIOUS STATE:\nTime: " + storyData.time + " | Date: " + storyData.date + " | Location: " + storyData.location + "\n";
-        s += "City: " + (storyData.city || "Unknown") + " | Country/Realm: " + (storyData.country || "Unknown") + "\n";
-        s += "Temperature: " + (storyData.temperature || "Unknown") + " | Weather: " + (storyData.weather || "Unknown") + "\n";
-        var outfit = getInventoryOutfit();
-        if (outfit && outfit.userEquipped.length > 0) {
-            var outfitStr = outfit.userEquipped.map(function(it) { return it.label + ": " + it.name; }).join(", ");
-            s += "User's current outfit: " + outfitStr + "\n";
-        }
-        if (outfit && outfit.charItems.length > 0) {
-            var charHeld = outfit.charItems.map(function(ci) { return ci.name + " (held by " + ci.heldBy + ")"; }).join(", ");
-            s += "Items held by character: " + charHeld + "\n";
-        }
-    }
-
-    return s + "(Update the time, check if location/weather changed, update character positions based on what they just did).";
-}
-
-// --- Sync to Character Tracker ---
-function syncToCharTracker() {
-    try {
-        var meta = scriptModule ? scriptModule.chat_metadata : null;
-        if (!meta) return;
-        var ct = meta["char_tracker"];
-        if (!ct) return; 
-
-        var day = 1, month = 1, year = 2024;
-        var parts = (storyData.date || "").split(/[\/\-\.]/);
-        if (parts.length >= 3) {
-            day   = parseInt(parts[0], 10) || 1;
-            month = parseInt(parts[1], 10) || 1;
-            year  = parseInt(parts[2], 10) || 2024;
-        }
-
-        var container = ct._isGroup ? ct : ct;
-        if (!container.sharedTime) container.sharedTime = {};
-        container.sharedTime.time  = storyData.time  || "--:--";
-        container.sharedTime.day   = day;
-        container.sharedTime.month = month;
-        container.sharedTime.year  = year;
-        container._timeInitialized = true;
-
-        if (ct._isGroup) {
-            var activeChar = ct._activeChar;
-            if (activeChar && ct.characters && ct.characters[activeChar]) {
-                ct.characters[activeChar].location = storyData.location;
-            }
-        } else {
-            ct.location = storyData.location;
-        }
-
-        if (typeof saveMetaFn === "function")
-            saveMetaFn();
-        else if (typeof scriptModule.saveMetadataDebounced === "function")
-            scriptModule.saveMetadataDebounced();
-
-        console.log("[Story Tracker] Synced time/location → Character Tracker");
-        $(document).trigger("CT_FORCE_RENDER");
-    } catch(e) { console.error("[Story Tracker] syncToCharTracker error:", e); }
-}
-
-// --- Inventory Integration ---
-var INV_SLOTS        = ["head","torso","legs","feet","hands","lefthand","righthand","accessory1","accessory2"];
-var INV_SLOT_LABELS  = { head:"Head", torso:"Torso", legs:"Legs", feet:"Feet", hands:"Hands", lefthand:"Left Hand", righthand:"Right Hand", accessory1:"Accessory 1", accessory2:"Accessory 2" };
-var INV_SLOT_ICONS  = { head:"🎩", torso:"👕", legs:"👖", feet:"👟", hands:"🧤", lefthand:"🤚", righthand:"右手", accessory1:"💍", accessory2:"💍" };
-
-function getInventoryOutfit() {
-    try {
-        var meta = scriptModule ? scriptModule.chat_metadata : null;
-        if (!meta) return null;
-        var inv = meta["inv_data"];
-        if (!inv || !inv.equipped) return null;
-
-        var eq = inv.equipped;
-
-        var userEquipped = [];
-        for (var i = 0; i < INV_SLOTS.length; i++) {
-            var sl = INV_SLOTS[i];
-            var it = eq[sl];
-            if (it && !it._mirror) {
-                userEquipped.push({
-                    slot:  sl,
-                    label: INV_SLOT_LABELS[sl],
-                    icon:  INV_SLOT_ICONS[sl],
-                    name:  it.name || "?",
-                    description: it.description || ""
-                });
-            }
-        }
-
-        var charItems = (inv.charItems || []).map(function(ci) {
-            return { name: ci.name, heldBy: ci.heldBy || "Character" };
-        });
-
-        return { userEquipped: userEquipped, charItems: charItems };
-    } catch (e) {
-        console.error("[Story Tracker] getInventoryOutfit error:", e);
-        return null;
-    }
-}
-
-// --- Context Injection ---
-function injectContextToChat() {
-    if (!isChatOpen()) return;
-    if (!settings.enabled) return;
-    
-    let sceneInj = "";
-    if (settings.injectToContext && storyData && storyData._initialized) {
-        let loc = storyData.location;
-        let ev = storyData.recent_events;
-        
-        let charsText = "";
-        if (storyData.characters && storyData.characters.length > 0) {
-            charsText = storyData.characters.map(c => `${c.name}: ${c.state}`).join(" | ");
-        }
-
-        let cityCountryStr = "";
-        if (settings.showCityCountry) {
-            let city = storyData.city || "";
-            let country = storyData.country || "";
-            if (city && city !== "Unknown" || country && country !== "Unknown") {
-                cityCountryStr = "\nCity: " + (city || "Unknown") + " | Country/Realm: " + (country || "Unknown");
-            }
-        }
-
-        sceneInj = `[Scene Context: Time: ${storyData.time}, Date: ${storyData.date}\nLocation: ${loc}${cityCountryStr}\nTemperature: ${storyData.temperature || "Unknown"} | Weather: ${storyData.weather || "Unknown"}\nPositions: ${charsText}\nRecent: ${ev}`;
-
-        var outfit = getInventoryOutfit();
-        if (outfit && outfit.userEquipped.length > 0) {
-            var outfitStr = outfit.userEquipped.map(function(it) { return it.label + ": " + it.name; }).join(", ");
-            sceneInj += `\nUser's Outfit: ${outfitStr}`;
-        }
-        if (outfit && outfit.charItems.length > 0) {
-            var charHeldStr = outfit.charItems.map(function(ci) { return ci.name + " (held by " + ci.heldBy + ")"; }).join(", ");
-            sceneInj += `\nCharacter holds: ${charHeldStr}`;
-        }
-        sceneInj += `]`;
-    }
-
-    let worldInj = "";
-    if (settings.injectWorldContext && worldData && worldData._initialized) {
-        // Retrieve the last 3 important events (importance >= 4, falling back to any if none)
-        let imp = worldData.worldEvents.filter(e => e.importance >= 4).slice(0, 3);
-        if (imp.length === 0) imp = worldData.worldEvents.slice(0, 3);
-        let eventsStr = imp.map(e => e.event).join("\n");
-        let sum = worldData.worldSummary || "";
-        
-        worldInj = `<world_progression>\n` +
-                   `The active context contains recent "World Progression" reports detailing background, off-screen macro events.\n\n` +
-                   `  - Environmental Bleed-in: You are ENCOURAGED to reflect these macro shifts passively through the scenery, weather, atmospheric tension, or ambient background details if they logically affect the current district or theme.\n` +
-                   `  - Hostile Initiative & Ambushed Scenes: If a report explicitly details a rival, faction, or antagonist plotting, executing a strike, or tracking {{user}}, you have full permission to be AGGRESSIVE. Do not wait for investigation. Let that hostile action violently collide with the current scene as an immediate consequence (e.g., an ambush, a sudden lockdown, an interception, or a direct threat manifesting).\n` +
-                   `  - Organic Intersection: If a report event mentions a passive entity or location matching {{user}}'s immediate surroundings or active inventory, let that event alter the local environment (e.g., increased patrol density, systemic panic, visible structural changes).\n` +
-                   `  - Asymmetric Knowledge Guardrail: Unless a hostile interception occurs, do NOT grant characters or {{user}} omniscient knowledge of these events. NPCs must not spontaneously discuss details they have no realistic way of knowing. Use the data strictly to dictate systemic consequences, hidden NPC positioning, and evolving motivations.\n\n` +
-                   `[World State Reports]\n` +
-                   `Summary: ${sum}\n` +
-                   `Recent Developments:\n${eventsStr || "None."}\n` +
-                   `</world_progression>`;
-    }
-
-    let finalInj = "";
-    if (sceneInj) finalInj += sceneInj;
-    if (worldInj) finalInj += (finalInj ? "\n" : "") + worldInj;
-
-    // Relationship context injection — only edges involving characters currently in scene
-    if (settings.injectRelationsContext && relationshipData && relationshipData._initialized && 
-        relationshipData.edges && relationshipData.edges.length > 0) {
-        var sceneNames = new Set((storyData && storyData.characters || []).map(function(c) { return c.name; }));
-        var relevantEdges = relationshipData.edges.filter(function(e) {
-            return sceneNames.has(e.from) || sceneNames.has(e.to);
-        });
-        if (relevantEdges.length > 0) {
-            var relLines = relevantEdges.map(function(e) {
-                var sign = e.strength >= 0 ? "+" : "";
-                return e.from + " \u2194 " + e.to + ": " + e.type + " (" + sign + (e.strength || 0).toFixed(1) + ") \u2014 " + e.summary;
-            }).join("\n");
-            var relInj = "<relationship_dynamics>\n" + relLines + "\n</relationship_dynamics>";
-            finalInj += (finalInj ? "\n" : "") + relInj;
-        }
-    }
-
-    if (!finalInj) {
-        // Nothing to inject this turn - clear any previous injection so stale
-        // context doesn't linger in the prompt after tracking is disabled.
-        try {
-            if (scriptModule.setExtensionPrompt) {
-                scriptModule.setExtensionPrompt("STORY_TRACKER_CONTEXT", "", 1, 0, false, 0);
-            }
-        } catch (e) { /* no-op */ }
-        return;
-    }
-
-    try {
-        // setExtensionPrompt is the official mechanism extensions use to inject
-        // content into the actual generation prompt (the same API SillyTavern's
-        // own Memory/Summarize and World Info systems use internally). Writing
-        // directly to chat_metadata.authorsNote is NOT read by SillyTavern's
-        // prompt builder (the real Author's Note key is note_prompt), so that
-        // approach silently did nothing - this fixes it.
-        //
-        // Position 1 = IN_CHAT (in_prompt=0, in_chat=1, before_prompt=2)
-        // Depth 0 = inserted right after the most recent message
-        // Role 0 = SYSTEM
-        var posTypes = scriptModule.extension_prompt_types || { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
-        var roleTypes = scriptModule.extension_prompt_roles || { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
-        scriptModule.setExtensionPrompt(
-            "STORY_TRACKER_CONTEXT",
-            finalInj,
-            posTypes.IN_CHAT,
-            0,
-            false,
-            roleTypes.SYSTEM
-        );
-
-        // Clean up the old (non-functional) injection key so it doesn't linger
-        // in chat_metadata for users upgrading from a previous version.
-        if (scriptModule.chat_metadata && scriptModule.chat_metadata.authorsNote) {
-            delete scriptModule.chat_metadata.authorsNote;
-        }
-    } catch (e) { console.error("[Story Tracker] Inject error:", e); }
-}
-
-// --- Event Handling ---
-function bindEvents() {
-    var es = scriptModule.eventSource, et = scriptModule.event_types;
-    if (!es) return;
-    
-    es.on(et.CHAT_CHANGED, function() {
-        loadStoryData();
-        renderModal(); renderHUD();
-        updateSettingsUI();
-    });
-    
-    $(document).on("ST_FORCE_RENDER", function() {
-        loadStoryData();
-        renderModal(); 
-        renderHUD();
-        updateSettingsUI();
-    });
-
-    $(document).on("INV_EQUIPMENT_CHANGED", function() {
-        renderModal();
-        renderHUD();
-        if (settings.enabled && settings.injectToContext) injectContextToChat();
-    });
-
-    let handleMsg = async function(type) {
-        // GENERATION_ENDED doesn't pass a message ID - we derive it from the chat array
-        var liveChat = getLiveChat();
-        if (!liveChat || liveChat.length === 0) return;
-
-        // Only process AI (character) messages, not user messages
-        var lastMsg = liveChat[liveChat.length - 1];
-        if (!lastMsg || lastMsg.is_user) return;
-
-        var id = liveChat.length - 1;
-        if (id <= lastCountedMsgId) return;
-
-        var msgObj = lastMsg;
-        if (!msgObj || typeof msgObj.mes !== "string" || !msgObj.mes.trim()) return;
-
-        lastCountedMsgId = id;
-        saveStoryData();
-
-        if (!settings.enabled) return;
-
-        // Small startup delay so ST's full pipeline (streaming, post-processors) finishes
-        // before we start our own chain. Especially important on slow devices like Termux.
-        await new Promise(function(r) { setTimeout(r, settings.startupDelay || 2000); });
-
-        if (busy) return;
-
-        if (!isChatOpen()) {
-            console.warn("[Story Tracker] Event ignored: No active chat is open.");
-            return;
-        }
-
-        let autoUpdate = (storyData && storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
-        let autoUpdateInterval = (storyData && storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
-
-        msgCounter++;
-        relMsgCounter++;
-        saveStoryData();
-        
-        // Run agents sequentially to avoid concurrent API requests on rate-limited backends.
-        // Each agent awaits the previous one and waits an extra 1.5s gap before firing.
-        var needsSceneUpdate = autoUpdate && msgCounter > 0 && msgCounter % autoUpdateInterval === 0;
-        var needsWorldTick   = settings.enabled && settings.worldEnabled;
-        var needsRelUpdate   = settings.relationsEnabled && settings.relationsAutoUpdate && !relsBusy &&
-                               relMsgCounter > 0 && relMsgCounter % (settings.relAutoInterval || 5) === 0;
-
-        if (needsSceneUpdate) {
-            busy = true;
-            setHudStatus("Scene...");
-            if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing scene...", "", { timeOut: 0, extendedTimeOut: 0 });
-            try {
-                await doLLMUpdate();
-                renderModal(); renderHUD();
-            } catch(e) { console.error(e); }
-            busy = false;
-            clearHudStatus();
-            if (typeof toastr !== "undefined") toastr.clear();
-        } else {
-            renderAutoInfo();
-        }
-
-        if (needsWorldTick) {
-            await new Promise(function(r) { setTimeout(r, 1500); });
-            // checkAndRunWorldTicks() now owns its own HUD/toast feedback internally, and only
-            // shows it when a tick is actually about to run (see function below). This avoids
-            // a misleading flash-then-clear on every message when no time has actually passed
-            // in-RP yet (e.g. the Scene Tracker hasn't extracted an updated date this turn).
-            await checkAndRunWorldTicks();
-        }
-
-        if (needsRelUpdate) {
-            await new Promise(function(r) { setTimeout(r, 1500); });
-            setHudStatus("Relations...");
-            if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing relationships...", "", { timeOut: 0, extendedTimeOut: 0 });
-            try {
-                await doRelationshipUpdate();
-                if ($("#st-tab-relations").is(":visible")) renderRelationshipGraph();
-                clearHudStatus();
-                if (typeof toastr !== "undefined") { toastr.clear(); toastr.info("Relationships updated."); }
-            } catch(e) {
-                clearHudStatus();
-                if (typeof toastr !== "undefined") toastr.clear();
-                console.error("[Story Tracker] Auto relationship update failed:", e);
-            }
-        }
-    };
-
-    es.on(et.GENERATION_ENDED, handleMsg);
-    es.on(et.GENERATION_STARTED, function() { if (settings.enabled) injectContextToChat(); });
-}
-
-// --- UI Rendering ---
-function esc(t) { var d = document.createElement("div"); d.textContent = t; return d.innerHTML; }
-
-// --- Custom Macro Registration ---
+// Quotes are escaped as well as &<> because this helper's output is also used
+// inside HTML attribute values (title="...", data-name="...") — an unescaped
+// quote in LLM-authored text (character names, event text) breaks out of the
+// attribute, and a crafted one could inject live handlers.
+function esc(t) { var d = document.createElement("div"); d.textContent = t == null ? "" : t; return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 function registerStoryMacros() {
     try {
         var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function") 
@@ -1359,7 +282,7 @@ function registerStoryMacros() {
                 try {
                     context.macros.register(m.name, {
                         handler: function() {
-                            return (storyData && storyData[m.key]) ? storyData[m.key] : "Unknown";
+                            return (Store.storyData && Store.storyData[m.key]) ? Store.storyData[m.key] : "Unknown";
                         },
                         category: "Story Tracker",
                         description: "Tracked narrative value for " + m.key
@@ -1367,7 +290,7 @@ function registerStoryMacros() {
                 } catch(e) {
                     try {
                         context.macros.register(m.name, function() {
-                            return (storyData && storyData[m.key]) ? storyData[m.key] : "Unknown";
+                            return (Store.storyData && Store.storyData[m.key]) ? Store.storyData[m.key] : "Unknown";
                         });
                     } catch(ex) {
                         console.warn("[Story Tracker] Legacy macro fallback registration failed for " + m.name, ex);
@@ -1392,8 +315,6 @@ function getDayOfWeek(dateStr) {
     if (isNaN(d.getTime())) return "";
     return days[d.getDay()];
 }
-
-// Safe utility to grab character names or group titles for journal subtitles
 function getChatSubtitle() {
     try {
         var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function") 
@@ -1410,6 +331,39 @@ function getChatSubtitle() {
         }
     } catch(e) {}
     return "Field Notes";
+}
+
+// Purely a rendering aid — keeps the World tab from turning into an ever-growing wall of
+// always-expanded boxes as NPCs/events/reveals accumulate over a long story. The three
+// "grows without bound" list sections (NPC/Reveals/Events) collapse by default; the
+// Summary and Scheduled Events stay open since they're the primary/actionable content.
+// Collapse state is UI-only, kept in memory for this modal session — not worth a settings
+// field for something this cosmetic, and it re-defaults sensibly on next open.
+var worldCollapseState = { npc: true, reveals: true, events: true, codex: true }; // true = collapsed
+function worldCollapseSectionHtml(key, title, icon, tier, contentId, emptyText) {
+    var collapsed = worldCollapseState[key] !== false;
+    // tier is optional — sections not backed by a regenerable World Agent tier
+    // (e.g. the Location Codex, which the Scene tick maintains) get no wand button.
+    var wandHtml = tier
+        ? '<button class="st-wand-regen" data-tier="' + tier + '" title="Regenerate ' + esc(title) + '"><i class="fa-solid fa-wand-magic-sparkles"></i></button>'
+        : '';
+    return '<div class="st-journal-section st-collapse-section">' +
+        '<div class="st-sec-title-row st-collapse-toggle" data-collapse-key="' + key + '">' +
+            '<div class="st-journal-sec-title"><i class="fa-solid ' + icon + '" style="margin-right:6px;opacity:0.75;"></i>' + esc(title) + ' <span class="st-collapse-count" id="' + contentId + '-count"></span></div>' +
+            '<div style="display:flex;align-items:center;gap:8px;">' +
+                wandHtml +
+                '<i class="fa-solid fa-chevron-down st-collapse-chevron' + (collapsed ? '' : ' st-collapse-chevron-open') + '"></i>' +
+            '</div>' +
+        '</div>' +
+        '<div class="st-world-list st-collapse-body" id="' + contentId + '" style="' + (collapsed ? 'display:none;' : '') + '"><i>' + esc(emptyText) + '</i></div>' +
+    '</div>';
+}
+
+/** Updates a collapsible World-tab section's little count chip (e.g. "12") next to its title; hides the chip entirely at 0 so an empty section doesn't look falsely active. */
+function setWorldCollapseCount(contentId, count) {
+    var $chip = $("#" + contentId + "-count");
+    if (!$chip.length) return;
+    if (count > 0) $chip.text(count).show(); else $chip.hide();
 }
 
 function buildModal() {
@@ -1441,10 +395,20 @@ function buildModal() {
     h += '<div id="st-content-area">';
     
     // Structured Sentence Meta Blocks
-    h += '<div class="st-journal-meta">';
-    h += '  <div class="st-meta-line"><i class="fa-regular fa-clock"></i> <span id="st-val-dow"></span>, <span id="st-val-date"></span> &bull; <span id="st-val-time"></span></div>';
+    h += '<div class="st-journal-meta" style="position:relative;">';
+    h += '  <div class="st-meta-line"><i class="fa-regular fa-clock"></i> <span id="st-val-dow"></span>, <span id="st-val-date"></span> &bull; <span id="st-val-time"></span> <button class="st-wand-regen" id="st-time-correct-btn" title="Correct the tracked clock"><i class="fa-solid fa-pen"></i></button></div>';
     h += '  <div class="st-meta-line"><i class="fa-solid fa-location-dot"></i> <span id="st-val-loc"></span><span id="st-city-country-row">, <span id="st-val-city-country"></span></span></div>';
     h += '  <div class="st-meta-line" id="st-weather-row"><i class="fa-solid fa-cloud-sun" id="st-weather-icon-dynamic"></i> <span id="st-val-temp"></span> &bull; <span id="st-val-weather"></span></div>';
+    h += '  <div id="st-time-correct-popout" class="st-add-event-popout" style="display:none;">' +
+         '    <div class="st-add-event-popout-head"><span><i class="fa-solid fa-clock-rotate-left"></i> Correct Tracked Time</span><button id="st-time-correct-close" class="st-hdr-btn" title="Close" style="min-width:28px;min-height:28px;font-size:14px;"><i class="fa-solid fa-xmark"></i></button></div>' +
+         '    <div class="st-add-event-popout-body">' +
+         '      <div class="st-add-event-row"><label>Time (HH:MM)</label><input type="text" id="st-time-correct-time" placeholder="14:30" /></div>' +
+         '      <div class="st-add-event-row"><label>Date (DD/MM/YYYY)</label><input type="text" id="st-time-correct-date" placeholder="09/07/2026" /></div>' +
+         '      <div class="st-add-event-row"><label class="checkbox_label" style="display:flex;align-items:flex-start;gap:6px;"><input type="checkbox" id="st-time-correct-resync" checked style="margin-top:3px;" /><span style="font-size:11px;line-height:1.4;">Also resync scene/world/relationship checkpoints to the current message (recommended after deleting or rewriting messages)</span></label></div>' +
+         '      <div class="st-add-event-popout-note">This resets the clock and checkpoints going forward only — it does not remove any world events, NPC changes, or relationship history already generated. Edit or remove those individually if needed.</div>' +
+         '      <div class="st-add-event-actions"><button class="menu_button st-pill-btn" id="st-time-correct-save"><i class="fa-solid fa-check"></i> Apply</button></div>' +
+         '    </div>' +
+         '  </div>';
     h += '</div>';
     
     // Who's Here Section
@@ -1472,10 +436,49 @@ function buildModal() {
     
     // World Tab
     h += '<div id="st-tab-world" style="display:none;">';
-    h += '  <div class="st-journal-section"><div class="st-journal-sec-title">World State Summary</div><div class="st-world-preview-box" id="st-world-val-summary">No summary available yet.</div></div>';
-    h += '  <div class="st-journal-section"><div class="st-journal-sec-title">NPC Changes</div><div class="st-world-list" id="st-world-val-npcs"><i>No NPC changes.</i></div></div>';
-    h += '  <div class="st-journal-section"><div class="st-journal-sec-title">Pending Discoveries</div><div class="st-world-list" id="st-world-val-reveals"><i>No pending discoveries.</i></div></div>';
-    h += '  <div class="st-journal-section"><div class="st-journal-sec-title">World Events Chronology</div><div class="st-world-list" id="st-world-val-events"><i>No events.</i></div></div>';
+    // Compact status strip — season + weather trend at a glance, replacing what used to
+    // be a full separate "Regional Weather Trend" box. Season chip only shows once
+    // computed (settings.seasonHemisphere !== "none").
+    h += '  <div class="st-world-status-strip">' +
+         '    <div class="st-world-status-chip" id="st-world-chip-season" style="display:none;"><i class="fa-solid fa-leaf"></i><span id="st-world-chip-season-text"></span></div>' +
+         '    <div class="st-world-status-chip st-world-status-chip-grow" id="st-world-chip-weather"><i class="fa-solid fa-cloud-sun"></i><span id="st-world-chip-weather-text">No weather trend yet.</span></div>' +
+         '    <button class="st-wand-regen" data-tier="weather" title="Regenerate Weather Trend"><i class="fa-solid fa-wand-magic-sparkles"></i></button>' +
+         '  </div>';
+    h += '  <div class="st-journal-section"><div class="st-sec-title-row"><div class="st-journal-sec-title">World State Summary</div><button class="st-wand-regen" data-tier="world" title="Regenerate World Summary"><i class="fa-solid fa-wand-magic-sparkles"></i></button></div><div class="st-world-preview-box" id="st-world-val-summary">No summary available yet.</div></div>';
+    h += worldCollapseSectionHtml('npc', 'NPC Changes', 'fa-users', 'npc', 'st-world-val-npcs', 'No NPC changes.');
+    h += worldCollapseSectionHtml('reveals', 'Pending Discoveries', 'fa-eye-slash', 'faction', 'st-world-val-reveals', 'No pending discoveries.');
+    h += worldCollapseSectionHtml('events', 'World Events', 'fa-scroll', 'faction', 'st-world-val-events', 'No events.');
+    // Location Codex — maintained by the Scene tick on location changes (see
+    // Pipeline.doLLMUpdate), not by a World Agent tier, hence no regen wand.
+    h += worldCollapseSectionHtml('codex', 'Location Codex', 'fa-map-location-dot', null, 'st-world-val-codex', 'No locations remembered yet — entries appear when the scene moves somewhere else.');
+    h += '  <div class="st-journal-section" style="position:relative;"><div class="st-sec-title-row"><div class="st-journal-sec-title">Scheduled Events</div><button class="menu_button st-pill-btn" id="st-world-btn-add-event" title="Add a scheduled event"><i class="fa-solid fa-calendar-plus"></i> Add Event</button></div>';
+    h += '    <div id="st-world-add-event-popout" class="st-add-event-popout" style="display:none;">' +
+         '      <div class="st-add-event-popout-head"><span><i class="fa-solid fa-calendar-plus"></i> Schedule an Event</span><button id="st-evt-close-popout" class="st-hdr-btn" title="Close" style="min-width:28px;min-height:28px;font-size:14px;"><i class="fa-solid fa-xmark"></i></button></div>' +
+         '      <div class="st-add-event-popout-body">' +
+         '        <div class="st-add-event-row"><label>What happens</label><input type="text" id="st-evt-desc" placeholder="A messenger arrives with news from the capital" /></div>' +
+         '        <div class="st-add-event-row"><label>When</label>' +
+         '          <div class="st-add-event-when-row">' +
+         '            <span>In</span>' +
+         '            <input type="number" id="st-evt-amount" min="1" step="1" value="1" />' +
+         '            <select id="st-evt-unit">' +
+         '              <option value="1">minutes</option>' +
+         '              <option value="60" selected>hours</option>' +
+         '              <option value="1440">days</option>' +
+         '            </select>' +
+         '          </div>' +
+         '          <div class="st-add-event-preview" id="st-evt-preview">Resolves around --:--, --/--/----</div>' +
+         '        </div>' +
+         '        <div class="st-add-event-row"><label>Repeats</label>' +
+         '          <select id="st-evt-repeat">' +
+         '            <option value="0" selected>Never (one-time)</option>' +
+         '            <option value="1440">Daily</option>' +
+         '            <option value="10080">Weekly</option>' +
+         '          </select>' +
+         '        </div>' +
+         '        <div class="st-add-event-actions"><button class="menu_button st-pill-btn" id="st-evt-save"><i class="fa-solid fa-check"></i> Schedule</button></div>' +
+         '      </div>' +
+         '    </div>';
+    h += '    <div class="st-world-list" id="st-world-val-pending"><i>No scheduled events.</i></div></div>';
     h += '</div>'; // end world tab
     
     // Relations Tab
@@ -1495,6 +498,7 @@ function buildModal() {
          '  </div>';
     h += '  <div class="st-relations-controls st-hidden" style="display: none !important; gap: 5px;">' +
          '    <button class="menu_button st-pill-btn" id="st-rel-btn-analyze"><i class="fa-solid fa-magnifying-glass-chart"></i> Analyze</button>' +
+         '    <button class="menu_button st-pill-btn" id="st-rel-btn-reset-layout" title="Reset node positions and pan/zoom"><i class="fa-solid fa-arrows-to-circle"></i> Reset Layout</button>' +
          '    <button class="menu_button st-pill-btn" id="st-rel-btn-clear" style="color:#ff453a !important;"><i class="fa-solid fa-trash-can"></i> Clear</button>' +
          '  </div>';
     h += '  <div class="st-auto-info" id="st-auto-info"></div>';
@@ -1502,7 +506,7 @@ function buildModal() {
     document.body.insertAdjacentHTML("beforeend", h);
 
     $(document).on("click", ".st-overlay, #st-h-close", function() { $("#st-modal").fadeOut(150); });
-    $(document).on("click", "#st-f-update", doManualUpdate);
+    $(document).on("click", "#st-f-update", Pipeline.doManualUpdate);
     $(document).on("click", ".st-tab", function() {
         $(".st-tab").removeClass("st-tab-active"); $(this).addClass("st-tab-active");
         $("#st-tab-current, #st-tab-history, #st-tab-world, #st-tab-relations").hide();
@@ -1534,43 +538,274 @@ function buildModal() {
 
     // World control routing
     $(document).on("click", "#st-world-btn-tick", async function() {
-        await runManualWorldTick();
+        await Pipeline.runManualWorldTick();
     });
     $(document).on("click", "#st-world-btn-clear", function() {
         if (confirm("Are you sure you want to clear world progression history?")) {
-            worldData = makeDefaultWorldData();
-            saveWorldData();
-            renderModal(); renderHUD();
+            Store.setWorldData(Persistence.makeDefaultWorldData());
+            Persistence.saveWorldData();
+            renderModal(); HUD.renderHUD();
             if (typeof toastr !== "undefined") toastr.info("World state cleared.");
         }
     });
+    // Custom drag-to-resize handle for textareas — native CSS `resize: vertical` simply
+    // doesn't render a usable grip on most mobile browsers, so on mobile a resizable
+    // textarea is effectively stuck at its starting height. Pointer Events unify mouse
+    // and touch, so this one handler works on both. Delegated + registered once here
+    // (not inside wireRelEditPanel, which re-runs every time the edit panel opens) so
+    // repeatedly opening/closing the panel never stacks up duplicate listeners.
+    $(document).on("pointerdown", ".st-resize-handle", function(e) {
+        var $handle = $(this);
+        var $textarea = $handle.siblings("textarea");
+        if ($textarea.length === 0) return;
+        e.preventDefault();
+        var startY = e.clientY;
+        var startHeight = $textarea.outerHeight();
+        $handle.addClass("st-resize-active");
+        var move = function(ev) {
+            var dy = ev.clientY - startY;
+            var newHeight = Math.max(40, startHeight + dy);
+            $textarea.css("height", newHeight + "px");
+        };
+        var up = function() {
+            $handle.removeClass("st-resize-active");
+            $(document).off("pointermove", move).off("pointerup", up);
+        };
+        $(document).on("pointermove", move).on("pointerup", up);
+    });
+
     $(document).on("click", "#st-world-btn-refresh", function() {
-        loadWorldData();
-        renderModal(); renderHUD();
+        Persistence.loadWorldData();
+        renderModal(); HUD.renderHUD();
         if (typeof toastr !== "undefined") toastr.info("World data refreshed.");
+    });
+
+    // Per-section "regenerate" (wand) buttons — re-run just that one World Agent
+    // tier on demand, instead of waiting for its scheduled interval or running
+    // all four tiers via "Run Tick". See regenerateWorldSection() for details.
+    $(document).on("click", ".st-wand-regen", async function(e) {
+        e.stopPropagation();
+        var tier = $(this).data("tier");
+        await Pipeline.regenerateWorldSection(tier, $(this));
+    });
+
+    // Collapsible World-tab sections (NPC Changes / Pending Discoveries / World Events) —
+    // toggles both the visible body and the in-memory state so it stays collapsed/expanded
+    // across a renderModal() re-render within the same session (e.g. after a tick completes).
+    $(document).on("click", ".st-collapse-toggle", function() {
+        var key = $(this).data("collapse-key");
+        var $body = $(this).closest(".st-collapse-section").find(".st-collapse-body");
+        var $chevron = $(this).find(".st-collapse-chevron");
+        var nowCollapsed = $body.is(":visible");
+        $body.slideToggle(150);
+        $chevron.toggleClass("st-collapse-chevron-open", !nowCollapsed);
+        worldCollapseState[key] = nowCollapsed;
+    });
+
+    // --- Manual "calendar" event scheduling ---
+    function updateEventPreview() {
+        if (!Store.TimelineEngine || !Store.storyData || !Store.storyData.time || !Store.storyData.date) return;
+        var amount = Number($("#st-evt-amount").val());
+        var unitMinutes = Number($("#st-evt-unit").val());
+        if (!(amount > 0) || !unitMinutes) { $("#st-evt-preview").text("Resolves around --:--, --/--/----"); return; }
+        var base = Store.TimelineEngine.parseDateTime(Store.storyData.time, Store.storyData.date);
+        if (!base) return;
+        var resolved = Store.TimelineEngine.addMinutesToDate(base, amount * unitMinutes);
+        $("#st-evt-preview").text("Resolves around " + Store.TimelineEngine.formatTime(resolved) + ", " + Store.TimelineEngine.formatDate(resolved) + " (RP time)");
+    }
+    $(document).on("click", "#st-world-btn-add-event", function() {
+        var $popout = $("#st-world-add-event-popout");
+        if ($popout.is(":visible")) { $popout.hide(); return; }
+        $("#st-evt-desc").val("");
+        $("#st-evt-amount").val(1);
+        $("#st-evt-unit").val("60");
+        $("#st-evt-repeat").val("0");
+        updateEventPreview();
+        $popout.show();
+    });
+    $(document).on("click", "#st-evt-close-popout", function() {
+        $("#st-world-add-event-popout").hide();
+    });
+    // Click-outside-to-close, same pattern as any lightweight popover.
+    $(document).on("click", function(e) {
+        var $popout = $("#st-world-add-event-popout");
+        if (!$popout.is(":visible")) return;
+        if ($(e.target).closest("#st-world-add-event-popout, #st-world-btn-add-event").length === 0) {
+            $popout.hide();
+        }
+    });
+    $(document).on("input change", "#st-evt-amount, #st-evt-unit", updateEventPreview);
+    $(document).on("click", "#st-evt-save", function() {
+        if (!Store.EventQueue) { if (typeof toastr !== "undefined") toastr.error("Event Queue module not loaded yet."); return; }
+        if (!Store.isChatOpen() || !Store.storyData) { if (typeof toastr !== "undefined") toastr.warning("No active chat is open."); return; }
+
+        var amount = Number($("#st-evt-amount").val());
+        var unitMinutes = Number($("#st-evt-unit").val());
+        var desc = ($("#st-evt-desc").val() || "").trim();
+        var repeatMinutes = Number($("#st-evt-repeat").val()) || 0;
+
+        if (!desc) { if (typeof toastr !== "undefined") toastr.warning("Please describe what happens."); return; }
+        if (!(amount > 0)) { if (typeof toastr !== "undefined") toastr.warning("Please enter how long until this happens."); return; }
+        var duration = Math.round(amount * unitMinutes);
+
+        Persistence.loadWorldData();
+        try {
+            Store.worldData._eventQueue = Store.EventQueue.enqueue(Store.worldData._eventQueue || [], {
+                actor: null,
+                action: desc,
+                startTime: Store.storyData.time,
+                startDate: Store.storyData.date,
+                durationMinutes: duration,
+                recurringMinutes: repeatMinutes > 0 ? repeatMinutes : null,
+                meta: { origin: "manual" },
+            });
+            Persistence.saveWorldData();
+            $("#st-world-add-event-popout").hide();
+            renderModal(); HUD.renderHUD();
+            if (typeof toastr !== "undefined") toastr.success("Event scheduled.");
+        } catch (e) {
+            if (typeof toastr !== "undefined") toastr.error("Could not schedule event: " + e.message);
+        }
+    });
+    // Cancel a pending scheduled event (manual or agent-scheduled) directly from the list.
+    $(document).on("click", ".st-cancel-pending-evt", function() {
+        var id = $(this).data("id");
+        if (!Store.EventQueue || !Store.worldData || !id) return;
+        Store.worldData._eventQueue = Store.EventQueue.cancelEvent(Store.worldData._eventQueue || [], id);
+        Persistence.saveWorldData();
+        renderModal(); HUD.renderHUD();
+        if (typeof toastr !== "undefined") toastr.info("Scheduled event cancelled.");
+    });
+
+    // Pin/unpin a world event — a pinned event is exempt from trimWorldEvents' importance-based
+    // pruning (see WorldAgent.js), so a plot-critical development can't get quietly trimmed out
+    // of the log during a long campaign just because newer events outrank its importance score.
+    $(document).on("click", ".st-pin-event-btn", function() {
+        var idx = parseInt($(this).data("index"), 10);
+        if (!Store.WorldAgent || !Store.worldData || isNaN(idx)) return;
+        Store.worldData.worldEvents = Store.WorldAgent.togglePinned(Store.worldData.worldEvents || [], idx);
+        Persistence.saveWorldData();
+        renderModal();
+        if (typeof toastr !== "undefined") {
+            var nowPinned = !!(Store.worldData.worldEvents[idx] && Store.worldData.worldEvents[idx].pinned);
+            toastr.info(nowPinned ? "Event pinned — protected from automatic trimming." : "Event unpinned.");
+        }
+    });
+
+    // --- Manual "correct the clock" control ---
+    // The tracked clock and its scene/world/relationship checkpoints only ever move forward
+    // (see EventQueue/RelationshipAgent's append/merge-only philosophy) — they never rewind
+    // on their own when messages are deleted or heavily rewritten, and an explicit narrative
+    // skip larger than the resolver's cap could historically only ever be corrected by editing
+    // save data directly. This is the manual escape hatch for both: set the clock to wherever
+    // the story actually is, and optionally re-anchor the tracker checkpoints to the current
+    // last message so the next scene/world/relationship call reads forward from here rather
+    // than replaying anything that got deleted or rewritten.
+    $(document).on("click", "#st-time-correct-btn", function() {
+        var $popout = $("#st-time-correct-popout");
+        if ($popout.is(":visible")) { $popout.hide(); return; }
+        if (!Store.isChatOpen() || !Store.storyData) { if (typeof toastr !== "undefined") toastr.warning("No active chat is open."); return; }
+        $("#st-time-correct-time").val(Store.storyData.time || "");
+        $("#st-time-correct-date").val(Store.storyData.date || "");
+        $popout.show();
+    });
+    $(document).on("click", "#st-time-correct-close", function() {
+        $("#st-time-correct-popout").hide();
+    });
+    // Click-outside-to-close, same pattern as the add-event popout.
+    $(document).on("click", function(e) {
+        var $popout = $("#st-time-correct-popout");
+        if (!$popout.is(":visible")) return;
+        if ($(e.target).closest("#st-time-correct-popout, #st-time-correct-btn").length === 0) {
+            $popout.hide();
+        }
+    });
+    $(document).on("click", "#st-time-correct-save", function() {
+        if (!Store.isChatOpen() || !Store.storyData || !Store.TimelineEngine) { if (typeof toastr !== "undefined") toastr.warning("No active chat is open."); return; }
+
+        var rawTime = ($("#st-time-correct-time").val() || "").trim();
+        var rawDate = ($("#st-time-correct-date").val() || "").trim();
+        if (!/^\d{1,2}[:.]\d{1,2}$/.test(rawTime)) { if (typeof toastr !== "undefined") toastr.warning("Enter time as HH:MM."); return; }
+        if (!/^\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{3,4}$/.test(rawDate)) { if (typeof toastr !== "undefined") toastr.warning("Enter date as DD/MM/YYYY."); return; }
+
+        var newTime = Persistence.sanitizeTimeStr(rawTime, Store.storyData.time);
+        var newDate = Persistence.sanitizeDateStr(rawDate, Store.storyData.date);
+        var parsed = Store.TimelineEngine.parseDateTime(newTime, newDate);
+        if (!parsed) { if (typeof toastr !== "undefined") toastr.error("Could not parse that time/date."); return; }
+
+        Store.storyData.time = newTime;
+        Store.storyData.date = newDate;
+        Store.storyData._timeEpoch = parsed.getTime();
+
+        var resync = $("#st-time-correct-resync").is(":checked");
+        if (resync) {
+            var liveChat = Store.getLiveChat() || [];
+            var lastIdx = liveChat.length - 1;
+            var lastMsg = liveChat[lastIdx];
+            var anchor = (lastMsg && lastMsg.mes) ? String(lastMsg.mes).slice(0, 40) : "";
+
+            Store.storyData._sceneCheckpointIdx = lastIdx;
+            Store.storyData._sceneCheckpointAnchor = anchor;
+
+            Persistence.loadWorldData();
+            if (Store.worldData) {
+                Store.worldData._worldCheckpointIdx = lastIdx;
+                Store.worldData._worldCheckpointAnchor = anchor;
+                if (Store.worldData._schedulerAccumulated) {
+                    Object.keys(Store.worldData._schedulerAccumulated).forEach(function (t) {
+                        Store.worldData._schedulerAccumulated[t] = 0;
+                    });
+                }
+                Persistence.saveWorldData();
+            }
+
+            Persistence.loadRelationshipData();
+            if (Store.relationshipData) {
+                Store.relationshipData._checkpointMsgIdx = lastIdx;
+                Store.relationshipData._checkpointAnchor = anchor;
+                Persistence.saveRelationshipData();
+            }
+        }
+
+        Persistence.saveStoryData();
+        $("#st-time-correct-popout").hide();
+        renderModal(); HUD.renderHUD();
+        if (typeof toastr !== "undefined") toastr.success("Tracked clock corrected" + (resync ? " and checkpoints resynced." : "."));
     });
 
     // Relations control routing
     $(document).on("click", "#st-rel-btn-analyze", async function() {
-        await runManualRelationshipAnalysis();
+        await Pipeline.runManualRelationshipAnalysis();
+    });
+    $(document).on("click", "#st-rel-btn-reset-layout", function() {
+        if (!Store.relationshipData) return;
+        if (!confirm("Reset the graph layout? This clears saved node positions and pan/zoom, and re-arranges everything automatically.")) return;
+        (Store.relationshipData.nodes || []).forEach(function(n) { delete n.x; delete n.y; });
+        Store.relationshipData._view = null;
+        Store.setRelEditingNode(null);
+        Persistence.saveRelationshipData();
+        renderRelationshipGraph();
+        if (typeof toastr !== "undefined") toastr.info("Graph layout reset.");
     });
     $(document).on("click", "#st-rel-btn-clear", function() {
         if (!confirm("Clear all relationship tracking data?")) return;
 
-        relationshipData = makeDefaultRelationshipData();
+        Store.setRelationshipData(Persistence.makeDefaultRelationshipData());
+        Store.setRelEditingNode(null);
+        Store.setRelSelectedNode(null);
 
         // make sure graph immediately enters empty state
-        relationshipData._initialized = false;
+        Store.relationshipData._initialized = false;
 
-        saveRelationshipData();
+        Persistence.saveRelationshipData();
 
         // refresh everything that consumes relationship state
         renderRelationshipGraph();
-        renderHUD();
+        HUD.renderHUD();
         renderModal();
 
         // refresh injected prompt context too
-        if (settings.enabled && settings.injectToContext) injectContextToChat();
+        if (Store.settings.enabled) Pipeline.injectContextToChat();
 
         $(document).trigger("ST_FORCE_RENDER");
 
@@ -1579,28 +814,92 @@ function buildModal() {
         }
     });
 
+    // Stop tracking an NPC entirely — removes their state entry (goal and routine
+    // with it) and cancels any still-pending scheduled action of theirs, so an
+    // orphaned "arrives at the outpost" can't resolve later and resurrect them
+    // as a world event. They can be re-tracked from scratch by a future NPC tick
+    // if they stay active in the story (which also clears any _noGoal/_noRoutine
+    // opt-outs, since the fresh entry starts clean).
+    $(document).on("click", ".st-del-npc", function() {
+        var name = $(this).attr("data-name");
+        if (!Store.worldData || !name) return;
+        if (!confirm('Stop tracking "' + name + '"? Their offscreen state, goal, and routine are removed. (They may be re-tracked automatically if they stay active in the story.)')) return;
+        Store.worldData.npcStates = (Store.worldData.npcStates || []).filter(function(n) { return n && n.name !== name; });
+        if (Store.EventQueue) {
+            Store.worldData._eventQueue = Store.EventQueue.cancelPendingMatching(Store.worldData._eventQueue || [], function(ev) {
+                return ev.meta && ev.meta.origin === "npc" && ev.meta.npcName === name;
+            });
+        }
+        Persistence.saveWorldData();
+        renderModal(); HUD.renderHUD();
+        if (typeof toastr !== "undefined") toastr.info('No longer tracking "' + name + '".');
+    });
+
+    // Remove just an NPC's goal/routine. Sets the matching opt-out flag so the
+    // agent doesn't simply re-invent one next tick — see WorldAgent's
+    // formatNpcsNeedingGoalForPrompt/_noGoal comments for why deletion has to
+    // be an opt-out, not a vacancy.
+    function removeNpcField(name, field, optOutFlag, label) {
+        if (!Store.worldData || !name) return;
+        var npc = (Store.worldData.npcStates || []).find(function(n) { return n && n.name === name; });
+        if (!npc) return;
+        npc[field] = null;
+        npc[optOutFlag] = true;
+        Persistence.saveWorldData();
+        renderModal();
+        if (typeof toastr !== "undefined") toastr.info(label + ' removed for "' + name + '" — the tracker won\'t generate a new one for them.');
+    }
+    $(document).on("click", ".st-del-npc-goal", function() {
+        removeNpcField($(this).attr("data-name"), "goal", "_noGoal", "Goal");
+    });
+    $(document).on("click", ".st-del-npc-routine", function() {
+        removeNpcField($(this).attr("data-name"), "routine", "_noRoutine", "Routine");
+    });
+
+    // Forget a remembered location from the codex
+    $(document).on("click", ".st-del-codex", function() {
+        var key = $(this).attr("data-key");
+        if (!Store.worldData || !Store.worldData.locationCodex || !key) return;
+        if (!confirm("Forget this location's remembered state?")) return;
+        delete Store.worldData.locationCodex[key];
+        Persistence.saveWorldData();
+        renderModal();
+        if (typeof toastr !== "undefined") toastr.info("Location memory removed.");
+    });
+
     // Delete past summary from history
     $(document).on("click", ".st-del-hist", function() {
         var index = parseInt($(this).data("index"), 10);
-        if (storyData && storyData.history && !isNaN(index)) {
-            storyData.history.splice(index, 1);
-            saveStoryData();
+        if (Store.storyData && Store.storyData.history && !isNaN(index)) {
+            Store.storyData.history.splice(index, 1);
+            Persistence.saveStoryData();
             renderModal();
         }
     });
 }
 
 function renderModal() {
-    if (!isChatOpen() || !storyData) {
+    if (!Store.isChatOpen() || !Store.storyData) {
         $("#st-no-data").show(); $("#st-content-area").hide();
         $("#st-history-list").html("<div class='st-no-data'>No active chat.</div>");
         $("#st-world-val-summary").text("No active chat.");
+        $("#st-world-chip-weather-text").text("No active chat.");
+        $("#st-world-chip-season").hide();
         $("#st-world-val-events").html("<i>No active chat.</i>");
         $("#st-world-val-npcs").html("<i>No active chat.</i>");
         $("#st-world-val-reveals").html("<i>No active chat.</i>");
+        $("#st-world-val-pending").html("<i>No active chat.</i>");
+        $("#st-world-val-codex").html("<i>No active chat.</i>");
+        // These count badges/chips are stateful DOM (jQuery .show()/.hide()), so on
+        // returning to a "no chat" state they must be explicitly reset — otherwise
+        // they keep showing whatever the previously-open chat last left them at.
+        setWorldCollapseCount("st-world-val-events", 0);
+        setWorldCollapseCount("st-world-val-npcs", 0);
+        setWorldCollapseCount("st-world-val-reveals", 0);
+        setWorldCollapseCount("st-world-val-codex", 0);
         return;
     }
-    if (!storyData._initialized) {
+    if (!Store.storyData._initialized) {
         $("#st-no-data").show(); $("#st-content-area").hide();
     } else {
         $("#st-no-data").hide(); $("#st-content-area").show();
@@ -1609,15 +908,15 @@ function renderModal() {
         $("#st-modal-subtitle").text(getChatSubtitle());
         
         // Populate standard nodes
-        $("#st-val-time").text(storyData.time);
-        $("#st-val-date").text(storyData.date);
-        var dow = getDayOfWeek(storyData.date);
+        $("#st-val-time").text(Store.storyData.time);
+        $("#st-val-date").text(Store.storyData.date);
+        var dow = getDayOfWeek(Store.storyData.date);
         $("#st-val-dow").text(dow || "Unknown");
-        $("#st-val-loc").text(storyData.location);
+        $("#st-val-loc").text(Store.storyData.location);
         
-        if (settings.showCityCountry) {
-            let city = storyData.city || "Unknown";
-            let country = storyData.country || "Unknown";
+        if (Store.settings.showCityCountry) {
+            let city = Store.storyData.city || "Unknown";
+            let country = Store.storyData.country || "Unknown";
             let ccText = (city !== "Unknown" || country !== "Unknown")
                 ? [city, country].filter(v => v && v !== "Unknown").join(", ") || "Unknown"
                 : "Unknown";
@@ -1627,13 +926,23 @@ function renderModal() {
             $("#st-city-country-row").hide();
         }
 
-        $("#st-val-temp").text(storyData.temperature || "Unknown");
-        $("#st-val-weather").text(storyData.weather || "Unknown");
-        $("#st-val-events").text(storyData.recent_events);
+        $("#st-val-temp").text(Store.storyData.temperature || "Unknown");
+        // Scene Agent's weather grounding (see SceneAgent.buildScenePrompt's
+        // regionalWeatherTrend) means this should rarely land on "Unknown" once the World
+        // Agent's weather tier has ticked at least once — but for a brand-new chat, before
+        // that first tick, there's genuinely nothing to go on yet. In that specific gap,
+        // fall back to showing the broader regional trend (clearly marked as such) rather
+        // than a bare, unhelpful "Unknown".
+        var sceneWeatherKnown = Store.storyData.weather && Store.storyData.weather !== "Unknown";
+        var trendFallback = (!sceneWeatherKnown && Store.worldData && Store.worldData.weatherTrend) ? Store.worldData.weatherTrend : null;
+        $("#st-val-weather").toggleClass("st-val-weather-fallback", !!trendFallback)
+            .attr("title", trendFallback ? "Scene-specific weather not yet known — showing the current regional trend instead." : "")
+            .text(trendFallback || Store.storyData.weather || "Unknown");
+        $("#st-val-events").text(Store.storyData.recent_events);
         
         // Dynamically compute weather icon classes
         var wIcon = "fa-cloud-sun";
-        var w = (storyData.weather || "").toLowerCase();
+        var w = (trendFallback || Store.storyData.weather || "").toLowerCase();
         if (w.includes("rain") || w.includes("дожд")) wIcon = "fa-cloud-rain";
         else if (w.includes("snow") || w.includes("снег")) wIcon = "fa-snowflake";
         else if (w.includes("storm") || w.includes("гроз")) wIcon = "fa-bolt";
@@ -1643,11 +952,11 @@ function renderModal() {
         $("#st-weather-icon-dynamic").attr("class", "fa-solid " + wIcon);
         
         var outfit = getInventoryOutfit();
-        var userName = (scriptModule && scriptModule.name1) ? scriptModule.name1 : null;
+        var userName = (Store.scriptModule && Store.scriptModule.name1) ? Store.scriptModule.name1 : null;
 
         let cHtml = "";
-        if (storyData.characters) {
-            storyData.characters.forEach(c => {
+        if (Store.storyData.characters) {
+            Store.storyData.characters.forEach(c => {
                 var stateText = c.state;
                 var isUser = (userName && c.name.toLowerCase() === userName.toLowerCase()) ||
                              c.name.toLowerCase() === "вы" ||
@@ -1694,8 +1003,8 @@ function renderModal() {
         $("#st-val-chars").html(cHtml || "<i>No characters detected.</i>");
 
         // Populate World Progression preview if summary exists
-        if (worldData && worldData.worldSummary && worldData.worldSummary.trim() !== "") {
-            $("#st-val-world-summary-preview").text(worldData.worldSummary);
+        if (Store.worldData && Store.worldData.worldSummary && Store.worldData.worldSummary.trim() !== "") {
+            $("#st-val-world-summary-preview").text(Store.worldData.worldSummary);
             $("#st-world-preview-section").show();
         } else {
             $("#st-world-preview-section").hide();
@@ -1703,8 +1012,8 @@ function renderModal() {
     }   
     
     let hHtml = "";
-    if (storyData.history && storyData.history.length > 0) {
-        storyData.history.forEach((h, i) => {
+    if (Store.storyData.history && Store.storyData.history.length > 0) {
+        Store.storyData.history.forEach((h, i) => {
             let weatherInfo = (h.temperature || h.weather) ? ` | ${h.temperature || ""}${h.weather ? " " + esc(h.weather) : ""}` : "";
             hHtml += `<div class="st-history-item" style="position: relative;">
                 <div class="st-history-meta" style="display: flex; justify-content: space-between; align-items: center;">
@@ -1721,16 +1030,33 @@ function renderModal() {
     $("#st-history-list").html(hHtml);
 
     // Populate Secondary Tab States
-    if (worldData && worldData._initialized) {
-        $("#st-world-val-summary").text(worldData.worldSummary || "No summary available yet.");
+    if (Store.worldData && Store.worldData._initialized) {
+        $("#st-world-val-summary").text(Store.worldData.worldSummary || "No summary available yet.");
+        $("#st-world-chip-weather-text").text(Store.worldData.weatherTrend || "No weather trend yet.");
+
+        // Season chip — same computation used to ground the Weather/World prompts,
+        // surfaced here so it's not a purely invisible behind-the-scenes input.
+        if (Store.TimelineEngine && Store.settings.seasonHemisphere && Store.settings.seasonHemisphere !== "none" && Store.storyData && Store.storyData.date) {
+            var seasonNow = Store.TimelineEngine.formatSeasonForPrompt(Store.storyData.date, Store.settings.seasonHemisphere);
+            if (seasonNow) {
+                $("#st-world-chip-season-text").text(seasonNow.charAt(0).toUpperCase() + seasonNow.slice(1));
+                $("#st-world-chip-season").show();
+            } else {
+                $("#st-world-chip-season").hide();
+            }
+        } else {
+            $("#st-world-chip-season").hide();
+        }
 
         let eventsHtml = "";
-        if (worldData.worldEvents && worldData.worldEvents.length > 0) {
-            worldData.worldEvents.forEach(function(e) {
-                eventsHtml += `<div class="st-world-event-item">
+        if (Store.worldData.worldEvents && Store.worldData.worldEvents.length > 0) {
+            Store.worldData.worldEvents.forEach(function(e, idx) {
+                var pinned = !!e.pinned;
+                eventsHtml += `<div class="st-world-event-item${pinned ? " st-world-event-pinned" : ""}">
                     <div class="st-world-event-meta">
                         <span>${e.time} ${e.date}</span>
                         <span>Importance: ${e.importance}/10</span>
+                        <button class="st-pin-event-btn menu_button${pinned ? " st-pin-event-active" : ""}" data-index="${idx}" title="${pinned ? "Unpin — allow this to be trimmed over time" : "Pin — protect this event from automatic trimming"}"><i class="fa-solid fa-thumbtack"></i></button>
                     </div>
                     <div class="st-world-event-text">${esc(e.event)}</div>
                 </div>`;
@@ -1739,22 +1065,49 @@ function renderModal() {
             eventsHtml = "<i>No events recorded.</i>";
         }
         $("#st-world-val-events").html(eventsHtml);
+        setWorldCollapseCount("st-world-val-events", (Store.worldData.worldEvents || []).length);
 
         let npcsHtml = "";
-        if (worldData.npcStates && worldData.npcStates.length > 0) {
-            worldData.npcStates.forEach(function(n) {
+        if (Store.worldData.npcStates && Store.worldData.npcStates.length > 0) {
+            Store.worldData.npcStates.forEach(function(n) {
+                var goalLine = n.goal
+                    ? `<div class="st-world-npc-goal"><i class="fa-solid fa-compass"></i>${esc(n.goal)}<button class="st-npc-line-del st-del-npc-goal" data-name="${esc(n.name)}" title="Remove this goal — the tracker won't invent a new one for this NPC (remove the whole NPC entry to reset that)">&times;</button></div>`
+                    : "";
+                var routineLine = "";
+                if (Store.WorldAgent && Array.isArray(n.routine) && n.routine.length > 0) {
+                    var routineText = Store.WorldAgent.formatRoutineForPrompt(n.routine);
+                    var nowEntry = (Store.storyData && Store.storyData.time)
+                        ? Store.WorldAgent.getRoutineActivityAt(n.routine, Store.storyData.time)
+                        : null;
+                    routineLine = `<div class="st-world-npc-goal"><i class="fa-solid fa-clock"></i>${esc(routineText)}${nowEntry ? " &middot; now: " + esc(nowEntry.activity) : ""}<button class="st-npc-line-del st-del-npc-routine" data-name="${esc(n.name)}" title="Remove this routine — the tracker won't invent a new one for this NPC (remove the whole NPC entry to reset that)">&times;</button></div>`;
+                }
+                var currentAction = Store.EventQueue
+                    ? Store.EventQueue.getPendingMatching(Store.worldData._eventQueue || [], function(ev) {
+                        return ev.meta && ev.meta.origin === "npc" && ev.meta.npcName === n.name;
+                    })[0]
+                    : null;
+                var currentLine = currentAction
+                    ? `<div class="st-world-npc-current"><i class="fa-solid fa-hourglass-half"></i>${esc(currentAction.action)} <span class="st-world-npc-current-eta">(due ${esc(currentAction.executeTime)} ${esc(currentAction.executeDate)})</span></div>`
+                    : "";
                 npcsHtml += `<div class="st-world-npc-item">
-                    <span class="st-world-npc-name">${esc(n.name)}:</span> <span>${esc(n.change)}</span>
+                    <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:6px;">
+                        <div style="min-width:0;"><span class="st-world-npc-name">${esc(n.name)}:</span> <span>${esc(n.change)}</span></div>
+                        <button class="st-del-npc st-hdr-btn menu_button" data-name="${esc(n.name)}" title="Stop tracking this NPC (removes their state, goal, and routine)" style="padding: 2px 6px !important; font-size: 10px; color: #ff453a; border-color: rgba(255,255,255,0.1); background: transparent; min-width: unset !important; min-height: unset !important;"><i class="fa-solid fa-trash-can"></i></button>
+                    </div>
+                    ${goalLine}
+                    ${routineLine}
+                    ${currentLine}
                 </div>`;
             });
         } else {
             npcsHtml = "<i>No NPC changes recorded.</i>";
         }
         $("#st-world-val-npcs").html(npcsHtml);
+        setWorldCollapseCount("st-world-val-npcs", (Store.worldData.npcStates || []).length);
 
         let revealsHtml = "";
-        if (worldData.pendingReveals && worldData.pendingReveals.length > 0) {
-            worldData.pendingReveals.forEach(function(r) {
+        if (Store.worldData.pendingReveals && Store.worldData.pendingReveals.length > 0) {
+            Store.worldData.pendingReveals.forEach(function(r) {
                 revealsHtml += `<div class="st-world-reveal-item">
                     <i class="fa-solid fa-circle-question st-world-reveal-icon"></i>
                     <span>${esc(r)}</span>
@@ -1764,12 +1117,80 @@ function renderModal() {
             revealsHtml = "<i>No pending discoveries.</i>";
         }
         $("#st-world-val-reveals").html(revealsHtml);
+        setWorldCollapseCount("st-world-val-reveals", (Store.worldData.pendingReveals || []).length);
     } else {
         $("#st-world-val-summary").text("Waiting for first World Tick to run...");
+        $("#st-world-chip-weather-text").text("Waiting for first tick...");
+        $("#st-world-chip-season").hide();
         $("#st-world-val-events").html("<i>Waiting for simulation...</i>");
         $("#st-world-val-npcs").html("<i>Waiting for simulation...</i>");
         $("#st-world-val-reveals").html("<i>Waiting for simulation...</i>");
+        setWorldCollapseCount("st-world-val-events", 0);
+        setWorldCollapseCount("st-world-val-npcs", 0);
+        setWorldCollapseCount("st-world-val-reveals", 0);
     }
+
+    // Scheduled Events is independent of the World Agent — a manually-added calendar
+    // entry (or an agent-scheduled delayed action) should show up here whether or not
+    // World Agent ticks have ever run, so this is NOT gated behind worldData._initialized.
+    let pendingHtml = "";
+    var pendingEvents = (Store.EventQueue && Store.worldData) ? Store.EventQueue.getPending(Store.worldData._eventQueue || []) : [];
+    if (pendingEvents.length > 0) {
+        pendingEvents
+            .slice()
+            .sort(function(a, b) {
+                var da = Store.TimelineEngine.parseDateTime(a.executeTime, a.executeDate);
+                var db = Store.TimelineEngine.parseDateTime(b.executeTime, b.executeDate);
+                return (da ? da.getTime() : 0) - (db ? db.getTime() : 0);
+            })
+            .forEach(function(ev) {
+                var originLabel = (ev.meta && ev.meta.origin === "manual") ? " &bull; manual" : "";
+                var repeatLabel = "";
+                if (ev.recurringMinutes > 0) {
+                    repeatLabel = ev.recurringMinutes === 1440 ? " &bull; repeats daily"
+                        : ev.recurringMinutes === 10080 ? " &bull; repeats weekly"
+                        : " &bull; repeats every " + ev.recurringMinutes + " min";
+                }
+                pendingHtml += `<div class="st-world-event-item">
+                    <div class="st-world-event-meta">
+                        <span>Resolves: ${ev.executeTime} ${ev.executeDate}${originLabel}${repeatLabel}</span>
+                        <button class="st-cancel-pending-evt st-hdr-btn menu_button" data-id="${esc(ev.id)}" title="Cancel this scheduled event" style="padding: 2px 6px !important; font-size: 10px; color: #ff453a; border-color: rgba(255,255,255,0.1); background: transparent;"><i class="fa-solid fa-trash-can"></i></button>
+                    </div>
+                    <div class="st-world-event-text">${esc(ev.action)}</div>
+                </div>`;
+            });
+    } else {
+        pendingHtml = "<i>No scheduled events.</i>";
+    }
+    $("#st-world-val-pending").html(pendingHtml);
+
+    // Location Codex — like Scheduled Events, this is maintained by the Scene tick,
+    // not the World Agent tiers, so it renders whether or not a world tick has ever
+    // run (deliberately NOT gated behind worldData._initialized).
+    let codexHtml = "";
+    var codexMap = (Store.worldData && Store.worldData.locationCodex) ? Store.worldData.locationCodex : {};
+    var codexEntries = Object.keys(codexMap)
+        .map(function(k) { return { key: k, entry: codexMap[k] }; })
+        .filter(function(c) { return c.entry && c.entry.name; })
+        .sort(function(a, b) { return (b.entry.epoch || 0) - (a.entry.epoch || 0); }); // most recently left first
+    if (codexEntries.length > 0) {
+        codexEntries.forEach(function(c) {
+            var e = c.entry;
+            var whoThen = (e.characters || []).map(function(ch) { return ch && ch.name ? ch.name : ""; }).filter(Boolean).join(", ");
+            codexHtml += `<div class="st-world-event-item">
+                <div class="st-world-event-meta">
+                    <span><i class="fa-solid fa-map-pin" style="margin-right:4px;opacity:0.7;"></i>${esc(e.name)} &bull; last left ${esc(e.time)} ${esc(e.date)}${e.visits > 1 ? " &bull; " + e.visits + " visits" : ""}</span>
+                    <button class="st-del-codex st-hdr-btn menu_button" data-key="${esc(c.key)}" title="Forget this location" style="padding: 2px 6px !important; font-size: 10px; color: #ff453a; border-color: rgba(255,255,255,0.1); background: transparent;"><i class="fa-solid fa-trash-can"></i></button>
+                </div>
+                <div class="st-world-event-text">${esc(e.recentEvents || "No details recorded.")}</div>
+                ${whoThen ? `<div class="st-world-npc-goal"><i class="fa-solid fa-users"></i>Present then: ${esc(whoThen)}</div>` : ""}
+            </div>`;
+        });
+    } else {
+        codexHtml = "<i>No locations remembered yet — entries appear when the scene moves somewhere else.</i>";
+    }
+    $("#st-world-val-codex").html(codexHtml);
+    setWorldCollapseCount("st-world-val-codex", codexEntries.length);
 
     renderAutoInfo();
     // Refresh graph if relations tab is currently visible
@@ -1779,54 +1200,64 @@ function renderModal() {
 }
 
 function updateSettingsUI() {
-    let hasData = isChatOpen() && storyData;
-    let autoUpdate = (hasData && storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
-    let autoUpdateInterval = (hasData && storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
+    let hasData = Store.isChatOpen() && Store.storyData;
+    let autoUpdate = (hasData && Store.storyData.autoUpdate !== undefined) ? Store.storyData.autoUpdate : Store.settings.autoUpdate;
 
     $("#st-s-auto").prop("checked", autoUpdate);
-    $("#st-s-interval").val(autoUpdateInterval);
-    $("#st-interval-val").text(autoUpdateInterval);
 
-    // Sync World Agent settings
-    $("#st-s-startup-delay").val(settings.startupDelay || 2000).on("input", function() {
-        settings.startupDelay = parseInt(this.value, 10);
-        $("#st-s-delay-val").text(this.value);
-        save();
-    });
-    $("#st-s-delay-val").text(settings.startupDelay || 2000);
+    // Value sync only — the "input" handler is bound ONCE in buildSettingsPanel.
+    // Binding it here used to stack a duplicate handler on every updateSettingsUI
+    // call (chat switches, force-renders, opening the modal...).
+    $("#st-s-startup-delay").val(Store.settings.startupDelay || 2000);
+    $("#st-s-delay-val").text(Store.settings.startupDelay || 2000);
 
-    $("#st-s-world-on").prop("checked", settings.worldEnabled);
-    $("#st-s-world-inject").prop("checked", settings.injectWorldContext);
-    $("#st-s-world-useprofile").prop("checked", settings.useWorldProfile);
-    $("#st-world-profile-row").toggle(settings.useWorldProfile);
-    $("#st-s-world-freq").val(settings.worldTickFrequency);
-    $("#st-s-max-ticks").val(settings.maxWorldTicks);
-    $("#st-max-ticks-val").text(settings.maxWorldTicks);
+    $("#st-s-hud-tint").prop("checked", Store.settings.hudTimeTint !== false);
+
+    $("#st-s-smart-time").prop("checked", Store.settings.timeMode === "smart");
+    $("#st-message-mode-row").toggle(Store.settings.timeMode !== "smart");
+    $("#st-smart-time-sub-row").toggle(Store.settings.timeMode === "smart");
+    $("#st-s-msg-interval").val(Store.settings.messageModeInterval || 5);
+    $("#st-s-msg-interval-val").text(Store.settings.messageModeInterval || 5);
+    renderCustomSkipChips();
+
+    $("#st-s-interval").val(Store.settings.sceneTierMinutes);
+    $("#st-interval-val").text(Store.settings.sceneTierMinutes);
+
+    $("#st-s-world-on").prop("checked", Store.settings.worldEnabled);
+    $("#st-s-world-useprofile").prop("checked", Store.settings.useWorldProfile);
+    $("#st-world-profile-row").toggle(Store.settings.useWorldProfile);
+    $("#st-s-npc-tier-minutes").val(Store.settings.npcTierMinutes);
+    $("#st-s-weather-tier-minutes").val(Store.settings.weatherTierMinutes);
+    $("#st-s-faction-tier-minutes").val(Store.settings.factionTierMinutes);
+    $("#st-s-world-tier-minutes").val(Store.settings.worldTierMinutes);
+    $("#st-s-max-ticks").val(Store.settings.maxWorldTicks);
+    $("#st-max-ticks-val").text(Store.settings.maxWorldTicks);
+    $("#st-s-world-parallel").prop("checked", Store.settings.parallelWorldTiers);
+    $("#st-s-season-hemisphere").val(Store.settings.seasonHemisphere || "northern");
 
     // Sync Relationship Tracker settings
-    $("#st-s-rel-on").prop("checked", settings.relationsEnabled);
-    $("#st-s-rel-auto").prop("checked", settings.relationsAutoUpdate);
-    $("#st-rel-interval-row").toggle(settings.relationsAutoUpdate);
-    $("#st-s-rel-interval").val(settings.relAutoInterval || 5);
-    $("#st-rel-interval-val").text(settings.relAutoInterval || 5);
-    $("#st-s-rel-useprofile").prop("checked", settings.useRelProfile);
-    $("#st-rel-profile-row").toggle(settings.useRelProfile);
-    $("#st-s-rel-inject").prop("checked", settings.injectRelationsContext);
+    $("#st-s-rel-on").prop("checked", Store.settings.relationsEnabled);
+    $("#st-s-rel-auto").prop("checked", Store.settings.relationsAutoUpdate);
+    $("#st-rel-interval-row").toggle(Store.settings.relationsAutoUpdate);
+    $("#st-s-rel-interval").val(Store.settings.relAutoInterval || 5);
+    $("#st-rel-interval-val").text(Store.settings.relAutoInterval || 5);
+    $("#st-s-rel-useprofile").prop("checked", Store.settings.useRelProfile);
+    $("#st-rel-profile-row").toggle(Store.settings.useRelProfile);
 
     // Sync RGB Highlights
-    $("#st-s-rgb-r").val(settings.accentR || 216);
-    $("#st-rgb-r-val").text(settings.accentR || 216);
-    $("#st-s-rgb-g").val(settings.accentG || 160);
-    $("#st-rgb-g-val").text(settings.accentG || 160);
-    $("#st-s-rgb-b").val(settings.accentB || 64);
-    $("#st-rgb-b-val").text(settings.accentB || 64);
+    $("#st-s-rgb-r").val(Store.settings.accentR || 216);
+    $("#st-rgb-r-val").text(Store.settings.accentR || 216);
+    $("#st-s-rgb-g").val(Store.settings.accentG || 160);
+    $("#st-rgb-g-val").text(Store.settings.accentG || 160);
+    $("#st-s-rgb-b").val(Store.settings.accentB || 64);
+    $("#st-rgb-b-val").text(Store.settings.accentB || 64);
     applyCustomAccentColor();
 
     renderAutoInfo();
 }
 
 function renderAutoInfo() {
-    var hasData = isChatOpen() && storyData;
+    var hasData = Store.isChatOpen() && Store.storyData;
     if (!hasData) { $("#st-auto-info").text("No active chat"); return; }
 
     // Show the countdown relevant to whichever tab is currently active, since each
@@ -1842,985 +1273,62 @@ function renderAutoInfo() {
         return;
     }
 
-    // Default: Scene tracker countdown (Current / History tabs)
-    var autoUpdate = (storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
-    var autoUpdateInterval = (storyData.autoUpdateInterval !== undefined) ? storyData.autoUpdateInterval : settings.autoUpdateInterval;
+    // Default: Scene tracker countdown (Current / History tabs).
+    var autoUpdate = (Store.storyData.autoUpdate !== undefined) ? Store.storyData.autoUpdate : Store.settings.autoUpdate;
     if (!autoUpdate) { $("#st-auto-info").text("Auto-update: OFF"); return; }
-    var rem = autoUpdateInterval - (msgCounter % autoUpdateInterval);
-    $("#st-auto-info").text(`Auto-update in ${rem} msg(s)`);
+
+    if (Store.settings.timeMode === "message") {
+        // Message Mode: cadence is purely message-count driven (see _timeModeMsgCounter
+        // in the message handler) — sceneTierMinutes/RP-time never factors in here, so
+        // showing an RP-time countdown would be actively misleading in this mode.
+        var msgInterval = Store.settings.messageModeInterval || 5;
+        var timeModeMsgCounter = Store.storyData._timeModeMsgCounter || 0;
+        var msgRem = Math.max(0, msgInterval - timeModeMsgCounter);
+        $("#st-auto-info").text(`Scene update in ${msgRem} message(s)`);
+        return;
+    }
+
+    // Smart Time mode: Scene is a time-based Scheduler tier, not a message-count interval —
+    // this is also just the fallback cadence (skip-language detection can fire it sooner).
+    var sceneAccum = (Store.worldData && Store.worldData._schedulerAccumulated) ? (Store.worldData._schedulerAccumulated.scene || 0) : 0;
+    var sceneRemMin = Math.max(0, Store.settings.sceneTierMinutes - sceneAccum);
+    $("#st-auto-info").text(`Scene update in ~${sceneRemMin.toFixed(1)}min (RP time, or sooner if a skip is detected)`);
 }
 
 function renderWorldAutoInfo() {
-    if (!settings.enabled || !settings.worldEnabled) { $("#st-auto-info").text("World Agent: OFF"); return; }
-    if (settings.worldTickFrequency === "manual") { $("#st-auto-info").text("World Agent: Manual only"); return; }
+    if (!Store.settings.enabled || !Store.settings.worldEnabled) { $("#st-auto-info").text("World Agent: OFF"); return; }
+    if (!Store.worldData || !Store.worldData._schedulerAccumulated) { $("#st-auto-info").text("World Agent: waiting for first tick"); return; }
 
-    var thresholdHours = 1;
-    if (settings.worldTickFrequency === "3h") thresholdHours = 3;
-    else if (settings.worldTickFrequency === "1d") thresholdHours = 24;
-
-    if (!worldData || !worldData.lastTickTime || !worldData.lastTickDate || !storyData || !storyData.time || !storyData.date) {
-        $("#st-auto-info").text(`World tick every ${thresholdHours}h (RP time)`);
-        return;
-    }
-
-    var lastDateObj = parseRpDateTime(worldData.lastTickTime, worldData.lastTickDate);
-    var curDateObj = parseRpDateTime(storyData.time, storyData.date);
-    if (!lastDateObj || !curDateObj) { $("#st-auto-info").text(`World tick every ${thresholdHours}h (RP time)`); return; }
-
-    var elapsedHours = (curDateObj.getTime() - lastDateObj.getTime()) / (1000 * 60 * 60);
-    var remHours = thresholdHours - (elapsedHours % thresholdHours);
-    if (remHours <= 0 || elapsedHours >= thresholdHours) {
-        $("#st-auto-info").text("World tick: due now");
-    } else {
-        $("#st-auto-info").text(`World tick in ~${remHours.toFixed(1)}h (RP time)`);
-    }
+    var accum = Store.worldData._schedulerAccumulated;
+    var parts = [
+        "npc in ~" + Math.max(0, Store.settings.npcTierMinutes - (accum.npc || 0)).toFixed(0) + "min",
+        "weather in ~" + Math.max(0, Store.settings.weatherTierMinutes - (accum.weather || 0)).toFixed(0) + "min",
+        "faction in ~" + Math.max(0, Store.settings.factionTierMinutes - (accum.faction || 0)).toFixed(0) + "min",
+        "world in ~" + Math.max(0, Store.settings.worldTierMinutes - (accum.world || 0)).toFixed(0) + "min",
+    ];
+    $("#st-auto-info").text(parts.join(" | "));
 }
 
 function renderRelAutoInfo() {
-    if (!settings.enabled || !settings.relationsEnabled) { $("#st-auto-info").text("Relationship Tracker: OFF"); return; }
-    if (!settings.relationsAutoUpdate) { $("#st-auto-info").text("Relationship Tracker: Manual only"); return; }
+    if (!Store.settings.enabled || !Store.settings.relationsEnabled) { $("#st-auto-info").text("Relationship Tracker: OFF"); return; }
+    if (!Store.settings.relationsAutoUpdate) { $("#st-auto-info").text("Relationship Tracker: Manual only"); return; }
 
-    var relInterval = settings.relAutoInterval || 5;
-    var rem = relInterval - (relMsgCounter % relInterval);
-    $("#st-auto-info").text(`Relations update in ${rem} msg(s)`);
+    var relInterval = Store.settings.relAutoInterval || 5;
+    // Mirrors the actual trigger check in handleMsg (relMsgCounter > 0 && % === 0 → due).
+    // Plain `relInterval - (relMsgCounter % relInterval)` reports a full interval remaining
+    // instead of "due now" at the exact moment the counter lands on a multiple.
+    var isDue = Store.relMsgCounter > 0 && Store.relMsgCounter % relInterval === 0;
+    var rem = isDue ? 0 : (relInterval - (Store.relMsgCounter % relInterval));
+    $("#st-auto-info").text(isDue ? "Relations update due now" : `Relations update in ${rem} msg(s)`);
 }
-
-// --- Core LLM Scene Update Engine ---
-async function doLLMUpdate() {
-    if (!genRaw) throw new Error("Story Tracker: Raw LLM generation not available.");
-    if (!isChatOpen()) throw new Error("Story Tracker: No active chat is open.");
-
-    loadStoryData();
-    if (!storyData) throw new Error("Story Tracker: No story data available.");
-
-    // Build recent chat context using checkpoint system.
-    // First run: last 20 messages. Subsequent runs: only messages since last scene checkpoint.
-    // Each message is truncated to 500 chars to prevent long AI responses from bloating the prompt.
-    var liveChat = getLiveChat() || [];
-    var userName = (scriptModule && scriptModule.name1) ? scriptModule.name1 : "{{user}}";
-    var sceneLastCheckpoint = -1;
-    if (storyData._sceneCheckpointIdx != null) {
-        var scpIdx = storyData._sceneCheckpointIdx;
-        var scpAnchor = storyData._sceneCheckpointAnchor || "";
-        var scpMsg = liveChat[scpIdx];
-        var scpText = (scpMsg && scpMsg.mes) ? String(scpMsg.mes).slice(0, 40) : "";
-        if (scpAnchor && scpText === scpAnchor) {
-            sceneLastCheckpoint = scpIdx;
-        } else {
-            console.warn("[Story Tracker] Scene checkpoint anchor mismatch - falling back to last 20 messages.");
-        }
-    }
-    var sceneMsgs = sceneLastCheckpoint >= 0
-        ? liveChat.slice(sceneLastCheckpoint + 1)
-        : liveChat.slice(-20);
-    if (sceneMsgs.length < 3) sceneMsgs = liveChat.slice(-3);
-    var chatContext = "";
-    sceneMsgs.forEach(function(msg) {
-        var senderName = msg.is_user ? userName : (msg.name || "Character");
-        var text = (msg.mes || "").trim();
-        if (text) chatContext += senderName + ": " + text + "\n\n";
-    });
-    chatContext = chatContext.trim() || "No messages yet.";
-
-    var prevState = buildPrevStateText();
-    var prompt = UPDATE_PROMPT.replace("{{PREVIOUS_STATE}}", prevState) +
-                 "\n\n[Player character name: {{user}}. Always use this exact name in the JSON output, never write 'User'.]\n" +
-                 "Recent chat:\n" + chatContext;
-
-    var raw = await withConnectionProfile(async function() {
-        try {
-            return await genRaw({ prompt: prompt, quietToLoud: true });
-        } catch(e) {
-            console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e);
-            return await genRaw(prompt, null, false, true);
-        }
-    });
-
-    var data = cleanAndParseJSON(raw);
-    if (!data) throw new Error("Story Tracker: Failed to parse LLM scene analysis response.");
-
-    // Apply validated updates to storyData
-    if (data.time) storyData.time = sanitizeTimeStr(data.time, storyData.time);
-    if (data.date) storyData.date = sanitizeDateStr(data.date, storyData.date);
-    if (data.location) storyData.location = data.location;
-    if (data.city  && data.city  !== "Unknown") storyData.city    = data.city;
-    if (data.country && data.country !== "Unknown") storyData.country = data.country;
-    if (data.temperature) storyData.temperature = data.temperature;
-    if (data.weather)     storyData.weather     = data.weather;
-    if (Array.isArray(data.characters) && data.characters.length > 0) storyData.characters = data.characters;
-    if (data.recent_events) storyData.recent_events = data.recent_events;
-
-    // Fallback: if city or country is still unknown, run a targeted prompt to determine them
-    var cityMissing    = !storyData.city    || storyData.city    === "Unknown";
-    var countryMissing = !storyData.country || storyData.country === "Unknown";
-    if (cityMissing || countryMissing) {
-        try {
-            var ccPrompt = CITY_COUNTRY_PROMPT.replace("{{LOCATION}}", storyData.location || "Unknown");
-            var ccRaw = await withConnectionProfile(async function() {
-                try { return await genRaw({ prompt: ccPrompt, quietToLoud: true }); }
-                catch(e) { console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e); return await genRaw(ccPrompt, null, false, true); }
-            });
-            var ccData = cleanAndParseJSON(ccRaw);
-            if (ccData) {
-                if (ccData.city    && ccData.city    !== "Unknown") storyData.city    = ccData.city;
-                if (ccData.country && ccData.country !== "Unknown") storyData.country = ccData.country;
-            }
-        } catch(e) {
-            console.warn("[Story Tracker] City/country fallback failed:", e);
-        }
-    }
-
-    // Mark initialized and record a history entry (uses fields expected by renderModal)
-    storyData._initialized = true;
-    if (data.recent_events) {
-        if (!storyData.history) storyData.history = [];
-        storyData._historyCount = (storyData._historyCount || 0) + 1;
-        storyData.history.unshift({
-            msg:         storyData._historyCount,
-            time:        storyData.time,
-            loc:         storyData.location,
-            events:      data.recent_events,
-            temperature: storyData.temperature || "",
-            weather:     storyData.weather     || ""
-        });
-        // Cap history at 50 entries
-        if (storyData.history.length > 50) storyData.history = storyData.history.slice(0, 50);
-    }
-
-    // Save scene checkpoint
-    if (liveChat.length > 0) {
-        var lastSceneMsg = liveChat[liveChat.length - 1];
-        storyData._sceneCheckpointIdx = liveChat.length - 1;
-        storyData._sceneCheckpointAnchor = (lastSceneMsg && lastSceneMsg.mes)
-            ? String(lastSceneMsg.mes).slice(0, 40) : "";
-    }
-    saveStoryData();
-    syncToCharTracker();
-    if (settings.enabled && settings.injectToContext) injectContextToChat();
-}
-
-async function doManualUpdate() {
-    if (!settings.enabled) {
-        if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
-        return;
-    }
-    if (busy) return;
-    
-    // Failsafe: abort manual update if no active chat open
-    if (!isChatOpen()) {
-        console.warn("[Story Tracker] Aborted manual update: No active chat open.");
-        if (typeof toastr !== "undefined") {
-            toastr.warning("Story Tracker: Manual update aborted. No active chat is open.");
-        }
-        return;
-    }
-
-    busy = true;
-    var $b = $("#st-f-update").prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Analyzing...');
-    setHudStatus("Scene...");
-    if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing scene...", "", { timeOut: 0, extendedTimeOut: 0 });
-    try {
-        await doLLMUpdate();
-        
-        // Reset the message counter for auto-updates and save
-        msgCounter = 0;
-        saveStoryData();
-        
-        renderModal(); renderHUD();
-        clearHudStatus();
-        if(typeof toastr !== "undefined") { toastr.clear(); toastr.success("Story updated!"); }
-    } catch(e) { clearHudStatus(); if (typeof toastr !== "undefined") { toastr.clear(); toastr.error(e.message); } }
-    busy = false;
-    $b.prop("disabled", false).html('<i class="fa-solid fa-pen"></i> Update now');
-}
-
-// --- World Simulation Engine ---
-function padZero(n) { return n < 10 ? "0" + n : n; }
-
-// --- Extract NPCs recently interacted with from chat history ---
-function extractRecentNPCsFromChat(chatMessages, numMessages) {
-    var n = numMessages || 15;
-    var recent = (chatMessages || []).slice(-n);
-    var userName = (scriptModule && scriptModule.name1) ? scriptModule.name1.toLowerCase() : "user";
-    var seen = new Set();
-    var npcs = [];
-    recent.forEach(function(msg) {
-        if (!msg.is_user && msg.name) {
-            var lower = msg.name.toLowerCase();
-            // Exclude the user's own name in case it appears as a sender
-            if (lower !== userName && !seen.has(lower)) {
-                seen.add(lower);
-                npcs.push(msg.name);
-            }
-        }
-    });
-    return npcs;
-}
-
-// --- Helpers for event similarity and deduplication ---
-function getEventSimilarity(str1, str2) {
-    if (!str1 || !str2) return 0;
-    var tokenize = function(str) {
-        return str.toLowerCase().split(/[\s,.:;!?()"\'-]+/).filter(function(w) { return w.length > 1; });
-    };
-    var tokens1 = tokenize(str1);
-    var tokens2 = tokenize(str2);
-    var set1 = new Set(tokens1);
-    var set2 = new Set(tokens2);
-    if (set1.size === 0 || set2.size === 0) return 0;
-    var intersection = new Set([...set1].filter(function(x) { return set2.has(x); }));
-    var union = new Set([...set1, ...set2]);
-    return intersection.size / union.size;
-}
-
-// --- Cap the world summary so it cannot grow unbounded over long RPs ---
-// The model is instructed to "advance" the existing summary each tick, which in practice
-// means it tends to append rather than condense. Since this summary is re-injected into
-// every future tick's prompt, an uncapped summary grows linearly with tick count and can
-// eventually push the combined prompt over the API's context limit (surfacing as a
-// "Bad Request" from the LLM endpoint). We hard-cap it here, keeping the most recent
-// (tail) content since that's the most relevant to ongoing continuity, and trimming to a
-// clean sentence/word boundary so it doesn't begin mid-word.
-var WORLD_SUMMARY_MAX_CHARS = 1200;
-function capWorldSummary(text) {
-    if (!text || typeof text !== "string") return text;
-    if (text.length <= WORLD_SUMMARY_MAX_CHARS) return text;
-    var truncated = text.slice(text.length - WORLD_SUMMARY_MAX_CHARS);
-    var firstBreak = truncated.search(/[.!?]\s+/);
-    if (firstBreak > -1 && firstBreak < WORLD_SUMMARY_MAX_CHARS * 0.4) {
-        truncated = truncated.slice(firstBreak + 1).trim();
-    } else {
-        var firstSpace = truncated.indexOf(" ");
-        if (firstSpace > -1 && firstSpace < 40) {
-            truncated = truncated.slice(firstSpace + 1);
-        }
-    }
-    return "(earlier history truncated) " + truncated.trim();
-}
-
-function isDuplicateEvent(newEventText) {
-    if (!worldData || !worldData.worldEvents) return false;
-    for (var i = 0; i < worldData.worldEvents.length; i++) {
-        var sim = getEventSimilarity(newEventText, worldData.worldEvents[i].event);
-        if (sim > 0.7) {
-            return true;
-        }
-    }
-    return false;
-}
-
-async function runSingleWorldTick(timeStr, dateStr) {
-    if (!genRaw) throw new Error("Raw LLM generation not available.");
-
-    var tickDateObj = parseRpDateTime(timeStr, dateStr);
-
-    var sumBefore = capWorldSummary(worldData.worldSummary) || "No world summary yet.";
-    var revealsBefore = (worldData.pendingReveals || []).join("\n") || "None.";
-
-    // Track active NPC States for context injection
-    // Cap to 20 most recently active NPCs to avoid prompt overflow on NPC-heavy RPs.
-    var npcStatesText = "";
-    if (worldData.npcStates && worldData.npcStates.length > 0) {
-        var recentNPCNames = new Set(extractRecentNPCsFromChat(originalChat, 30));
-        var sortedNPCs = worldData.npcStates.slice().sort(function(a, b) {
-            var aRecent = recentNPCNames.has(a.name) ? 1 : 0;
-            var bRecent = recentNPCNames.has(b.name) ? 1 : 0;
-            return bRecent - aRecent;
-        });
-        var cappedNPCs = sortedNPCs.slice(0, 20);
-        npcStatesText = cappedNPCs.map(function(n) { return "- " + n.name + ": " + n.change; }).join("\n");
-        if (worldData.npcStates.length > 20) {
-            npcStatesText += "\n(" + (worldData.npcStates.length - 20) + " additional NPCs omitted - showing most recently active)";
-        }
-    } else {
-        npcStatesText = "No tracked NPCs yet.";
-    }
-
-    // Build chat context for world agent using checkpoint system.
-    // First tick: last 15 messages. Subsequent ticks: only messages since last world checkpoint.
-    // Each message is truncated to 500 chars to prevent long responses from bloating the prompt.
-    var originalChat = (scriptModule && scriptModule.chat) ? scriptModule.chat : [];
-    var worldLastCheckpoint = -1;
-    if (worldData._worldCheckpointIdx != null) {
-        var wcpIdx = worldData._worldCheckpointIdx;
-        var wcpAnchor = worldData._worldCheckpointAnchor || "";
-        var wcpMsg = originalChat[wcpIdx];
-        var wcpText = (wcpMsg && wcpMsg.mes) ? String(wcpMsg.mes).slice(0, 40) : "";
-        if (wcpAnchor && wcpText === wcpAnchor) {
-            worldLastCheckpoint = wcpIdx;
-        } else {
-            console.warn("[Story Tracker] World checkpoint anchor mismatch - falling back to last 15 messages.");
-        }
-    }
-    var worldMsgs = worldLastCheckpoint >= 0
-        ? originalChat.slice(worldLastCheckpoint + 1)
-        : originalChat.slice(-15);
-    if (worldMsgs.length < 3) worldMsgs = originalChat.slice(-3);
-    var chatHistoryText = "";
-    worldMsgs.forEach(function(msg) {
-        var senderName = msg.is_user ? (scriptModule && scriptModule.name1 ? scriptModule.name1 : "{{user}}") : (msg.name || "Char");
-        var msgText = (msg.mes || "").trim();
-        chatHistoryText += senderName + ": " + msgText + "\n";
-    });
-    if (!chatHistoryText.trim()) chatHistoryText = "No recent messages.";
-
-    // Retrieve past history timeline as structured context to pass to the model, filtered to <= current tick
-    // Capped at 12 most recent entries to avoid prompt overflow on long RPs.
-    var historyTimelineText = "";
-    if (storyData && storyData.history && storyData.history.length > 0) {
-        var reversedHist = [...storyData.history].reverse();
-        var addedCount = 0;
-        var HISTORY_INJECT_CAP = 12;
-        reversedHist.forEach(function(h) {
-            if (addedCount >= HISTORY_INJECT_CAP) return;
-            var entryDateObj = parseRpDateTime(h.time, h.date);
-            if (entryDateObj && tickDateObj && entryDateObj.getTime() <= tickDateObj.getTime()) {
-                historyTimelineText += `- Time: ${h.time} | Date: ${h.date} (Event: ${h.events})\n`;
-                addedCount++;
-            }
-        });
-        if (addedCount === 0) {
-            historyTimelineText = "No past history recorded before this tick.";
-        }
-    } else {
-        historyTimelineText = "No past history recorded yet.";
-    }
-
-    // Ensure non-translated values are fed to prompt context
-    var currentLoc = (storyData && storyData.location) ? storyData.location : "Unknown";
-    var recentEv = (storyData && storyData.recent_events) ? storyData.recent_events : "None.";
-
-    // Extract NPCs that were recently interacted with in chat so the world agent can prioritize them
-    var recentNPCs = extractRecentNPCsFromChat(originalChat, 15);
-    var interactedNPCsText = recentNPCs.length > 0
-        ? recentNPCs.map(function(n) { return "- " + n; }).join("\n")
-        : "None identified — generate general world updates.";
-
-    var prompt = WORLD_PROMPT
-        .replace("{{CURRENT_TIME}}", timeStr)
-        .replace("{{CURRENT_DATE}}", dateStr)
-        .replace("{{CURRENT_LOCATION}}", currentLoc)
-        .replace("{{RECENT_EVENTS}}", recentEv)
-        .replace("{{INTERACTED_NPCS}}", interactedNPCsText)
-        .replace("{{PAST_HISTORY_TIMELINE}}", historyTimelineText)
-        .replace("{{RECENT_CHAT_HISTORY}}", chatHistoryText)
-        .replace("{{WORLD_SUMMARY}}", sumBefore)
-        .replace("{{NPC_STATES}}", npcStatesText)
-        .replace("{{PENDING_REVEALS}}", revealsBefore);
-
-    console.log("[Story Tracker] Executing World Agent simulation step...");
-    var raw = await withWorldConnectionProfile(async function () {
-        try {
-            return await genRaw({
-                prompt: prompt,
-                quietToLoud: true
-            });
-        } catch (e) {
-            console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e);
-            return await genRaw(prompt, null, false, true);
-        }
-    });
-
-    var data = cleanAndParseJSON(raw);
-
-    if (!data || !data.summary) {
-        throw new Error("Invalid World Agent response object.");
-    }
-
-    // Save outputs and update state baseline parameters
-    worldData.worldSummary = capWorldSummary(data.summary);
-    worldData.lastTickTime = timeStr;
-    worldData.lastTickDate = dateStr;
-    worldData._initialized = true; // Mark initialized to update the UI on modal render
-
-    if (Array.isArray(data.events)) {
-        data.events.forEach(function(e) {
-            if (e && e.event) {
-                if (isDuplicateEvent(e.event)) {
-                    console.log("[Story Tracker] Duplicate world event skipped:", e.event);
-                    return;
-                }
-                var eventTime = sanitizeTimeStr(e.time, timeStr);
-                var eventDate = sanitizeDateStr(e.date, dateStr);
-
-                // Clamp future events to the current tick time
-                var eventDateObj = parseRpDateTime(eventTime, eventDate);
-                if (eventDateObj && tickDateObj && eventDateObj.getTime() > tickDateObj.getTime()) {
-                    eventTime = timeStr;
-                    eventDate = dateStr;
-                }
-
-                worldData.worldEvents.unshift({
-                    time: eventTime,
-                    date: eventDate,
-                    event: e.event,
-                    importance: parseInt(e.importance, 10) || 5
-                });
-            }
-        });
-    }
-
-    if (Array.isArray(data.npc_updates)) {
-        data.npc_updates.forEach(function(npc) {
-            if (npc && npc.name && npc.change) {
-                var existing = worldData.npcStates.find(n => n.name.toLowerCase() === npc.name.toLowerCase());
-                if (existing) {
-                    existing.change = npc.change;
-                } else {
-                    worldData.npcStates.push({ name: npc.name, change: npc.change });
-                }
-            }
-        });
-    }
-
-    if (Array.isArray(data.pending_reveals)) {
-        data.pending_reveals.forEach(function(rev) {
-            if (rev && !worldData.pendingReveals.includes(rev)) {
-                worldData.pendingReveals.push(rev);
-            }
-        });
-        // Cap pendingReveals — keep only the 15 most recent
-        if (worldData.pendingReveals.length > 15) {
-            worldData.pendingReveals = worldData.pendingReveals.slice(-15);
-        }
-    }
-
-    // Save world checkpoint
-    if (originalChat.length > 0) {
-        var lastWorldMsg = originalChat[originalChat.length - 1];
-        worldData._worldCheckpointIdx = originalChat.length - 1;
-        worldData._worldCheckpointAnchor = (lastWorldMsg && lastWorldMsg.mes)
-            ? String(lastWorldMsg.mes).slice(0, 40) : "";
-    }
-    trimWorldEvents();
-    saveWorldData();
-}
-
-// Batched world tick - covers MULTIPLE intervals in a single LLM call instead of one call per tick.
-// Used by checkAndRunWorldTicks when a catchup gap spans more than 1 interval, to save cost/time
-// while still grounding events in the same scene/chat context so they feel organic.
-async function runBatchWorldTick(intervalList, startTimeStr, startDateStr, endTimeStr, endDateStr) {
-    if (!genRaw) throw new Error("Raw LLM generation not available.");
-
-    var tickDateObj = parseRpDateTime(endTimeStr, endDateStr);
-
-    var sumBefore = capWorldSummary(worldData.worldSummary) || "No world summary yet.";
-    var revealsBefore = (worldData.pendingReveals || []).join("\n") || "None.";
-
-    var npcStatesText = "";
-    if (worldData.npcStates && worldData.npcStates.length > 0) {
-        var recentNPCNames = new Set(extractRecentNPCsFromChat((scriptModule && scriptModule.chat) ? scriptModule.chat : [], 30));
-        var sortedNPCs = worldData.npcStates.slice().sort(function(a, b) {
-            var aRecent = recentNPCNames.has(a.name) ? 1 : 0;
-            var bRecent = recentNPCNames.has(b.name) ? 1 : 0;
-            return bRecent - aRecent;
-        });
-        var cappedNPCs = sortedNPCs.slice(0, 20);
-        npcStatesText = cappedNPCs.map(function(n) { return "- " + n.name + ": " + n.change; }).join("\n");
-        if (worldData.npcStates.length > 20) {
-            npcStatesText += "\n(" + (worldData.npcStates.length - 20) + " additional NPCs omitted - showing most recently active)";
-        }
-    } else {
-        npcStatesText = "No tracked NPCs yet.";
-    }
-
-    var originalChat = (scriptModule && scriptModule.chat) ? scriptModule.chat : [];
-    var worldLastCheckpoint = -1;
-    if (worldData._worldCheckpointIdx != null) {
-        var wcpIdx = worldData._worldCheckpointIdx;
-        var wcpAnchor = worldData._worldCheckpointAnchor || "";
-        var wcpMsg = originalChat[wcpIdx];
-        var wcpText = (wcpMsg && wcpMsg.mes) ? String(wcpMsg.mes).slice(0, 40) : "";
-        if (wcpAnchor && wcpText === wcpAnchor) {
-            worldLastCheckpoint = wcpIdx;
-        } else {
-            console.warn("[Story Tracker] World checkpoint anchor mismatch - falling back to last 15 messages.");
-        }
-    }
-    var worldMsgs = worldLastCheckpoint >= 0
-        ? originalChat.slice(worldLastCheckpoint + 1)
-        : originalChat.slice(-15);
-    if (worldMsgs.length < 3) worldMsgs = originalChat.slice(-3);
-    var chatHistoryText = "";
-    worldMsgs.forEach(function(msg) {
-        var senderName = msg.is_user ? (scriptModule && scriptModule.name1 ? scriptModule.name1 : "{{user}}") : (msg.name || "Char");
-        var msgText = (msg.mes || "").trim();
-        chatHistoryText += senderName + ": " + msgText + "\n";
-    });
-    if (!chatHistoryText.trim()) chatHistoryText = "No recent messages.";
-
-    var historyTimelineText = "";
-    if (storyData && storyData.history && storyData.history.length > 0) {
-        var reversedHist = [...storyData.history].reverse();
-        var addedCount = 0;
-        var HISTORY_INJECT_CAP = 12;
-        reversedHist.forEach(function(h) {
-            if (addedCount >= HISTORY_INJECT_CAP) return;
-            var entryDateObj = parseRpDateTime(h.time, h.date);
-            if (entryDateObj && tickDateObj && entryDateObj.getTime() <= tickDateObj.getTime()) {
-                historyTimelineText += `- Time: ${h.time} | Date: ${h.date} (Event: ${h.events})\n`;
-                addedCount++;
-            }
-        });
-        if (addedCount === 0) {
-            historyTimelineText = "No past history recorded before this tick.";
-        }
-    } else {
-        historyTimelineText = "No past history recorded yet.";
-    }
-
-    var currentLoc = (storyData && storyData.location) ? storyData.location : "Unknown";
-    var recentEv = (storyData && storyData.recent_events) ? storyData.recent_events : "None.";
-
-    var recentNPCs = extractRecentNPCsFromChat(originalChat, 15);
-    var interactedNPCsText = recentNPCs.length > 0
-        ? recentNPCs.map(function(n) { return "- " + n; }).join("\n")
-        : "None identified - generate general world updates.";
-
-    var intervalListText = intervalList.map(function(iv) { return iv.time + " " + iv.date; }).join(", ");
-
-    var prompt = WORLD_BATCH_PROMPT
-        .replace("{{START_TIME}}", startTimeStr)
-        .replace("{{START_DATE}}", startDateStr)
-        .replace("{{END_TIME}}", endTimeStr)
-        .replace("{{END_DATE}}", endDateStr)
-        .replace("{{INTERVAL_LIST}}", intervalListText)
-        .replace("{{CURRENT_LOCATION}}", currentLoc)
-        .replace("{{RECENT_EVENTS}}", recentEv)
-        .replace("{{INTERACTED_NPCS}}", interactedNPCsText)
-        .replace("{{PAST_HISTORY_TIMELINE}}", historyTimelineText)
-        .replace("{{RECENT_CHAT_HISTORY}}", chatHistoryText)
-        .replace("{{WORLD_SUMMARY}}", sumBefore)
-        .replace("{{NPC_STATES}}", npcStatesText)
-        .replace("{{PENDING_REVEALS}}", revealsBefore);
-
-    console.log("[Story Tracker] Executing batched World Agent simulation (" + intervalList.length + " intervals)...");
-    var raw = await withWorldConnectionProfile(async function () {
-        try {
-            return await genRaw({ prompt: prompt, quietToLoud: true });
-        } catch (e) {
-            console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e);
-            return await genRaw(prompt, null, false, true);
-        }
-    });
-
-    var data = cleanAndParseJSON(raw);
-    if (!data || !data.summary) {
-        throw new Error("Invalid batched World Agent response object.");
-    }
-
-    worldData.worldSummary = capWorldSummary(data.summary);
-    worldData.lastTickTime = endTimeStr;
-    worldData.lastTickDate = endDateStr;
-    worldData._initialized = true;
-
-    if (Array.isArray(data.events)) {
-        data.events.forEach(function(e) {
-            if (e && e.event) {
-                if (isDuplicateEvent(e.event)) {
-                    console.log("[Story Tracker] Duplicate world event skipped:", e.event);
-                    return;
-                }
-                var eventTime = sanitizeTimeStr(e.time, endTimeStr);
-                var eventDate = sanitizeDateStr(e.date, endDateStr);
-
-                // Clamp events that fall outside the gap being covered (before start or after end)
-                var eventDateObj = parseRpDateTime(eventTime, eventDate);
-                if (eventDateObj && tickDateObj && eventDateObj.getTime() > tickDateObj.getTime()) {
-                    eventTime = endTimeStr;
-                    eventDate = endDateStr;
-                }
-
-                worldData.worldEvents.unshift({
-                    time: eventTime,
-                    date: eventDate,
-                    event: e.event,
-                    importance: parseInt(e.importance, 10) || 5
-                });
-            }
-        });
-    }
-
-    if (Array.isArray(data.npc_updates)) {
-        data.npc_updates.forEach(function(npc) {
-            if (npc && npc.name && npc.change) {
-                var existing = worldData.npcStates.find(n => n.name.toLowerCase() === npc.name.toLowerCase());
-                if (existing) {
-                    existing.change = npc.change;
-                } else {
-                    worldData.npcStates.push({ name: npc.name, change: npc.change });
-                }
-            }
-        });
-    }
-
-    if (Array.isArray(data.pending_reveals)) {
-        data.pending_reveals.forEach(function(rev) {
-            if (rev && !worldData.pendingReveals.includes(rev)) {
-                worldData.pendingReveals.push(rev);
-            }
-        });
-        if (worldData.pendingReveals.length > 15) {
-            worldData.pendingReveals = worldData.pendingReveals.slice(-15);
-        }
-    }
-
-    if (originalChat.length > 0) {
-        var lastWorldMsg = originalChat[originalChat.length - 1];
-        worldData._worldCheckpointIdx = originalChat.length - 1;
-        worldData._worldCheckpointAnchor = (lastWorldMsg && lastWorldMsg.mes)
-            ? String(lastWorldMsg.mes).slice(0, 40) : "";
-    }
-    trimWorldEvents();
-    saveWorldData();
-}
-
-function trimWorldEvents() {
-    if (!worldData || !worldData.worldEvents || worldData.worldEvents.length <= 15) return;
-
-    // Priority trim: remove lowest importance events first, then oldest
-    while (worldData.worldEvents.length > 15) {
-        var removed = false;
-
-        // Pass 1 — remove oldest minor events (importance <= 3)
-        for (var i = worldData.worldEvents.length - 1; i >= 0; i--) {
-            if (worldData.worldEvents[i].importance <= 3) {
-                worldData.worldEvents.splice(i, 1);
-                removed = true;
-                break;
-            }
-        }
-        if (removed) continue;
-
-        // Pass 2 — remove oldest moderate events (importance < 7)
-        for (var i = worldData.worldEvents.length - 1; i >= 0; i--) {
-            if (worldData.worldEvents[i].importance < 7) {
-                worldData.worldEvents.splice(i, 1);
-                removed = true;
-                break;
-            }
-        }
-        if (removed) continue;
-
-        // Hard fallback — remove oldest regardless of importance
-        worldData.worldEvents.pop();
-    }
-}
-
-async function runManualWorldTick() {
-    if (!settings.enabled) {
-        if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
-        return;
-    }
-    if (worldBusy) return;
-    if (!settings.worldEnabled) {
-        if (typeof toastr !== "undefined") toastr.warning("World Agent is disabled. Enable it in settings first.");
-        return;
-    }
-    if (!isChatOpen()) {
-        if (typeof toastr !== "undefined") toastr.warning("No active chat is open.");
-        return;
-    }
-
-    loadWorldData();
-
-    var tickTimeStr = "Manual";
-    var tickDateStr = "Tick";
-    if (storyData && storyData._initialized) {
-        tickTimeStr = storyData.time;
-        tickDateStr = storyData.date;
-    }
-
-    worldBusy = true;
-    var $btn = $("#st-world-btn-tick").prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Ticking...');
-    setHudStatus("World...");
-    if (typeof toastr !== "undefined") toastr.info("Story Tracker: Running world tick...", "", { timeOut: 0, extendedTimeOut: 0 });
-    try {
-        await runSingleWorldTick(tickTimeStr, tickDateStr);
-        renderModal(); renderHUD();
-        clearHudStatus();
-        if (typeof toastr !== "undefined") { toastr.clear(); toastr.success("World tick generated!"); }
-
-    } catch(e) {
-        clearHudStatus();
-        if (typeof toastr !== "undefined") { toastr.clear(); toastr.error("World tick failed: " + e.message); }
-    } finally {
-        worldBusy = false;
-        $btn.prop("disabled", false).html('<i class="fa-solid fa-play"></i> Run World Tick');
-    }
-}
-
-// --- Relationship Tracker Engine ---
-
-async function doRelationshipUpdate() {
-    if (!genRaw) throw new Error("Raw LLM generation not available.");
-    if (!isChatOpen()) throw new Error("No active chat is open.");
-    if (!storyData) throw new Error("No story data available.");
-
-    loadRelationshipData();
-    if (!relationshipData) return;
-
-    // Build character list from current scene
-    var sceneChars = (storyData.characters || []).map(function(c) { return c.name; }).join(", ") || "None identified.";
-
-    // Build existing relationships summary for the prompt
-    var existingRels = "";
-    if (relationshipData.edges && relationshipData.edges.length > 0) {
-        existingRels = relationshipData.edges.map(function(e) {
-            var sign = e.strength >= 0 ? "+" : "";
-            return "- " + e.from + " \u2194 " + e.to + ": " + e.type +
-                   " (strength: " + sign + (e.strength || 0).toFixed(1) + ") \u2014 " + e.summary;
-        }).join("\n");
-    } else {
-        existingRels = "None yet — identify all meaningful relationships from scratch.";
-    }
-
-    // Build recent chat context using checkpoint system
-    // On first run (no checkpoint) grab the last 20 messages.
-    // On subsequent runs grab only messages since the last checkpoint message index.
-    var liveChat = getLiveChat() || [];
-    var userName = (scriptModule && scriptModule.name1) ? scriptModule.name1 : "{{user}}";
-    // Validate checkpoint anchor to detect index drift from deletions/swipes
-    var lastCheckpoint = -1;
-    if (relationshipData && relationshipData._checkpointMsgIdx != null) {
-        var cpIdx = relationshipData._checkpointMsgIdx;
-        var cpAnchor = relationshipData._checkpointAnchor || "";
-        var cpMsg = liveChat[cpIdx];
-        var cpMsgText = (cpMsg && cpMsg.mes) ? String(cpMsg.mes).slice(0, 40) : "";
-        // Trust the checkpoint only if the message at that index still matches the anchor
-        if (cpAnchor && cpMsgText === cpAnchor) {
-            lastCheckpoint = cpIdx;
-        } else {
-            console.warn("[Story Tracker] Relationship checkpoint anchor mismatch - falling back to last 20 messages.");
-        }
-    }
-    var relevantMsgs = lastCheckpoint >= 0
-        ? liveChat.slice(lastCheckpoint + 1)
-        : liveChat.slice(-20);
-    // Always include at least 3 messages for context even if interval fires early
-    if (relevantMsgs.length < 3) relevantMsgs = liveChat.slice(-3);
-    var chatText = "";
-    relevantMsgs.forEach(function(msg) {
-        var sender = msg.is_user ? userName : (msg.name || "Character");
-        var text = (msg.mes || "").trim();
-        if (text) chatText += sender + ": " + text + "\n\n";
-    });
-    chatText = chatText.trim() || "No recent messages.";
-
-    var prompt = RELATIONSHIP_PROMPT
-        .replace("{{SCENE_CHARACTERS}}", sceneChars)
-        .replace("{{EXISTING_RELATIONSHIPS}}", existingRels)
-        .replace("{{RECENT_CHAT}}", chatText);
-
-    console.log("[Story Tracker] Running relationship analysis...");
-    var raw = await withRelConnectionProfile(async function() {
-        try { return await genRaw({ prompt: prompt, quietToLoud: true }); }
-        catch(e) { console.warn("[Story Tracker] genRaw object-form call failed, falling back to legacy call signature:", e); return await genRaw(prompt, null, false, true); }
-    });
-
-    var data = cleanAndParseJSON(raw);
-    if (!data || !Array.isArray(data.relationships)) {
-        console.warn("[Story Tracker] Relationship response invalid or empty.");
-        return;
-    }
-
-    // Merge relationships into existing data
-    data.relationships.forEach(function(rel) {
-        if (!rel.from || !rel.to || rel.from === rel.to) return;
-
-        // Resolve each name against existing nodes first, so a differently-phrased
-        // mention of a known character ("Lt. Ara Vorn") reuses that character's
-        // existing node/edges instead of spawning a duplicate.
-        rel.from = resolveCanonicalName(rel.from);
-        rel.to = resolveCanonicalName(rel.to);
-        if (rel.from === rel.to) return; // collapsed onto the same character after resolution
-
-        var strength = parseFloat(rel.strength);
-        if (isNaN(strength)) strength = 0;
-        strength = Math.max(-1, Math.min(1, strength));
-
-        // Normalize edge key alphabetically to deduplicate A↔B vs B↔A
-        var keyA = rel.from < rel.to ? rel.from : rel.to;
-        var keyB = rel.from < rel.to ? rel.to : rel.from;
-
-        // Ensure both character nodes exist (already-resolved names match
-        // existing nodes exactly, so this only adds genuinely new characters)
-        [rel.from, rel.to].forEach(function(name) {
-            if (!relationshipData.nodes.find(function(n) { return n.name === name; })) {
-                relationshipData.nodes.push({ id: name, name: name });
-            }
-        });
-
-        var existing = relationshipData.edges.find(function(e) {
-            return e.from === keyA && e.to === keyB;
-        });
-
-        if (existing) {
-            // Record history entry before overwriting
-            if (!existing.history) existing.history = [];
-            if (existing.summary) {
-                existing.history.unshift({
-                    msg: storyData._historyCount || 0,
-                    summary: rel.change || "Updated",
-                    strength: strength
-                });
-                if (existing.history.length > 20) existing.history = existing.history.slice(0, 20);
-            }
-            existing.type = rel.type || existing.type;
-            existing.strength = strength;
-            existing.summary = rel.summary || existing.summary;
-            existing.change = rel.change || "Stable";
-        } else {
-            relationshipData.edges.push({
-                from: keyA,
-                to: keyB,
-                type: rel.type || "neutral",
-                strength: strength,
-                summary: rel.summary || "",
-                change: rel.change || "",
-                history: []
-            });
-        }
-    });
-
-    // Ensure all current scene characters have a node entry
-    if (storyData.characters) {
-        storyData.characters.forEach(function(c) {
-            if (!c || !c.name) return;
-            var canonical = resolveCanonicalName(c.name);
-            if (!relationshipData.nodes.find(function(n) { return n.name === canonical; })) {
-                relationshipData.nodes.push({ id: canonical, name: canonical });
-            }
-        });
-    }
-
-    // Save checkpoint: record the index and a content anchor of the last processed message.
-    // The anchor (first 40 chars of the last message) lets us detect index drift
-    // caused by message deletions or swipes, so we fall back to last-20 when stale.
-    if (liveChat.length > 0) {
-        var lastMsg = liveChat[liveChat.length - 1];
-        relationshipData._checkpointMsgIdx = liveChat.length - 1;
-        relationshipData._checkpointAnchor = (lastMsg && lastMsg.mes)
-            ? String(lastMsg.mes).slice(0, 40)
-            : "";
-        relMsgCounter = 0; // reset the per-interval counter
-        if (storyData) storyData._relMsgCount = 0;
-    }
-    relationshipData._initialized = true;
-    trimRelationshipData();
-    applyRelationshipDecay();
-    saveRelationshipData();
-    console.log("[Story Tracker] Relationship data saved. Edges:", relationshipData.edges.length);
-}
-
-// Trim relationship edges when they exceed the cap (100 max).
-// Removes weakest edges first (by absolute strength), then oldest.
-function trimRelationshipData() {
-    if (!relationshipData || !relationshipData.edges) return;
-    var MAX_EDGES = 100;
-    if (relationshipData.edges.length <= MAX_EDGES) return;
-
-    // Sort ascending by absolute strength so weakest get removed first
-    relationshipData.edges.sort(function(a, b) {
-        return Math.abs(a.strength || 0) - Math.abs(b.strength || 0);
-    });
-    relationshipData.edges = relationshipData.edges.slice(relationshipData.edges.length - MAX_EDGES);
-
-    // Rebuild nodes to only include those still referenced by remaining edges
-    var referencedNames = new Set();
-    relationshipData.edges.forEach(function(e) {
-        referencedNames.add(e.from);
-        referencedNames.add(e.to);
-    });
-    relationshipData.nodes = (relationshipData.nodes || []).filter(function(n) {
-        return referencedNames.has(n.name);
-    });
-    console.log("[Story Tracker] Relationship data trimmed to " + relationshipData.edges.length + " edges.");
-}
-
-// Nudge edges toward neutral when neither character has appeared in recent chat.
-// Keeps the graph reflecting current story focus rather than freezing old bonds.
-function applyRelationshipDecay() {
-    if (!relationshipData || !relationshipData.edges || !relationshipData.edges.length) return;
-
-    var liveChat = getLiveChat() || [];
-    var recentMsgs = liveChat.slice(-25);
-    var recentNames = new Set();
-    var userName = (scriptModule && scriptModule.name1) ? scriptModule.name1 : "User";
-    recentMsgs.forEach(function(msg) {
-        var name = msg.is_user ? userName : (msg.name || "");
-        if (name) recentNames.add(name);
-    });
-
-    var DECAY_RATE = 0.04;   // strength nudged this much per analysis pass
-    var FLOOR = 0.05;         // don't decay below this absolute value (avoids zero-crossing oscillation)
-
-    relationshipData.edges.forEach(function(edge) {
-        // Only decay edges where both characters are absent from recent messages
-        if (recentNames.has(edge.from) || recentNames.has(edge.to)) return;
-
-        var s = edge.strength || 0;
-        if (Math.abs(s) <= FLOOR) return;
-
-        var direction = s > 0 ? -1 : 1;
-        var newStrength = s + direction * DECAY_RATE;
-
-        // Clamp: don't let decay push past zero
-        if (s > 0 && newStrength < FLOOR) newStrength = FLOOR;
-        if (s < 0 && newStrength > -FLOOR) newStrength = -FLOOR;
-
-        edge.strength = parseFloat(newStrength.toFixed(2));
-    });
-}
-
-async function runManualRelationshipAnalysis() {
-    if (!settings.enabled) {
-        if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
-        return;
-    }
-    if (relsBusy) return;
-    if (anyBusy() && !relsBusy) {
-        if (typeof toastr !== "undefined") toastr.warning("Another agent is running. Please wait.");
-        return;
-    }
-    if (!settings.relationsEnabled) {
-        if (typeof toastr !== "undefined") toastr.warning("Relationship Tracker is disabled. Enable it in settings first.");
-        return;
-    }
-    if (!isChatOpen()) {
-        if (typeof toastr !== "undefined") toastr.warning("Story Tracker: No active chat is open.");
-        return;
-    }
-
-    loadRelationshipData();
-    relsBusy = true;
-    var $btn = $("#st-rel-btn-analyze").prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Analyzing...');
-    setHudStatus("Relations...");
-    if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing relationships...", "", { timeOut: 0, extendedTimeOut: 0 });
-    try {
-        await doRelationshipUpdate();
-        renderRelationshipGraph();
-        renderHUD();
-        clearHudStatus();
-        if (typeof toastr !== "undefined") { toastr.clear(); toastr.success("Relationships analyzed!"); }
-    } catch(e) {
-        clearHudStatus();
-        if (typeof toastr !== "undefined") { toastr.clear(); toastr.error("Relationship analysis failed: " + e.message); }
-        console.error("[Story Tracker] Manual relationship analysis error:", e);
-    } finally {
-        relsBusy = false;
-        $btn.prop("disabled", false).html('<i class="fa-solid fa-magnifying-glass-chart"></i> Analyze');
-    }
-}
-
-// Compute force-directed node positions for the relationship graph.
 function renderRelationshipGraph() {
     var $container = $("#st-rel-graph-container");
     if (!$container.length) return;
 
     try {
-        if (!isChatOpen() || !relationshipData || !relationshipData._initialized ||
-            !relationshipData.edges || relationshipData.edges.length === 0) {
+        if (!Store.isChatOpen() || !Store.relationshipData || !Store.relationshipData._initialized ||
+            !Store.relationshipData.edges || Store.relationshipData.edges.length === 0) {
+            Store.setRelEditingNode(null);
             $container.html(
                 '<div class="st-no-data" style="padding:30px 0;">' +
                 '<i class="fa-solid fa-share-nodes"></i>' +
@@ -2831,8 +1339,8 @@ function renderRelationshipGraph() {
             return;
         }
 
-        var edges = relationshipData.edges || [];
-        var nodes = relationshipData.nodes || [];
+        var edges = Store.relationshipData.edges || [];
+        var nodes = Store.relationshipData.nodes || [];
         var typeColors = {
             romance:    "#ff69b4",
             friendship: "#4a9eff",
@@ -2843,6 +1351,7 @@ function renderRelationshipGraph() {
             mentor:     "#80deea",
             neutral:    "#888888"
         };
+        var typeKeys = (Store.RelationshipAgent && Store.RelationshipAgent.VALID_TYPES) || Object.keys(typeColors);
 
         var nodeMap = {};
         nodes.forEach(function(n) { if (n && n.name) nodeMap[n.name] = n; else if (n && n.id) nodeMap[n.id] = n; });
@@ -2851,21 +1360,25 @@ function renderRelationshipGraph() {
             if (e.from && !nodeMap[e.from]) { var n1 = { id: e.from, name: e.from }; nodes.push(n1); nodeMap[e.from] = n1; }
             if (e.to && !nodeMap[e.to]) { var n2 = { id: e.to, name: e.to }; nodes.push(n2); nodeMap[e.to] = n2; }
         });
+        // If relEditingNode was deleted or renamed out from under us, close the panel.
+        if (Store.relEditingNode && !nodeMap[Store.relEditingNode]) Store.setRelEditingNode(null);
 
         var width = $container.width();
         if (!width || width < 100) width = 400; // Safeguard if tab is hidden during render
-        var height = 260; 
+        var height = 300;
         var cx = width / 2;
         var cy = height / 2;
 
         var simNodes = nodes.map(function(n, idx) {
+            var hasSavedPos = typeof n.x === "number" && typeof n.y === "number";
             return {
                 idx: idx,
                 id: n.id || n.name,
                 name: n.name || n.id || "?",
-                x: cx + (Math.random() - 0.5) * 80,
-                y: cy + (Math.random() - 0.5) * 80,
-                vx: 0, vy: 0
+                x: hasSavedPos ? n.x : cx + (Math.random() - 0.5) * 80,
+                y: hasSavedPos ? n.y : cy + (Math.random() - 0.5) * 80,
+                vx: 0, vy: 0,
+                fixed: hasSavedPos
             };
         });
 
@@ -2878,61 +1391,92 @@ function renderRelationshipGraph() {
             };
         }).filter(function(e) { return e && e.source && e.target; });
 
-        var iterations = 300;
-        for (var i = 0; i < iterations; i++) {
-            for (var a = 0; a < simNodes.length; a++) {
-                for (var b = a + 1; b < simNodes.length; b++) {
-                    var dx = simNodes[a].x - simNodes[b].x;
-                    var dy = simNodes[a].y - simNodes[b].y;
-                    var dist2 = dx * dx + dy * dy;
-                    if (dist2 === 0) { dx = Math.random(); dy = Math.random(); dist2 = dx*dx + dy*dy; }
-                    var dist = Math.sqrt(dist2);
-                    var force = 3000 / (dist2 + 100); 
-                    var fx = (dx / dist) * force;
-                    var fy = (dy / dist) * force;
-                    simNodes[a].vx += fx; simNodes[a].vy += fy;
-                    simNodes[b].vx -= fx; simNodes[b].vy -= fy;
+        // Only simulate if there's at least one un-anchored (new) node — once
+        // everything has a saved position, skip the sim entirely (instant re-render,
+        // and nothing drifts out from under the user between renders).
+        var needsSim = simNodes.some(function(sn) { return !sn.fixed; });
+        if (needsSim) {
+            var iterations = 300;
+            for (var i = 0; i < iterations; i++) {
+                for (var a = 0; a < simNodes.length; a++) {
+                    for (var b = a + 1; b < simNodes.length; b++) {
+                        var dx = simNodes[a].x - simNodes[b].x;
+                        var dy = simNodes[a].y - simNodes[b].y;
+                        var dist2 = dx * dx + dy * dy;
+                        if (dist2 === 0) { dx = Math.random(); dy = Math.random(); dist2 = dx*dx + dy*dy; }
+                        var dist = Math.sqrt(dist2);
+                        var force = 3000 / (dist2 + 100);
+                        var fx = (dx / dist) * force;
+                        var fy = (dy / dist) * force;
+                        if (!simNodes[a].fixed) { simNodes[a].vx += fx; simNodes[a].vy += fy; }
+                        if (!simNodes[b].fixed) { simNodes[b].vx -= fx; simNodes[b].vy -= fy; }
+                    }
+                    if (!simNodes[a].fixed) {
+                        simNodes[a].vx += (cx - simNodes[a].x) * 0.02;
+                        simNodes[a].vy += (cy - simNodes[a].y) * 0.02;
+                    }
                 }
-                simNodes[a].vx += (cx - simNodes[a].x) * 0.02;
-                simNodes[a].vy += (cy - simNodes[a].y) * 0.02;
+
+                for (var j = 0; j < simEdges.length; j++) {
+                    var edgeObj = simEdges[j];
+                    var sdx = edgeObj.target.x - edgeObj.source.x;
+                    var sdy = edgeObj.target.y - edgeObj.source.y;
+                    var sdist = Math.sqrt(sdx * sdx + sdy * sdy) || 1;
+                    var sforce = (sdist - 100) * 0.04;
+                    var sfx = (sdx / sdist) * sforce;
+                    var sfy = (sdy / sdist) * sforce;
+                    if (!edgeObj.source.fixed) { edgeObj.source.vx += sfx; edgeObj.source.vy += sfy; }
+                    if (!edgeObj.target.fixed) { edgeObj.target.vx -= sfx; edgeObj.target.vy -= sfy; }
+                }
+
+                for (var n = 0; n < simNodes.length; n++) {
+                    var sn = simNodes[n];
+                    if (sn.fixed) continue;
+                    sn.vx = Math.max(-20, Math.min(20, sn.vx));
+                    sn.vy = Math.max(-20, Math.min(20, sn.vy));
+                    sn.x += sn.vx;
+                    sn.y += sn.vy;
+                    sn.vx *= 0.6;
+                    sn.vy *= 0.6;
+                    sn.x = Math.max(20, Math.min(width - 20, sn.x));
+                    sn.y = Math.max(20, Math.min(height - 20, sn.y));
+                }
             }
 
-            for (var j = 0; j < simEdges.length; j++) {
-                var edgeObj = simEdges[j];
-                var sdx = edgeObj.target.x - edgeObj.source.x;
-                var sdy = edgeObj.target.y - edgeObj.source.y;
-                var sdist = Math.sqrt(sdx * sdx + sdy * sdy) || 1;
-                var sforce = (sdist - 100) * 0.04;
-                var sfx = (sdx / sdist) * sforce;
-                var sfy = (sdy / sdist) * sforce;
-                edgeObj.source.vx += sfx; edgeObj.source.vy += sfy;
-                edgeObj.target.vx -= sfx; edgeObj.target.vy -= sfy;
-            }
-
-            for (var n = 0; n < simNodes.length; n++) {
-                var sn = simNodes[n];
-                sn.vx = Math.max(-20, Math.min(20, sn.vx));
-                sn.vy = Math.max(-20, Math.min(20, sn.vy));
-                sn.x += sn.vx;
-                sn.y += sn.vy;
-                sn.vx *= 0.6; 
-                sn.vy *= 0.6;
-                sn.x = Math.max(30, Math.min(width - 30, sn.x));
-                sn.y = Math.max(30, Math.min(height - 40, sn.y));
-            }
+            // Freeze newly-simulated nodes into the persisted data so they're
+            // anchored too on the next render (and survive a reload).
+            var gainedPositions = false;
+            simNodes.forEach(function(sn) {
+                if (sn.fixed) return;
+                var nodeObj = nodeMap[sn.name] || nodeMap[sn.id];
+                if (nodeObj) { nodeObj.x = sn.x; nodeObj.y = sn.y; gainedPositions = true; }
+            });
+            if (gainedPositions) Persistence.saveRelationshipData();
         }
+
+        var view = (Store.relationshipData._view && typeof Store.relationshipData._view.scale === "number")
+            ? Store.relationshipData._view
+            : { tx: 0, ty: 0, scale: 1 };
 
         var html = '';
         var defaultDetail = '<i style="opacity: 0.6;">Hover or tap a character/connection to see details...</i>';
-        
+
         html += '<div class="st-rel-legend">';
-        Object.keys(typeColors).forEach(function(type) {
-            html += '<div class="st-rel-legend-item"><span class="st-rel-legend-dot" style="background:'+typeColors[type]+'"></span>' + type + '</div>';
+        typeKeys.forEach(function(type) {
+            html += '<div class="st-rel-legend-item"><span class="st-rel-legend-dot" style="background:'+(typeColors[type]||'#888')+'"></span>' + esc(type) + '</div>';
         });
         html += '</div>';
 
-        html += '<svg width="100%" height="'+height+'" viewBox="0 0 '+width+' '+height+'" style="overflow:visible; user-select:none;">';
-        
+        html += '<div class="st-rel-zoom-controls">';
+        html += '  <button type="button" class="st-rel-zoom-btn" id="st-rel-zoom-out" title="Zoom out"><i class="fa-solid fa-minus"></i></button>';
+        html += '  <button type="button" class="st-rel-zoom-btn" id="st-rel-zoom-reset" title="Reset view"><i class="fa-solid fa-compress"></i></button>';
+        html += '  <button type="button" class="st-rel-zoom-btn" id="st-rel-zoom-in" title="Zoom in"><i class="fa-solid fa-plus"></i></button>';
+        html += '</div>';
+
+        html += '<svg width="100%" height="'+height+'" viewBox="0 0 '+width+' '+height+'" class="st-rel-svg" style="user-select:none; touch-action:none;">';
+
+        html += '<g id="st-rel-viewport" transform="translate('+view.tx+','+view.ty+') scale('+view.scale+')">';
+
         html += '<g id="st-rel-edges">';
         simEdges.forEach(function(eObj, idx) {
             var eData = eObj.data || {};
@@ -2941,8 +1485,7 @@ function renderRelationshipGraph() {
             html += '<line class="st-rel-edge" data-idx="' + idx + '" ' +
                     'x1="'+eObj.source.x+'" y1="'+eObj.source.y+'" ' +
                     'x2="'+eObj.target.x+'" y2="'+eObj.target.y+'" ' +
-                    'stroke="'+color+'" stroke-width="'+thickness+'" stroke-linecap="round" ' +
-                    'style="cursor:pointer; transition: opacity 0.2s, stroke-width 0.2s;" /> ';
+                    'stroke="'+color+'" stroke-width="'+thickness+'" stroke-linecap="round" /> ';
         });
         html += '</g>';
 
@@ -2956,13 +1499,17 @@ function renderRelationshipGraph() {
                 else if (nStr.length > 0) initials = nStr.substring(0, 2).toUpperCase();
             }
 
-            html += '<g class="st-rel-node" data-nidx="'+sn.idx+'" style="cursor:pointer; transition: opacity 0.2s; transform: translate('+sn.x+'px, '+sn.y+'px);">';
-            html += '<circle r="16" fill="#242421" stroke="var(--st-custom-accent)" stroke-width="2" />';
-            html += '<text y="4" text-anchor="middle" fill="#fff" font-size="11px" font-weight="bold" font-family="sans-serif">'+esc(initials)+'</text>';
+            html += '<g class="st-rel-node" data-nidx="'+sn.idx+'" data-name="'+esc(sn.name)+'" transform="translate('+sn.x+','+sn.y+')">';
+            html += '<circle class="st-rel-node-circle" r="16" fill="#242421" stroke="var(--st-custom-accent)" stroke-width="2" />';
+            html += '<text y="4" text-anchor="middle" fill="#fff" font-size="11px" font-weight="bold" font-family="sans-serif" style="pointer-events:none;">'+esc(initials)+'</text>';
             html += '<text y="28" text-anchor="middle" fill="var(--st-journal-text)" font-size="11px" font-family="sans-serif" font-weight="600" style="pointer-events:none;">'+esc(sn.name)+'</text>';
+            html += '<g class="st-rel-edit-badge" transform="translate(14,-14)">';
+            html += '  <circle r="9" fill="var(--st-custom-accent)" stroke="#1c1c1a" stroke-width="1.5" />';
+            html += '  <text y="3.5" text-anchor="middle" fill="#1c1c1a" font-size="9px" font-family="sans-serif">✎</text>';
+            html += '</g>';
             html += '</g>';
         });
-        html += '</g></svg>';
+        html += '</g></g></svg>';
 
         html += '<div class="st-rel-detail" id="st-rel-detail-panel" style="min-height:55px; margin-top:10px;">';
         html += defaultDetail;
@@ -2971,395 +1518,609 @@ function renderRelationshipGraph() {
         $container.html(html);
 
         var $detail = $container.find("#st-rel-detail-panel");
+        var svgEl = $container.find(".st-rel-svg")[0];
+        var viewportEl = $container.find("#st-rel-viewport")[0];
+        var currentView = { tx: view.tx, ty: view.ty, scale: view.scale };
 
-        $container.find('.st-rel-edge').on('mouseenter click', function(e) {
-            e.stopPropagation();
-            var idx = $(this).data("idx");
-            if (idx === undefined || !simEdges[idx]) return;
-            var edgeObj = simEdges[idx];
+        function relClampScale(s) { return Math.max(0.35, Math.min(2.5, s)); }
+
+        function applyViewTransform() {
+            viewportEl.setAttribute('transform', 'translate('+currentView.tx+','+currentView.ty+') scale('+currentView.scale+')');
+        }
+
+        function persistView() {
+            if (!Store.relationshipData) return;
+            Store.relationshipData._view = { tx: currentView.tx, ty: currentView.ty, scale: currentView.scale };
+            Persistence.saveRelationshipData();
+        }
+
+        function zoomAt(mx, my, factor) {
+            var newScale = relClampScale(currentView.scale * factor);
+            var worldX = (mx - currentView.tx) / currentView.scale;
+            var worldY = (my - currentView.ty) / currentView.scale;
+            currentView.tx = mx - worldX * newScale;
+            currentView.ty = my - worldY * newScale;
+            currentView.scale = newScale;
+            applyViewTransform();
+            persistView();
+        }
+
+        // --- Selection / highlight (tap a node or edge) ---
+        function clearSelection() {
+            Store.setRelSelectedNode(null);
+            $container.find('.st-rel-node, .st-rel-edge').removeClass('st-rel-dim st-rel-selected');
+            $detail.html(defaultDetail);
+        }
+
+        function historyHtml(edgeData) {
+            var hist = (edgeData && edgeData.history) || [];
+            if (hist.length === 0) return "";
+            var rows = hist.map(function(h) {
+                var when = h.date ? ((h.time || "") + " " + h.date).trim() : ("Msg #" + (h.msg || 0));
+                var sign = (h.strength >= 0) ? "+" : "";
+                return '<div style="display:flex; justify-content:space-between; gap:6px; font-size:10px; opacity:0.85; padding:2px 0; border-bottom:1px solid rgba(255,255,255,0.06);">' +
+                       '<span><span style="color:var(--st-custom-accent);">' + esc(when) + '</span> ' + esc(h.summary || "") + '</span>' +
+                       '<span style="opacity:0.7; flex-shrink:0;">' + sign + (h.strength || 0).toFixed(2) + '</span></div>';
+            }).join("");
+            return '<div style="margin-top:4px;"><div style="font-size:9.5px; text-transform:uppercase; letter-spacing:0.3px; opacity:0.5; margin-bottom:2px;">History (' + hist.length + ')</div>' +
+                   '<div style="max-height:90px; overflow-y:auto; padding-right:4px;">' + rows + '</div></div>';
+        }
+
+        function showEdgeDetail(edgeObj) {
             var eData = edgeObj.data;
-            
-            $container.find('.st-rel-edge').css('opacity', '0.15');
-            $(this).css('opacity', '1');
-            $container.find('.st-rel-node').css('opacity', '0.15');
-            $container.find('.st-rel-node[data-nidx="'+edgeObj.source.idx+'"]').css('opacity', '1');
-            $container.find('.st-rel-node[data-nidx="'+edgeObj.target.idx+'"]').css('opacity', '1');
+            $container.find('.st-rel-edge').addClass('st-rel-dim');
+            $container.find('.st-rel-edge[data-idx="'+simEdges.indexOf(edgeObj)+'"]').removeClass('st-rel-dim');
+            $container.find('.st-rel-node').addClass('st-rel-dim').removeClass('st-rel-selected');
+            $container.find('.st-rel-node[data-nidx="'+edgeObj.source.idx+'"], .st-rel-node[data-nidx="'+edgeObj.target.idx+'"]').removeClass('st-rel-dim');
 
             var sign = (eData.strength || 0) >= 0 ? "+" : "";
             var strengthVal = (eData.strength || 0).toFixed(2);
-            var dHtml = '<div style="margin-bottom:6px;"><strong style="color:var(--st-custom-accent)">' + esc(eData.from) + ' ↔ ' + esc(eData.to) + '</strong></div>';
+            // Same mutual-vs-one-sided check as injectContextToChat — a reciprocal edge in
+            // the data means this pair is stored as two asymmetric entries (see
+            // RelationshipAgent.js rule 4b), so it should render with a one-way arrow here too.
+            var edgeOneSided = Store.RelationshipAgent && Store.RelationshipAgent.hasReciprocalEdge(Store.relationshipData.edges, eData.from, eData.to);
+            var edgeArrow = edgeOneSided ? ' \u2192 ' : ' \u2194 ';
+            var dHtml = '<div style="margin-bottom:6px;"><strong style="color:var(--st-custom-accent)">' + esc(eData.from) + edgeArrow + esc(eData.to) + '</strong></div>';
             dHtml += '<div style="margin-bottom:4px; font-size:11px;"><span style="color:'+(typeColors[eData.type]||'#888')+'">● ' + esc(eData.type||'neutral') + '</span> (Strength: ' + sign + strengthVal + ')</div>';
             if (eData.summary) dHtml += '<div style="opacity:0.9; margin-bottom:4px; font-size:11px; line-height: 1.4;">' + esc(eData.summary) + '</div>';
             if (eData.change && eData.change !== "Stable") dHtml += '<div style="opacity:0.75; font-style:italic; font-size:11px;">↗ ' + esc(eData.change) + '</div>';
-
+            dHtml += historyHtml(eData);
             $detail.html(dHtml);
-        });
+        }
 
-        $container.find('.st-rel-node').on('mouseenter click', function(e) {
-            e.stopPropagation();
-            var nidx = $(this).data("nidx");
-            if (nidx === undefined || !simNodes[nidx]) return;
-            var nodeObj = simNodes[nidx];
-            
-            var connectedEdges = simEdges.filter(function(eObj) { 
-                return eObj.source.idx === nodeObj.idx || eObj.target.idx === nodeObj.idx; 
+        function selectNode(nodeObj) {
+            Store.setRelSelectedNode(nodeObj.name);
+            var connectedEdges = simEdges.filter(function(eObj) {
+                return eObj.source.idx === nodeObj.idx || eObj.target.idx === nodeObj.idx;
             });
             var connectedNodeIdxs = new Set([nodeObj.idx]);
-            connectedEdges.forEach(function(eObj) { 
-                connectedNodeIdxs.add(eObj.source.idx); 
-                connectedNodeIdxs.add(eObj.target.idx); 
+            connectedEdges.forEach(function(eObj) {
+                connectedNodeIdxs.add(eObj.source.idx);
+                connectedNodeIdxs.add(eObj.target.idx);
             });
 
             $container.find('.st-rel-node').each(function() {
                 var thisIdx = $(this).data('nidx');
-                if (!connectedNodeIdxs.has(thisIdx)) $(this).css('opacity', '0.15');
-                else $(this).css('opacity', '1');
+                $(this).toggleClass('st-rel-dim', !connectedNodeIdxs.has(thisIdx));
+                $(this).toggleClass('st-rel-selected', thisIdx === nodeObj.idx);
             });
             $container.find('.st-rel-edge').each(function() {
-                var thisIdx = $(this).data('idx');
-                var eObj = simEdges[thisIdx];
-                if (eObj && eObj.source.idx !== nodeObj.idx && eObj.target.idx !== nodeObj.idx) {
-                    $(this).css('opacity', '0.15');
-                } else {
-                    $(this).css('opacity', '1');
-                }
+                var eObj = simEdges[$(this).data('idx')];
+                var connected = eObj && (eObj.source.idx === nodeObj.idx || eObj.target.idx === nodeObj.idx);
+                $(this).toggleClass('st-rel-dim', !connected);
             });
 
             var dHtml = '<div style="margin-bottom:6px;"><strong style="color:var(--st-custom-accent)">' + esc(nodeObj.name) + '\'s Connections</strong></div>';
+            var nodeData = nodeMap[nodeObj.name] || nodeMap[nodeObj.id];
+            if (nodeData && nodeData.bio) {
+                dHtml += '<div style="opacity:0.85; font-style:italic; font-size:11px; line-height:1.4; margin-bottom:8px;">' + esc(nodeData.bio) + '</div>';
+            }
             if (connectedEdges.length === 0) {
                 dHtml += '<div style="opacity:0.8; font-size:11px;">No known connections.</div>';
             } else {
-                dHtml += '<div style="display:flex; flex-direction:column; gap:6px; max-height:100px; overflow-y:auto; padding-right:5px;">';
+                dHtml += '<div style="display:flex; flex-direction:column; gap:6px; max-height:240px; overflow-y:auto; padding-right:5px;">';
                 connectedEdges.sort(function(a, b) { return Math.abs(b.data.strength||0) - Math.abs(a.data.strength||0); });
                 connectedEdges.forEach(function(eObj) {
                     var e = eObj.data;
                     var otherName = (eObj.source.idx === nodeObj.idx) ? eObj.target.name : eObj.source.name;
                     var sign = (e.strength || 0) >= 0 ? "+" : "";
                     var color = typeColors[e.type] || "#888";
+                    // Only annotate direction for genuinely asymmetric pairs (a reciprocal edge
+                    // exists — see RelationshipAgent.js rule 4b); mutual pairs stay unmarked as
+                    // before. Mirrors the badge already used in buildRelEditPanelHtml.
+                    var connOneSided = Store.RelationshipAgent && Store.RelationshipAgent.hasReciprocalEdge(Store.relationshipData.edges, e.from, e.to);
+                    var connDirTag = connOneSided
+                        ? (e.from === nodeObj.name
+                            ? ' <span style="opacity:0.6; font-size:10px;" title="One-sided \u2014 '+esc(nodeObj.name)+'\'s feelings toward '+esc(otherName)+'">(one-sided \u2192)</span>'
+                            : ' <span style="opacity:0.6; font-size:10px;" title="One-sided \u2014 '+esc(otherName)+'\'s feelings toward '+esc(nodeObj.name)+', not necessarily returned">(one-sided \u2190)</span>')
+                        : '';
                     dHtml += '<div style="font-size:11px; line-height: 1.3;">';
-                    dHtml += '<strong style="color:#fff;">' + esc(otherName) + ':</strong> ';
+                    dHtml += '<strong style="color:#fff;">' + esc(otherName) + ':</strong>' + connDirTag + ' ';
                     dHtml += '<span style="color:'+color+'">' + esc(e.type) + '</span> ';
                     dHtml += '(' + sign + (e.strength||0).toFixed(1) + ')<br>';
                     if (e.summary) dHtml += '<span style="opacity:0.8;">' + esc(e.summary) + '</span>';
+                    dHtml += historyHtml(e);
                     dHtml += '</div>';
                 });
                 dHtml += '</div>';
             }
+            dHtml += '<div style="margin-top:6px; font-size:10px; opacity:0.55;">Tap the ✎ badge on this character to edit their relationships.</div>';
             $detail.html(dHtml);
+        }
+
+        $container.find('.st-rel-edge').on('mouseenter click', function(e) {
+            e.stopPropagation();
+            var idx = $(this).data("idx");
+            if (idx === undefined || !simEdges[idx]) return;
+            showEdgeDetail(simEdges[idx]);
         });
 
-        // Click outside elements to restore layout
-        $container.on('mouseleave click', function() {
-            $container.find('.st-rel-edge').css('opacity', '1');
-            $container.find('.st-rel-node').css('opacity', '1');
-            $detail.html(defaultDetail);
+        // --- Node drag (reposition + persist) and tap-to-select ---
+        $container.find('.st-rel-node').each(function() {
+            var nodeEl = this;
+            var nidx = $(nodeEl).data('nidx');
+            var sn = simNodes[nidx];
+            if (!sn) return;
+
+            var dragPointerId = null, dragging = false;
+            var startClientX = 0, startClientY = 0, startWorldX = 0, startWorldY = 0;
+
+            function updateEdgesForNode() {
+                simEdges.forEach(function(eObj, idx) {
+                    if (eObj.source.idx !== sn.idx && eObj.target.idx !== sn.idx) return;
+                    var $line = $container.find('.st-rel-edge[data-idx="'+idx+'"]');
+                    if (eObj.source.idx === sn.idx) { $line.attr('x1', sn.x); $line.attr('y1', sn.y); }
+                    if (eObj.target.idx === sn.idx) { $line.attr('x2', sn.x); $line.attr('y2', sn.y); }
+                });
+            }
+
+            nodeEl.addEventListener('pointerdown', function(e) {
+                e.stopPropagation();
+                dragging = false;
+                dragPointerId = e.pointerId;
+                startClientX = e.clientX; startClientY = e.clientY;
+                startWorldX = sn.x; startWorldY = sn.y;
+                try { nodeEl.setPointerCapture(dragPointerId); } catch(err) {}
+            });
+
+            nodeEl.addEventListener('pointermove', function(e) {
+                if (dragPointerId === null || e.pointerId !== dragPointerId) return;
+                var dxScreen = e.clientX - startClientX;
+                var dyScreen = e.clientY - startClientY;
+                if (!dragging && Math.hypot(dxScreen, dyScreen) > 4) dragging = true;
+                if (!dragging) return;
+                sn.x = startWorldX + dxScreen / currentView.scale;
+                sn.y = startWorldY + dyScreen / currentView.scale;
+                nodeEl.setAttribute('transform', 'translate('+sn.x+','+sn.y+')');
+                updateEdgesForNode();
+            });
+
+            nodeEl.addEventListener('pointerup', function(e) {
+                e.stopPropagation();
+                if (dragPointerId === null || e.pointerId !== dragPointerId) return;
+                try { nodeEl.releasePointerCapture(dragPointerId); } catch(err) {}
+                dragPointerId = null;
+                if (dragging) {
+                    var nodeObj = nodeMap[sn.name] || nodeMap[sn.id];
+                    if (nodeObj) { nodeObj.x = sn.x; nodeObj.y = sn.y; }
+                    Persistence.saveRelationshipData();
+                    dragging = false;
+                    return; // a drag never counts as a tap/select
+                }
+                selectNode(sn);
+            });
+
+            nodeEl.addEventListener('pointercancel', function() {
+                dragPointerId = null; dragging = false;
+            });
         });
+
+        // Edit badge — stops the node's drag handler from firing, opens the inline editor.
+        $container.find('.st-rel-edit-badge').each(function() {
+            var badgeEl = this;
+            badgeEl.addEventListener('pointerdown', function(e) { e.stopPropagation(); });
+            badgeEl.addEventListener('pointerup', function(e) { e.stopPropagation(); });
+            badgeEl.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var name = $(badgeEl).closest('.st-rel-node').data('name');
+                if (!name) return;
+                Store.setRelEditingNode(name);
+                renderRelationshipGraph();
+            });
+        });
+
+        // --- Background pan + pinch/wheel zoom ---
+        var activePointers = {};
+        var panDragging = false, panBgDragged = false;
+        var panStartX = 0, panStartY = 0, panStartTx = 0, panStartTy = 0;
+        var pinchStartDist = 1, pinchStartScale = 1, pinchStartView = { tx: 0, ty: 0 };
+
+        svgEl.style.cursor = 'grab';
+
+        svgEl.addEventListener('pointerdown', function(e) {
+            activePointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+            try { svgEl.setPointerCapture(e.pointerId); } catch(err) {}
+            var ids = Object.keys(activePointers);
+            if (ids.length === 1) {
+                panDragging = true; panBgDragged = false;
+                panStartX = e.clientX; panStartY = e.clientY;
+                panStartTx = currentView.tx; panStartTy = currentView.ty;
+                svgEl.style.cursor = 'grabbing';
+            } else if (ids.length === 2) {
+                panDragging = false;
+                var pts = ids.map(function(id) { return activePointers[id]; });
+                pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+                pinchStartScale = currentView.scale;
+                pinchStartView = { tx: currentView.tx, ty: currentView.ty };
+            }
+        });
+
+        svgEl.addEventListener('pointermove', function(e) {
+            if (!activePointers[e.pointerId]) return;
+            activePointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+            var ids = Object.keys(activePointers);
+            var rect = svgEl.getBoundingClientRect();
+
+            if (ids.length === 2) {
+                var pts = ids.map(function(id) { return activePointers[id]; });
+                var dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+                var factor = dist / pinchStartDist;
+                var midX = (pts[0].x + pts[1].x) / 2, midY = (pts[0].y + pts[1].y) / 2;
+                var mx = (midX - rect.left) * (width / rect.width);
+                var my = (midY - rect.top) * (height / rect.height);
+                var newScale = relClampScale(pinchStartScale * factor);
+                var worldX = (mx - pinchStartView.tx) / pinchStartScale;
+                var worldY = (my - pinchStartView.ty) / pinchStartScale;
+                currentView.scale = newScale;
+                currentView.tx = mx - worldX * newScale;
+                currentView.ty = my - worldY * newScale;
+                applyViewTransform();
+            } else if (ids.length === 1 && panDragging) {
+                var dx = e.clientX - panStartX, dy = e.clientY - panStartY;
+                if (Math.hypot(dx, dy) > 4) panBgDragged = true;
+                currentView.tx = panStartTx + dx;
+                currentView.ty = panStartTy + dy;
+                applyViewTransform();
+            }
+        });
+
+        function svgPointerEnd(e) {
+            delete activePointers[e.pointerId];
+            try { svgEl.releasePointerCapture(e.pointerId); } catch(err) {}
+            var ids = Object.keys(activePointers);
+            if (ids.length === 0) {
+                var wasDrag = panBgDragged;
+                panDragging = false; panBgDragged = false;
+                svgEl.style.cursor = 'grab';
+                persistView();
+                if (!wasDrag) clearSelection();
+            } else if (ids.length === 1) {
+                panDragging = true;
+                var remaining = activePointers[ids[0]];
+                panStartX = remaining.x; panStartY = remaining.y;
+                panStartTx = currentView.tx; panStartTy = currentView.ty;
+            }
+        }
+        svgEl.addEventListener('pointerup', svgPointerEnd);
+        svgEl.addEventListener('pointercancel', svgPointerEnd);
+
+        svgEl.addEventListener('wheel', function(e) {
+            e.preventDefault();
+            var rect = svgEl.getBoundingClientRect();
+            var mx = (e.clientX - rect.left) * (width / rect.width);
+            var my = (e.clientY - rect.top) * (height / rect.height);
+            zoomAt(mx, my, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+        }, { passive: false });
+
+        $container.find('#st-rel-zoom-in').on('click', function() { zoomAt(width/2, height/2, 1.25); });
+        $container.find('#st-rel-zoom-out').on('click', function() { zoomAt(width/2, height/2, 1/1.25); });
+        $container.find('#st-rel-zoom-reset').on('click', function() {
+            currentView = { tx: 0, ty: 0, scale: 1 };
+            applyViewTransform();
+            persistView();
+        });
+
+        // --- Inline edit panel ---
+        if (Store.relEditingNode && nodeMap[Store.relEditingNode]) {
+            $container.append(buildRelEditPanelHtml(Store.relEditingNode, typeKeys, typeColors));
+            wireRelEditPanel($container, Store.relEditingNode);
+            selectNode(simNodes.find(function(sn) { return sn.name === Store.relEditingNode; }) || simNodes[0]);
+            $container.find('.st-rel-node[data-name="'+esc(Store.relEditingNode)+'"]').addClass('st-rel-selected');
+        }
 
     } catch (err) {
         console.error("[Story Tracker] Error rendering relationship graph:", err);
         $container.html('<div class="st-no-data">Failed to render graph. Please check the console.</div>');
     }
 }
+// Feature: small strength-over-time sparkline next to each relationship's strength
+// slider. Reads RelationshipAgent.buildStrengthTimeline() — the edge's `history`
+// entries the tracker already snapshots on every update, just never visualized
+// before. Renders nothing (returns "") when there isn't at least 2 points yet, i.e.
+// a brand-new relationship with no history — a single dot isn't a "timeline".
+function buildRelStrengthSparkline(edge) {
+    if (!Store.RelationshipAgent) return "";
+    var points = Store.RelationshipAgent.buildStrengthTimeline(edge, 10);
+    if (points.length < 2) return "";
 
-// --- HUD ---
-function setHudStatus(label) {
-    // Swap book icon for spinner; hide text label (looks clean in both collapsed and expanded states)
-    $("#st-hud .fa-book-open-reader").removeClass("fa-book-open-reader").addClass("fa-spinner fa-spin st-hud-was-book");
-    $("#st-hud-status").hide(); // text label hidden always - spinner icon is enough
-    $("#st-hud").addClass("st-hud-busy");
+    var w = 62, h = 18, pad = 2;
+    var stepX = (w - pad * 2) / (points.length - 1);
+    // strength in [-1, 1] -> y in [pad, h-pad], higher strength drawn higher on the chart
+    var toY = function(v) { return pad + (1 - (v + 1) / 2) * (h - pad * 2); };
+    var coords = points.map(function(v, i) { return (pad + i * stepX).toFixed(1) + "," + toY(v).toFixed(1); }).join(" ");
+    var zeroY = toY(0).toFixed(1);
+    var trendUp = points[points.length - 1] >= points[0];
+
+    return '<svg class="st-rel-edit-sparkline" viewBox="0 0 ' + w + ' ' + h + '" width="' + w + '" height="' + h + '" title="Strength over time">' +
+        '<line x1="' + pad + '" y1="' + zeroY + '" x2="' + (w - pad) + '" y2="' + zeroY + '" class="st-rel-spark-zero"></line>' +
+        '<polyline points="' + coords + '" class="st-rel-spark-line' + (trendUp ? " st-rel-spark-up" : " st-rel-spark-down") + '"></polyline>' +
+        "</svg>";
 }
 
-function clearHudStatus() {
-    $("#st-hud .fa-spinner.st-hud-was-book").removeClass("fa-spinner fa-spin st-hud-was-book").addClass("fa-book-open-reader");
-    $("#st-hud-status").hide().html("");
-    $("#st-hud").removeClass("st-hud-busy");
-}
+// Builds the inline "editing <character>" panel: one editable row per existing
+// relationship, an add-relationship mini form, and a destructive remove-character
+// action — for correcting whatever the LLM extraction got wrong.
+function buildRelEditPanelHtml(name, typeKeys, typeColors) {
+    var edges = (Store.relationshipData.edges || []).filter(function(e) { return e && (e.from === name || e.to === name); });
+    var allNames = (Store.relationshipData.nodes || [])
+        .map(function(n) { return n.name; })
+        .filter(function(n) { return n && n !== name; });
+    var selfNode = (Store.relationshipData.nodes || []).find(function(n) { return n && n.name === name; });
 
-function buildHUD() {
-    if (document.getElementById("st-hud")) return;
-    let h = `<div id="st-hud" class="st-hud st-hud-collapsed">
-        <div class="st-hud-head">
-            <i class="fa-solid fa-book-open-reader"></i>
-            <span class="st-hud-head-text" style="margin-left: 6px;">Tracker</span>
-            <span id="st-hud-status" style="margin-left:6px;font-size:9px;opacity:.75;display:none;"></span>
-            <i style="margin-left:auto" class="fa-solid fa-chevron-up"></i>
-        </div>
-        <div class="st-hud-body" id="st-hud-body"></div>
-    </div>`;
-    document.body.insertAdjacentHTML("beforeend", h);
-    
-    $(document).on("click", ".st-hud-head", function() { 
-        if ($("#st-hud").attr("data-dragging") === "true") return;
-        $("#st-hud").toggleClass("st-hud-collapsed"); 
-    });
-    $(document).on("click", "#st-hud-body", function() { 
-        if ($("#st-hud").attr("data-dragging") === "true") return;
-        loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); 
-    });
+    function typeOptions(selected) {
+        return typeKeys.map(function(t) {
+            return '<option value="'+esc(t)+'"'+(t === selected ? ' selected' : '')+'>'+esc(t)+'</option>';
+        }).join('');
+    }
 
-    var hudEl = document.getElementById("st-hud");
-    makeHudDraggable(hudEl);
+    var html = '<div class="st-rel-edit-panel">';
+    html += '<div class="st-rel-edit-header"><strong>Editing: '+esc(name)+'</strong><button type="button" class="st-rel-edit-close" title="Close">✕</button></div>';
 
-    renderHUD();
-}
+    // Character bio — a short, stable "who they are" blurb. Agent-written the first
+    // time it has enough info (first-write-wins, never silently overwritten after),
+    // but always editable by hand here.
+    html += '<div class="st-rel-edit-bio-row">';
+    html += '  <div class="st-rel-edit-bio-label">Bio</div>';
+    html += '  <div class="st-resizable-wrap"><textarea class="st-rel-edit-bio" rows="2" placeholder="No bio yet — the tracker will add one once it has enough info, or type one here.">'+esc((selfNode && selfNode.bio) || '')+'</textarea><div class="st-resize-handle" title="Drag to resize"><i class="fa-solid fa-grip-lines"></i></div></div>';
+    html += '  <button type="button" class="menu_button st-pill-btn st-rel-edit-bio-save">Save Bio</button>';
+    html += '</div>';
 
-function applyHudStyle() {
-    var $h = $("#st-hud");
-    if (!$h.length) return;
-
-    var scale  = (settings.hudScale || 100) / 100;
-    var origin = "top right";
-
-    if (settings.hudLeft !== null && settings.hudTop !== null) {
-        // Restore from raw CSS pixel coords — no percentage math, no scale distortion
-        var clamped = clampHudPosition(settings.hudLeft, settings.hudTop);
-
-        $h.css({
-            "left":   clamped.x + "px",
-            "top":    clamped.y + "px",
-            "right":  "auto",
-            "bottom": "auto"
-        });
-
-        // Adjust transform-origin so the scale grows toward the nearest corner
-        var oX = (clamped.x + ($h.outerWidth()  || 0) / 2) > window.innerWidth  / 2 ? "right" : "left";
-        var oY = (clamped.y + ($h.outerHeight() || 0) / 2) > window.innerHeight / 2 ? "bottom" : "top";
-        origin = oY + " " + oX;
+    if (edges.length === 0) {
+        html += '<div class="st-rel-edit-empty">No relationships yet for this character — add one below.</div>';
     } else {
-        // No saved position - explicitly set a safe bottom-right default rather than
-        // clearing to empty strings. Some browsers (notably Firefox) can render a
-        // position:fixed element with no offsets in normal document flow instead of
-        // the stylesheet's intended corner, making the HUD invisible/off-screen.
-        $h.css({ "left": "auto", "top": "auto", "right": "20px", "bottom": "90px" });
+        html += '<div class="st-rel-edit-list">';
+        edges.forEach(function(e) {
+            var other = e.from === name ? e.to : e.from;
+            var outgoing = e.from === name; // true: this is {name}'s view of {other}. false: {other}'s view of {name}.
+            var strength = (typeof e.strength === "number") ? e.strength : 0;
+            var hist = e.history || [];
+            // Direction matters now that both directions can exist as distinct edges (see
+            // RelationshipAgent.findEdgeIndex) — an arrow instead of "↔" avoids implying
+            // the relationship is automatically mutual when it may not be. A small "2-way"
+            // badge flags when the reverse ALSO exists, so two separate rows for the same
+            // pair read as intentional asymmetry, not a duplicate.
+            var arrowIcon = outgoing ? "fa-arrow-right" : "fa-arrow-left";
+            var arrowTitle = outgoing ? (esc(name) + "'s view of " + esc(other)) : (esc(other) + "'s view of " + esc(name));
+            var hasReverse = Store.RelationshipAgent && Store.RelationshipAgent.hasReciprocalEdge(Store.relationshipData.edges, e.from, e.to);
+            var reciprocalBadge = hasReverse ? '<span class="st-rel-edit-row-badge" title="A separate relationship exists in the other direction too — edit it from the other character\'s panel">2-way</span>' : '';
+            html += '<div class="st-rel-edit-row" data-from="'+esc(e.from)+'" data-to="'+esc(e.to)+'">';
+            html += '  <div class="st-rel-edit-row-name"><i class="fa-solid '+arrowIcon+'" title="'+arrowTitle+'"></i> '+esc(other)+reciprocalBadge+'</div>';
+            html += '  <select class="st-rel-edit-type">'+typeOptions(e.type)+'</select>';
+            html += '  <div class="st-rel-edit-strength-row"><input type="range" class="st-rel-edit-strength" min="-1" max="1" step="0.05" value="'+strength+'"><span class="st-rel-edit-strength-val">'+strength.toFixed(2)+'</span>'+buildRelStrengthSparkline(e)+'</div>';
+            html += '  <div class="st-resizable-wrap"><textarea class="st-rel-edit-summary" rows="2" placeholder="Summary">'+esc(e.summary||'')+'</textarea><div class="st-resize-handle" title="Drag to resize"><i class="fa-solid fa-grip-lines"></i></div></div>';
+            html += '  <div class="st-rel-edit-row-actions">';
+            html += '    <button type="button" class="st-rel-edit-history-toggle" '+(hist.length === 0 ? 'disabled' : '')+'><i class="fa-solid fa-clock-rotate-left"></i> History ('+hist.length+')</button>';
+            html += '    <button type="button" class="menu_button st-pill-btn st-rel-edit-save">Save</button>';
+            html += '    <button type="button" class="menu_button st-pill-btn st-rel-edit-delete" style="color:#ff453a !important;">Delete</button>';
+            html += '  </div>';
+            if (hist.length > 0) {
+                html += '  <div class="st-rel-edit-history-list" style="display:none;">';
+                hist.forEach(function(h) {
+                    var when = h.date ? ((h.time || "") + " " + h.date).trim() : ("Message #" + (h.msg || 0));
+                    var sign = (h.strength >= 0) ? "+" : "";
+                    html += '    <div class="st-rel-edit-history-item"><span class="st-rel-edit-history-when">'+esc(when)+'</span><span class="st-rel-edit-history-strength">'+sign+(h.strength || 0).toFixed(2)+'</span><div class="st-rel-edit-history-text">'+esc(h.summary || '')+'</div></div>';
+                });
+                html += '  </div>';
+            }
+            html += '</div>';
+        });
+        html += '</div>';
     }
 
-    $h.css({ "transform": "scale(" + scale + ")", "transform-origin": origin });
+    html += '<div class="st-rel-edit-add">';
+    html += '  <div class="st-rel-edit-add-title">Add relationship <span class="st-rel-edit-add-subtitle">— as '+esc(name)+' sees them</span></div>';
+    html += '  <input type="text" class="st-rel-edit-add-name" list="st-rel-names-list" placeholder="Character name">';
+    html += '  <datalist id="st-rel-names-list">' + allNames.map(function(n) { return '<option value="'+esc(n)+'">'; }).join('') + '</datalist>';
+    html += '  <select class="st-rel-edit-add-type">'+typeOptions('neutral')+'</select>';
+    html += '  <div class="st-rel-edit-strength-row"><input type="range" class="st-rel-edit-add-strength" min="-1" max="1" step="0.05" value="0"><span class="st-rel-edit-add-strength-val">0.00</span></div>';
+    html += '  <button type="button" class="menu_button st-pill-btn st-rel-edit-add-btn"><i class="fa-solid fa-plus"></i> Add</button>';
+    html += '</div>';
+
+    html += '<div class="st-rel-edit-danger">';
+    html += '  <button type="button" class="menu_button st-pill-btn st-rel-edit-remove-node" style="color:#ff453a !important;"><i class="fa-solid fa-trash-can"></i> Remove "'+esc(name)+'" entirely</button>';
+    html += '</div>';
+
+    html += '</div>';
+    return html;
 }
+// Wires up all interactive controls inside the inline edit panel built above.
+function wireRelEditPanel($container, name) {
+    var $editPanel = $container.find('.st-rel-edit-panel');
 
-// --- Draggable Handler ---
-function makeHudDraggable(el) {
-    let isDragging = false;
-    let startX, startY, initialX, initialY;
+    $editPanel.find('.st-rel-edit-close').on('click', function() {
+        Store.setRelEditingNode(null);
+        renderRelationshipGraph();
+    });
 
-    const onDown = (e) => {
-        if (e.target.closest && e.target.closest('button, input, select, textarea, a, .st-hud-body')) return;
+    $editPanel.find('.st-rel-edit-history-toggle').on('click', function() {
+        $(this).closest('.st-rel-edit-row').find('.st-rel-edit-history-list').slideToggle(120);
+    });
 
-        const clientX = e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : undefined);
-        const clientY = e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : undefined);
-        if (clientX === undefined) return;
-
-        isDragging = false;
-        el.removeAttribute('data-dragging');
-        startX = clientX;
-        startY = clientY;
-
-        const rect = el.getBoundingClientRect();
-        initialX = rect.left;
-        initialY = rect.top;
-
-        document.addEventListener('mousemove', onMove);
-        document.addEventListener('mouseup', onUp);
-        document.addEventListener('touchmove', onMove, { passive: false });
-        document.addEventListener('touchend', onUp);
-    };
-
-    const onMove = (e) => {
-        const clientX = e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : undefined);
-        const clientY = e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : undefined);
-        if (clientX === undefined) return;
-
-        const dx = clientX - startX;
-        const dy = clientY - startY;
-
-        if (!isDragging && Math.sqrt(dx * dx + dy * dy) > 5) {
-            isDragging = true;
-            el.setAttribute('data-dragging', 'true');
+    $editPanel.find('.st-rel-edit-bio-save').on('click', function() {
+        var bio = String($editPanel.find('.st-rel-edit-bio').val() || "").trim();
+        var node = (Store.relationshipData.nodes || []).find(function(n) { return n && n.name === name; });
+        if (!node) {
+            node = { id: name, name: name };
+            Store.relationshipData.nodes.push(node);
         }
+        node.bio = bio; // manual edit always allowed to override, unlike the agent's first-write-wins
+        Persistence.saveRelationshipData();
+        if (typeof toastr !== "undefined") toastr.success("Bio saved.");
+    });
 
-        if (isDragging) {
-            e.preventDefault();
-            var clamped = clampHudPosition(initialX + dx, initialY + dy);
-            el.style.left   = clamped.x + 'px';
-            el.style.top    = clamped.y + 'px';
-            el.style.right  = 'auto';
-            el.style.bottom = 'auto';
+    $editPanel.find('.st-rel-edit-strength').on('input', function() {
+        $(this).siblings('.st-rel-edit-strength-val').text(parseFloat($(this).val()).toFixed(2));
+    });
+    $editPanel.find('.st-rel-edit-add-strength').on('input', function() {
+        $(this).siblings('.st-rel-edit-add-strength-val').text(parseFloat($(this).val()).toFixed(2));
+    });
+
+    $editPanel.find('.st-rel-edit-save').on('click', function() {
+        var $row = $(this).closest('.st-rel-edit-row');
+        // .attr(), not .data() — jQuery .data() type-coerces attribute values
+        // ("123" -> number), which then fails findEdgeIndex's strict === match
+        // against the stored string name.
+        var from = $row.attr('data-from'), to = $row.attr('data-to');
+        var patch = {
+            type: $row.find('.st-rel-edit-type').val(),
+            strength: parseFloat($row.find('.st-rel-edit-strength').val()),
+            summary: $row.find('.st-rel-edit-summary').val()
+        };
+        Store.relationshipData.edges = Store.RelationshipAgent.updateEdgeFields(Store.relationshipData.edges, from, to, patch);
+        Persistence.saveRelationshipData();
+        renderRelationshipGraph();
+        HUD.renderHUD();
+        if (typeof toastr !== "undefined") toastr.success("Relationship updated.");
+    });
+
+    $editPanel.find('.st-rel-edit-delete').on('click', function() {
+        var $row = $(this).closest('.st-rel-edit-row');
+        var from = $row.attr('data-from'), to = $row.attr('data-to'); // .attr, not .data — see save handler above
+        if (!confirm("Delete this relationship?")) return;
+        Store.relationshipData.edges = Store.RelationshipAgent.removeEdge(Store.relationshipData.edges, from, to);
+        Persistence.saveRelationshipData();
+        renderRelationshipGraph();
+        HUD.renderHUD();
+    });
+
+    $editPanel.find('.st-rel-edit-add-btn').on('click', function() {
+        var otherName = String($editPanel.find('.st-rel-edit-add-name').val() || "").trim();
+        if (!otherName) { if (typeof toastr !== "undefined") toastr.warning("Enter a character name first."); return; }
+        // Resolve against existing nodes first — same guard the automated tracker
+        // uses — so typing "aria" when "Aria Stormwind" already exists reuses that
+        // node/edge instead of creating a second, duplicate character.
+        otherName = Persistence.resolveCanonicalName(otherName);
+        if (otherName === name) { if (typeof toastr !== "undefined") toastr.warning("Can't add a relationship to yourself."); return; }
+
+        var type = $editPanel.find('.st-rel-edit-add-type').val();
+        var strength = parseFloat($editPanel.find('.st-rel-edit-add-strength').val());
+
+        var before = Store.relationshipData.edges.length;
+        Store.relationshipData.edges = Store.RelationshipAgent.addManualEdge(Store.relationshipData.edges, {
+            from: name, to: otherName, type: type, strength: strength
+        });
+        if (Store.relationshipData.edges.length === before) {
+            if (typeof toastr !== "undefined") toastr.warning("That relationship already exists — edit it above instead.");
+            return;
         }
-    };
+        [name, otherName].forEach(function(nm) {
+            if (!Store.relationshipData.nodes.find(function(n) { return n.name === nm; })) {
+                Store.relationshipData.nodes.push({ id: nm, name: nm });
+            }
+        });
+        Persistence.saveRelationshipData();
+        renderRelationshipGraph();
+        HUD.renderHUD();
+        if (typeof toastr !== "undefined") toastr.success("Relationship added.");
+    });
 
-    const onUp = () => {
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-        document.removeEventListener('touchmove', onMove);
-        document.removeEventListener('touchend', onUp);
-
-        if (isDragging) {
-            settings.hudLeft = parseFloat(el.style.left) || 0;
-            settings.hudTop  = parseFloat(el.style.top)  || 0;
-            save();
-            applyHudStyle();
-        }
-
-        setTimeout(function() {
-            isDragging = false;
-            el.removeAttribute('data-dragging');
-        }, 50);
-    };
-
-    el.addEventListener('mousedown', onDown);
-    el.addEventListener('touchstart', onDown, { passive: true });
-
-    // Re-clamp the saved position on window resize
-    window.addEventListener('resize', function() {
-        if (settings.hudLeft === null || settings.hudTop === null) return;
-        var clamped = clampHudPosition(settings.hudLeft, settings.hudTop);
-        if (clamped.x !== settings.hudLeft || clamped.y !== settings.hudTop) {
-            settings.hudLeft = clamped.x;
-            settings.hudTop  = clamped.y;
-            el.style.left = clamped.x + 'px';
-            el.style.top  = clamped.y + 'px';
-            save();
-        }
+    $editPanel.find('.st-rel-edit-remove-node').on('click', function() {
+        if (!confirm('Remove "'+name+'" and all their relationships? This cannot be undone.')) return;
+        var result = Store.RelationshipAgent.removeNodeAndEdges(Store.relationshipData.nodes, Store.relationshipData.edges, name);
+        Store.relationshipData.nodes = result.nodes;
+        Store.relationshipData.edges = result.edges;
+        Store.setRelEditingNode(null);
+        Persistence.saveRelationshipData();
+        renderRelationshipGraph();
+        HUD.renderHUD();
+        if (typeof toastr !== "undefined") toastr.success("Character removed.");
     });
 }
-
-function renderHUD() {
-    $("#st-hud").toggle(settings.showHUD);
-    applyHudStyle();
-
-    if (!isChatOpen() || !storyData || !storyData._initialized) {
-        $("#st-hud-body").html("<div style='text-align:center;opacity:.5;font-size:10px;'>Waiting...</div>"); return;
-    }
-    let dow = getDayOfWeek(storyData.date);
-    let dowStr = dow ? ` &nbsp;<i class="fa-solid fa-calendar-day"></i> ${dow}` : "";
-    let h = `<div class="st-hud-row"><i class="fa-solid fa-clock"></i> <strong>${storyData.time}</strong> &nbsp; <i class="fa-solid fa-calendar"></i> ${storyData.date}${dowStr}</div>`;
-    h += `<div class="st-hud-row"><i class="fa-solid fa-location-dot"></i> ${esc(storyData.location)}</div>`;
-    if (settings.showCityCountry) {
-        let city = storyData.city || "";
-        let country = storyData.country || "";
-        let ccText = [city, country].filter(v => v && v !== "Unknown").join(", ");
-        if (ccText) h += `<div class="st-hud-row"><i class="fa-solid fa-earth-europe"></i> ${esc(ccText)}</div>`;
-    }
-    if (storyData.temperature || storyData.weather) {
-        let wIcon = "fa-cloud-sun";
-        let w = (storyData.weather || "").toLowerCase();
-        if (w.includes("rain") || w.includes("дожд")) wIcon = "fa-cloud-rain";
-        else if (w.includes("snow") || w.includes("снег")) wIcon = "fa-snowflake";
-        else if (w.includes("storm") || w.includes("гроз")) wIcon = "fa-bolt";
-        else if (w.includes("fog") || w.includes("туман")) wIcon = "fa-smog";
-        else if (w.includes("clear") || w.includes("ясн") || w.includes("солн")) wIcon = "fa-sun";
-        else if (w.includes("cloud") || w.includes("облач")) wIcon = "fa-cloud";
-        let tempStr = storyData.temperature && storyData.temperature !== "Unknown" ? `<strong>${esc(storyData.temperature)}</strong>` : "";
-        let weatherStr = storyData.weather && storyData.weather !== "Unknown" ? esc(storyData.weather) : "";
-        let sep = tempStr && weatherStr ? " &nbsp; " : "";
-        h += `<div class="st-hud-row"><i class="fa-solid ${wIcon}"></i> ${tempStr}${sep}${weatherStr}</div>`;
-    }
-    h += `<hr style="border-color:rgba(255,255,255,0.05);margin:5px 0;">`;
-    
-    var hudOutfit = getInventoryOutfit();
-    var hudUserName = (scriptModule && scriptModule.name1) ? scriptModule.name1 : null;
-
-    if (storyData.characters) {
-        storyData.characters.slice(0, 3).forEach(c => {
-            var hudStateText = c.state;
-
-            if (hudOutfit && hudOutfit.userEquipped.length > 0) {
-                var isUser = (hudUserName && c.name.toLowerCase() === hudUserName.toLowerCase()) ||
-                             c.name.toLowerCase() === "вы" ||
-                             c.name === "{{user}}";
-                if (isUser) {
-                    var wearNames = hudOutfit.userEquipped.map(function(it) { return it.name; }).join(", ");
-                    hudStateText += ", wearing " + wearNames;
-                }
-            }
-
-            if (hudOutfit && hudOutfit.charItems.length > 0) {
-                var hudHeld = hudOutfit.charItems.filter(ci => ci.heldBy && ci.heldBy.toLowerCase() === c.name.toLowerCase());
-                if (hudHeld.length > 0) {
-                    var heldNames = hudHeld.map(function(ci) { return ci.name; }).join(", ");
-                    hudStateText += ", holding " + heldNames;
-                }
-            }
-
-            h += '<div class="st-hud-char"><span class="st-hud-char-name">' + esc(c.name) + ':</span> ' + esc(hudStateText) + '</div>';
-        });
-        if (storyData.characters.length > 3) h += '<div style="font-size:9px;opacity:0.5;text-align:center;margin-top:2px;">+ ' + (storyData.characters.length - 3) + ' more</div>';
-    }
-
-    // --- World Summary Section (Only show the summary, no events) ---
-    if (settings.worldEnabled && worldData && worldData.worldSummary && worldData.worldSummary.trim() !== "") {
-        h += `<hr style="border-color:rgba(255,255,255,0.05);margin:5px 0;">`;
-        h += `<div style="font-size:9.5px;font-weight:bold;opacity:0.8;margin-bottom:3px;"><i class="fa-solid fa-earth-americas"></i> World Progression:</div>`;
-        h += `<div class="st-hud-char" style="font-size:9px;line-height:1.2;margin-bottom:3px;white-space:normal;opacity:0.9;font-style:italic;">${esc(worldData.worldSummary)}</div>`;
-    }
-
-    // --- Relationship signal: single most-shifted bond since last analysis ---
-    if (settings.relationsEnabled && relationshipData && relationshipData._initialized &&
-        relationshipData.edges && relationshipData.edges.length > 0) {
-        var relTypeColors = { romance:"#ff69b4", friendship:"#4a9eff", family:"#7dd67d", alliance:"#b39ddb", rivalry:"#ff8c00", hostile:"#ff453a", mentor:"#80deea", neutral:"#888" };
-        var mostChanged = null, biggestDelta = 0;
-        relationshipData.edges.forEach(function(edge) {
-            if (edge.history && edge.history.length > 0) {
-                var delta = Math.abs((edge.strength || 0) - (edge.history[0].strength || 0));
-                if (delta > biggestDelta) { biggestDelta = delta; mostChanged = edge; }
-            }
-        });
-        // Fall back to highest absolute strength edge if no history exists yet
-        if (!mostChanged) {
-            relationshipData.edges.forEach(function(edge) {
-                var s = Math.abs(edge.strength || 0);
-                if (s > biggestDelta) { biggestDelta = s; mostChanged = edge; }
-            });
-        }
-        if (mostChanged) {
-            var relColor = relTypeColors[mostChanged.type] || "#888";
-            var arrow = mostChanged.history && mostChanged.history.length > 0
-                ? ((mostChanged.strength || 0) > (mostChanged.history[0].strength || 0) ? "\u2197" : "\u2198")
-                : "";
-            h += '<hr style="border-color:rgba(255,255,255,0.05);margin:5px 0;">';
-            h += '<div class="st-hud-char" style="font-size:9px;border-left-color:' + relColor + ';white-space:normal;">' +
-                 '<i class="fa-solid fa-share-nodes" style="color:' + relColor + ';margin-right:3px;"></i>' +
-                 '<span style="color:' + relColor + ';font-weight:600;">' + esc(mostChanged.from) + ' \u2194 ' + esc(mostChanged.to) + '</span>' +
-                 (arrow ? ' <span style="opacity:0.75;">' + arrow + ' ' + esc(mostChanged.type) + '</span>' : ' <span style="opacity:0.75;">' + esc(mostChanged.type) + '</span>') +
-                 '</div>';
-        }
-    }
-
-    $("#st-hud-body").html(h);
-}
-
-// --- Chat Button ---
 function buildChatButton() {
     if (!document.getElementById("st-trigger")) {
         var btn = '<div id="st-trigger" class="st-trigger interactable" title="Story Tracker"><i class="fa-solid fa-book-open-reader"></i></div>';
         var $l = $("#leftSendForm"); if ($l.length) $l.append(btn); else $("#send_form").prepend(btn);
-        $(document).on("click", "#st-trigger", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); updateSettingsUI(); });
+        $(document).on("click", "#st-trigger", function() { Persistence.loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); updateSettingsUI(); });
     }
     toggleChatButtonVisibility();
 }
+// --- Custom time-skip phrase chips (settings UI) ------------------------------
+// The setting itself stays a plain newline-joined string (DEFAULT_SETTINGS.
+// customSkipPhrases) — exactly what TimelineEngine.parseCustomSkipPhrases already
+// reads — so Pipeline/detection code is untouched. These helpers are purely how
+// the settings panel renders and edits that string as removable chips.
+function getCustomSkipPhraseList() {
+    return String((Store.settings && Store.settings.customSkipPhrases) || "")
+        .split(/\r?\n/).map(function(s) { return s.trim(); }).filter(Boolean);
+}
 
-// --- Settings UI ---
+function setCustomSkipPhraseList(list) {
+    Store.settings.customSkipPhrases = list.join("\n");
+    Persistence.save();
+    renderCustomSkipChips();
+}
+
+function renderCustomSkipChips() {
+    var $box = $("#st-custom-skip-chips");
+    if (!$box.length) return;
+    var phrases = getCustomSkipPhraseList();
+    if (phrases.length === 0) {
+        $box.html('<small class="st-chip-empty">No custom phrases yet.</small>');
+        return;
+    }
+    // Chips are identified by index, not by matching text back out of the DOM —
+    // avoids any escaping round-trip issues with quotes/entities in phrases.
+    $box.html(phrases.map(function(p, i) {
+        return '<span class="st-chip">' + esc(p) +
+            '<button type="button" class="st-chip-del" data-idx="' + i + '" title="Remove this phrase">&times;</button></span>';
+    }).join(""));
+}
+
 function buildSettingsPanel() {
     var $c = $("#extensions_settings2"); if (!$c.length) $c = $("#extensions_settings"); if (!$c.length) return;
-    var h = '<div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b><i class="fa-solid fa-book-open-reader"></i> Story Tracker</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content">';
+    // st-settings-root scopes style.css's nested-drawer styling (Scene/World/Relationship
+    // sub-sections below) to Story Tracker's own panel only — see style.css. Without it the
+    // selector matched ANY extension's nested inline-drawer inside #extensions_settings.
+    var h = '<div class="inline-drawer st-settings-root"><div class="inline-drawer-toggle inline-drawer-header"><b><i class="fa-solid fa-book-open-reader"></i> Story Tracker</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content">';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-on"><span>Enable Extension</span></label></div>';
     
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-hud"><span>Show HUD Widget</span></label></div>';
     h += '<div class="da-srow" id="st-scale-row"><label><small>HUD Scale: <span id="st-scale-val"></span>%</small></label><input type="range" id="st-s-scale" min="50" max="200" step="5"></div>';
-    
-    h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-chatbtn"><span>Show Icon in Chat Panel</span></label></div>';
-    
-    h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-auto"><span>Auto-update LLM Scene</span></label></div>';
-    h += '<div class="da-srow"><label><small>Update every N msgs: <span id="st-interval-val"></span></small></label><input type="range" id="st-s-interval" min="1" max="20" step="1"></div>';
-    h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-inject"><span>Inject Context into Prompt (Reduces Amnesia)</span></label></div>';
-    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-cityctry"><span>Show City / Country (LLM infers or invents)</span></label></div>';
+    h += '<div class="da-srow" id="st-hud-tint-row"><label class="checkbox_label"><input type="checkbox" id="st-s-hud-tint"><span>Time-of-day tint (HUD color follows the RP clock)</span></label></div>';
 
     // RGB Highlight Colors
     h += '<hr><div class="da-srow"><b>Accent Highlight Color (RGB)</b></div>';
     h += '<div class="da-srow"><small style="opacity:.7">Adjust sliders to customize key titles, icons, and card highlights to match your theme.</small></div>';
-    h += '<div class="da-srow"><label><small>Red: <span id="st-rgb-r-val">' + settings.accentR + '</span></small></label><input type="range" id="st-s-rgb-r" min="0" max="255" step="1" value="' + settings.accentR + '"></div>';
-    h += '<div class="da-srow"><label><small>Green: <span id="st-rgb-g-val">' + settings.accentG + '</span></small></label><input type="range" id="st-s-rgb-g" min="0" max="255" step="1" value="' + settings.accentG + '"></div>';
-    h += '<div class="da-srow"><label><small>Blue: <span id="st-rgb-b-val">' + settings.accentB + '</span></small></label><input type="range" id="st-s-rgb-b" min="0" max="255" step="1" value="' + settings.accentB + '"></div>';
+    h += '<div class="da-srow"><label><small>Red: <span id="st-rgb-r-val">' + Store.settings.accentR + '</span></small></label><input type="range" id="st-s-rgb-r" min="0" max="255" step="1" value="' + Store.settings.accentR + '"></div>';
+    h += '<div class="da-srow"><label><small>Green: <span id="st-rgb-g-val">' + Store.settings.accentG + '</span></small></label><input type="range" id="st-s-rgb-g" min="0" max="255" step="1" value="' + Store.settings.accentG + '"></div>';
+    h += '<div class="da-srow"><label><small>Blue: <span id="st-rgb-b-val">' + Store.settings.accentB + '</span></small></label><input type="range" id="st-s-rgb-b" min="0" max="255" step="1" value="' + Store.settings.accentB + '"></div>';
     h += '<div class="da-srow" style="display:flex; align-items:center; gap:8px;"><small>Preview Color:</small> <span id="st-rgb-preview" style="display:inline-block; width:20px; height:20px; border-radius:50%; border:1px solid rgba(255,255,255,0.2);"></span></div>';
+
+    // Scene Tracker — nested drawer, closed by default. The old separate "General /
+    // Advanced" drawer has been folded in here: connection profile and Time Mode only
+    // ever affected Scene Agent's own behavior in practice (profile is used exclusively
+    // by the Scene Agent + city/country fallback calls; Time Mode decides purely WHEN
+    // Scene Agent fires), so they now live directly alongside Scene Tracker's other
+    // settings instead of a separate catch-all drawer. Chat-icon visibility and the
+    // post-response delay are genuinely extension-wide (not scene-specific), but this
+    // is now the only advanced-settings drawer, so they're kept here too rather than
+    // having nowhere to live.
+    h += '<hr><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b><i class="fa-solid fa-clapperboard"></i> Scene Tracker</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content" style="display:none;">';
+    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-auto"><span>Auto-update Scene</span></label></div>';
+    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-cityctry"><span>Show City / Country (LLM infers or invents)</span></label></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">Enabling also injects scene context into prompts automatically.</small></div>';
+
+    h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-chatbtn"><span>Show Icon in Chat Panel</span></label></div>';
 
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-useprofile"><span>Use a separate Connection Profile for analysis</span></label></div>';
     h += '<div class="da-srow" id="st-profile-row"><label><small>Analysis Profile:</small></label>';
@@ -3371,30 +2132,75 @@ function buildSettingsPanel() {
     h += '<div class="da-srow"><small style="opacity:.7">Delay before extension starts after a response. Increase on slow devices (e.g. Termux) if you get concurrent request errors.</small></div>';
     h += '<div class="da-srow"><label><small>Post-response delay: <span id="st-s-delay-val"></span>ms</small></label><input type="range" id="st-s-startup-delay" min="500" max="8000" step="500"></div>';
 
-    // World Agent Settings Element Bindings
-    h += '<hr><div class="da-srow"><b>World Progression Settings</b></div>';
+    // Time Mode — a single checkbox switches between the two, both fully LLM-driven.
+    // Unchecked = Message Mode (cadence slider shown). Checked = Smart Time (its own
+    // big-jump sub-setting shown instead). The clock's flat 1-min/message tick underneath
+    // runs regardless — this only decides which trigger overrides it with a real duration.
+    h += '<hr><div class="da-srow"><b>Time Mode</b></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">The LLM always determines the real elapsed time — this just decides how it gets triggered.</small></div>';
+    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-smart-time"><span>Smart Time (event-driven — calls the LLM only when it spots real time-skip language)</span></label></div>';
+    h += '<div class="da-srow" id="st-message-mode-row" style="padding-left:20px;">';
+    h += '  <small style="opacity:.7">Message Mode: reviews everything since the last check-in every few messages.</small>';
+    h += '  <label><small>Review every <span id="st-s-msg-interval-val"></span> messages</small></label><input type="range" id="st-s-msg-interval" min="2" max="20" step="1">';
+    h += '</div>';
+    h += '<div class="da-srow" id="st-smart-time-sub-row" style="padding-left:14px;border-left:2px solid rgba(255,255,255,0.08); display:none;">';
+    h += '  <small style="opacity:.7">Fallback cadence, in case skip-language is never detected.</small>';
+    h += '  <label><small><span id="st-scene-interval-label">Scene tier interval (RP-minutes)</span>: <span id="st-interval-val"></span></small></label><input type="number" id="st-s-interval" class="text_pole" min="1" style="width:100%">';
+    h += '  <label style="margin-top:8px;"><small>Extra time-skip phrases</small></label>';
+    h += '  <div id="st-custom-skip-chips" class="st-chip-list"></div>';
+    h += '  <div class="st-chip-input-row">';
+    h += '    <input type="text" id="st-s-custom-skip-input" class="text_pole" placeholder="e.g. три дня спустя — press Enter to add" style="flex:1;">';
+    h += '    <button type="button" class="menu_button" id="st-s-custom-skip-add" title="Add phrase" style="flex:0 0 auto;"><i class="fa-solid fa-plus"></i></button>';
+    h += '  </div>';
+    h += '  <small style="opacity:.7">Fires the Smart Time check when a message contains one of these (typo-tolerant). The built-in detection is English-only, so for non-English stories these phrases are the ONLY skip trigger — add your language\'s common time-skip wording here.</small>';
+    h += '</div>';
+    h += '</div></div>'; // end Scene Tracker nested drawer (now also covers former General/Advanced settings)
+
+    // World Agent Settings — nested drawer, closed by default, so the main panel doesn't
+    // dump every tier's cadence slider in the user's face all at once.
+    h += '<div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b><i class="fa-solid fa-earth-americas"></i> World Agent Settings</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content" style="display:none;">';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-world-on"><span>Enable World Agent</span></label></div>';
-    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-world-inject"><span>Inject World Context</span></label></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">Enabling also injects its context into prompts — there\'s no separate inject toggle anymore.</small></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-world-useprofile"><span>Use Separate Connection Profile</span></label></div>';
     
     h += '<div class="da-srow" id="st-world-profile-row"><label><small>Analysis Profile:</small></label>';
     h += '<div style="display:flex;gap:5px;align-items:center;"><select id="st-s-world-profile" class="text_pole" style="flex:1"></select>';
     h += '<button class="menu_button" id="st-s-world-profile-refresh" title="Refresh profile list" style="flex:0 0 auto;"><i class="fa-solid fa-rotate"></i></button></div></div>';
 
-    h += '<div class="da-srow"><label><small>World Tick Frequency:</small></label>';
-    h += '<select id="st-s-world-freq" class="text_pole" style="width:100%">' +
-         '<option value="1h">Every RP Hour</option>' +
-         '<option value="3h">Every 3 RP Hours</option>' +
-         '<option value="1d">Every RP Day</option>' +
-         '<option value="manual">Manual Only</option>' +
-         '</select></div>';
+    // The old single "World Tick Frequency" dropdown is gone — the World Agent is now 4
+    // independent tiers (npc/weather/faction/world), each with its own RP-time cadence, run
+    // by the Scheduler. Exposed here as advanced sub-settings under the single World toggle,
+    // per the "3 categories, tiers internal" decision.
+    h += '<div class="da-srow"><b><small id="st-tier-cadence-label">Tier Update Cadence (RP-minutes)</small></b></div>';
+    h += '<div class="da-srow"><label><small>NPC behavior (fast, offscreen activity):</small></label>' +
+         '<input type="number" id="st-s-npc-tier-minutes" class="text_pole" min="1" style="width:100%"></div>';
+    h += '<div class="da-srow"><label><small>Regional weather trend:</small></label>' +
+         '<input type="number" id="st-s-weather-tier-minutes" class="text_pole" min="1" style="width:100%"></div>';
+    h += '<div class="da-srow"><label><small>Faction/plot events:</small></label>' +
+         '<input type="number" id="st-s-faction-tier-minutes" class="text_pole" min="1" style="width:100%"></div>';
+    h += '<div class="da-srow"><label><small>World summary synthesis (slow, daily by default):</small></label>' +
+         '<input type="number" id="st-s-world-tier-minutes" class="text_pole" min="1" style="width:100%"></div>';
 
-    h += '<div class="da-srow" id="st-max-ticks-row"><label><small>Maximum Tick Catchup: <span id="st-max-ticks-val"></span></small></label>' +
+    h += '<div class="da-srow" id="st-max-ticks-row"><label><small>Maximum Tick Catchup (per tier): <span id="st-max-ticks-val"></span></small></label>' +
          '<input type="range" id="st-s-max-ticks" min="1" max="24" step="1"></div>';
 
-    // Relationship Tracker Settings
-    h += '<hr><div class="da-srow"><b>Relationship Tracker</b></div>';
-    h += '<div class="da-srow"><small style="opacity:.7">Tracks character bonds and how they evolve. Runs on its own message interval using checkpoints \u2014 only new messages since the last analysis are sent each time.</small></div>';
+    h += '<div class="inline-drawer" style="margin-top:6px;"><div class="inline-drawer-toggle inline-drawer-header"><b><small>Advanced</small></b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content" style="display:none;">';
+    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-world-parallel"><span>Run due tiers in parallel</span></label></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">When several tiers are due on the same message, run NPC/Weather/Faction at the same time instead of one after another (World still waits for Faction to finish, since it reads Faction\'s fresh output). Faster, but sends multiple LLM calls at once — leave off if you\'re on a tight per-minute rate limit.</small></div>';
+    h += '<div class="da-srow"><label><small>Seasonal grounding:</small></label>' +
+         '<select id="st-s-season-hemisphere" class="text_pole" style="width:100%">' +
+         '<option value="northern">Northern hemisphere</option>' +
+         '<option value="southern">Southern hemisphere</option>' +
+         '<option value="none">Off (no real-calendar mapping)</option>' +
+         '</select></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">Feeds the current real-calendar season (from the RP date) into the Weather and World tier prompts as light grounding context. Turn off for settings with their own fictional calendar.</small></div>';
+    h += '</div></div>'; // end Advanced sub-drawer
+
+    h += '</div></div>'; // end World Agent nested drawer
+
+    // Relationship Tracker Settings — nested drawer, closed by default
+    h += '<div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b><i class="fa-solid fa-people-arrows"></i> Relationship Tracker</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content" style="display:none;">';
+    h += '<div class="da-srow"><small style="opacity:.7">Tracks character bonds and how they evolve on its own message interval.</small></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-rel-on"><span>Enable Relationship Tracker</span></label></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-rel-auto"><span>Auto-analyze on interval</span></label></div>';
     h += '<div class="da-srow" id="st-rel-interval-row"><label><small>Analyze every N messages: <span id="st-rel-interval-val"></span></small></label><input type="range" id="st-s-rel-interval" min="1" max="20" step="1"></div>';
@@ -3402,173 +2208,255 @@ function buildSettingsPanel() {
     h += '<div class="da-srow" id="st-rel-profile-row"><label><small>Relationship Profile:</small></label>';
     h += '<div style="display:flex;gap:5px;align-items:center;"><select id="st-s-rel-profile" class="text_pole" style="flex:1"></select>';
     h += '<button class="menu_button" id="st-s-rel-profile-refresh" title="Refresh profile list" style="flex:0 0 auto;"><i class="fa-solid fa-rotate"></i></button></div></div>';
-    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-rel-inject"><span>Inject Relationship Context into Prompts</span></label></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">Enabling above also injects relationship context into prompts automatically.</small></div>';
+    h += '</div></div>'; // end Relationship nested drawer
 
     h += '<hr><div class="da-srow da-srow-btns"><input type="button" class="menu_button" id="st-s-open" value="Open Tracker"></div></div></div>';
     $c.append(h);
 
-    $("#st-s-on").prop("checked", settings.enabled).on("change", function() { 
-        settings.enabled = this.checked; save(); renderHUD(); toggleChatButtonVisibility();
+    $("#st-s-on").prop("checked", Store.settings.enabled).on("change", function() { 
+        Store.settings.enabled = this.checked; Persistence.save(); HUD.renderHUD(); toggleChatButtonVisibility();
+        Pipeline.injectContextToChat(); // sync (or clear) the injected prompt immediately, don't wait for the next message
     });
     
-    $("#st-s-hud").prop("checked", settings.showHUD).on("change", function() { 
-        settings.showHUD = this.checked; save(); renderHUD(); 
+    $("#st-s-hud").prop("checked", Store.settings.showHUD).on("change", function() {
+        Store.settings.showHUD = this.checked; Persistence.save(); HUD.renderHUD();
         $("#st-scale-row").toggle(this.checked);
+        $("#st-hud-tint-row").toggle(this.checked);
     });
-    $("#st-scale-row").toggle(settings.showHUD);
+    $("#st-scale-row").toggle(Store.settings.showHUD);
+    $("#st-hud-tint-row").toggle(Store.settings.showHUD);
+
+    $("#st-s-hud-tint").prop("checked", Store.settings.hudTimeTint !== false).on("change", function() {
+        Store.settings.hudTimeTint = this.checked;
+        Persistence.save();
+        HUD.renderHUD();
+    });
+
+    // Bound here, once — updateSettingsUI only syncs the displayed value (see the
+    // note there about the duplicate-handler bug this replaces).
+    $("#st-s-startup-delay").on("input", function() {
+        Store.settings.startupDelay = parseInt(this.value, 10);
+        $("#st-s-delay-val").text(this.value);
+        Persistence.save();
+    });
     
-    $("#st-s-scale").val(settings.hudScale).on("input", function() { 
-        settings.hudScale = parseInt(this.value, 10); 
+    $("#st-s-scale").val(Store.settings.hudScale).on("input", function() { 
+        Store.settings.hudScale = parseInt(this.value, 10); 
         $("#st-scale-val").text(this.value); 
-        save(); 
-        applyHudStyle(); 
+        Persistence.save(); 
+        HUD.applyHudStyle(); 
     });
-    $("#st-scale-val").text(settings.hudScale);
+    $("#st-scale-val").text(Store.settings.hudScale);
     
-    $("#st-s-chatbtn").prop("checked", settings.showChatButton).on("change", function() {
-        settings.showChatButton = this.checked; 
-        save(); 
+    $("#st-s-chatbtn").prop("checked", Store.settings.showChatButton).on("change", function() {
+        Store.settings.showChatButton = this.checked; 
+        Persistence.save(); 
         toggleChatButtonVisibility(); 
     });
     
     $("#st-s-auto").on("change", function() { 
         let val = this.checked;
-        if (storyData) {
-            storyData.autoUpdate = val;
-            saveStoryData();
+        if (Store.storyData) {
+            Store.storyData.autoUpdate = val;
+            Persistence.saveStoryData();
         }
-        settings.autoUpdate = val; // Also acts as default for future chats
-        save(); 
+        Store.settings.autoUpdate = val; // Also acts as default for future chats
+        Persistence.save(); 
         renderModal(); 
     });
 
-    // Initialize the slider's default value and label value from settings, then bind the input event
-    $("#st-s-interval").val(settings.autoUpdateInterval).on("input", function() { 
-        let val = parseInt(this.value, 10); 
+    // Scene is now a time-based Scheduler tier (RP-minutes), not a message-count interval.
+    // Changing it resets the scene tier's accumulator so the new cadence is honored
+    // immediately, same "no save-and-reload needed" behavior established for the old
+    // message-count sliders.
+    $("#st-s-interval").val(Store.settings.sceneTierMinutes).on("input", function() { 
+        let val = Math.max(1, parseInt(this.value, 10) || 1); 
         $("#st-interval-val").text(val); 
-        // Reset the message counter so the new interval is honored from this point forward,
-        // instead of waiting for msgCounter to naturally re-align to a multiple of the new value.
-        msgCounter = 0;
-        if (storyData) {
-            storyData.autoUpdateInterval = val;
-            saveStoryData();
+        Store.settings.sceneTierMinutes = val;
+        if (Store.worldData && Store.worldData._schedulerAccumulated) {
+            Store.worldData._schedulerAccumulated.scene = 0;
+            Persistence.saveWorldData();
         }
-        settings.autoUpdateInterval = val; // Also acts as default for future chats
-        save(); 
+        Persistence.save(); 
         renderModal(); 
         renderAutoInfo();
     });
-    $("#st-interval-val").text(settings.autoUpdateInterval);
+    $("#st-interval-val").text(Store.settings.sceneTierMinutes);
     
-    $("#st-s-inject").prop("checked", settings.injectToContext).on("change", function() { settings.injectToContext = this.checked; save(); });
-    $("#st-s-cityctry").prop("checked", settings.showCityCountry).on("change", function() { settings.showCityCountry = this.checked; save(); renderModal(); renderHUD(); });
+    $("#st-s-cityctry").prop("checked", Store.settings.showCityCountry).on("change", function() { Store.settings.showCityCountry = this.checked; Persistence.save(); renderModal(); HUD.renderHUD(); });
+
+    $("#st-s-smart-time").on("change", function() {
+        Store.settings.timeMode = this.checked ? "smart" : "message";
+        Persistence.save();
+        $("#st-message-mode-row").toggle(!this.checked);
+        $("#st-smart-time-sub-row").toggle(this.checked);
+        renderAutoInfo();
+    });
+    $("#st-s-msg-interval").val(Store.settings.messageModeInterval || 5).on("input", function() {
+        Store.settings.messageModeInterval = parseInt(this.value, 10);
+        $("#st-s-msg-interval-val").text(this.value);
+        Persistence.save();
+    });
+    $("#st-s-msg-interval-val").text(Store.settings.messageModeInterval || 5);
+
+    // Chip-style editor for the custom skip phrases — see the helpers above
+    // buildSettingsPanel. Caps mirror parseCustomSkipPhrases (80 chars/phrase,
+    // 50 phrases): anything past those would be silently ignored by the parser
+    // anyway, so it's clearer to stop it at entry with feedback.
+    function addCustomSkipPhraseFromInput() {
+        var $input = $("#st-s-custom-skip-input");
+        var phrase = String($input.val() || "").trim().slice(0, 80);
+        if (!phrase) return;
+        var phrases = getCustomSkipPhraseList();
+        if (phrases.length >= 50) {
+            if (typeof toastr !== "undefined") toastr.warning("Phrase list is full (50 max) — remove one first.");
+            return;
+        }
+        var lower = phrase.toLowerCase();
+        if (phrases.some(function(p) { return p.toLowerCase() === lower; })) {
+            if (typeof toastr !== "undefined") toastr.info("That phrase is already in the list.");
+            $input.val("");
+            return;
+        }
+        phrases.push(phrase);
+        setCustomSkipPhraseList(phrases);
+        $input.val("").focus();
+    }
+    $("#st-s-custom-skip-add").on("click", addCustomSkipPhraseFromInput);
+    $("#st-s-custom-skip-input").on("keydown", function(e) {
+        if (e.key === "Enter") { e.preventDefault(); addCustomSkipPhraseFromInput(); }
+    });
+    // Delegated from the (static) container — the chips inside are re-rendered
+    // on every add/remove, so binding them directly would go stale.
+    $("#st-custom-skip-chips").on("click", ".st-chip-del", function() {
+        var idx = parseInt($(this).attr("data-idx"), 10);
+        var phrases = getCustomSkipPhraseList();
+        if (isNaN(idx) || idx < 0 || idx >= phrases.length) return;
+        phrases.splice(idx, 1);
+        setCustomSkipPhraseList(phrases);
+    });
+    renderCustomSkipChips();
 
     // RGB Slider Bindings
     $("#st-s-rgb-r").on("input", function() {
-        settings.accentR = parseInt(this.value, 10);
+        Store.settings.accentR = parseInt(this.value, 10);
         $("#st-rgb-r-val").text(this.value);
-        save();
+        Persistence.save();
         applyCustomAccentColor();
     });
     $("#st-s-rgb-g").on("input", function() {
-        settings.accentG = parseInt(this.value, 10);
+        Store.settings.accentG = parseInt(this.value, 10);
         $("#st-rgb-g-val").text(this.value);
-        save();
+        Persistence.save();
         applyCustomAccentColor();
     });
     $("#st-s-rgb-b").on("input", function() {
-        settings.accentB = parseInt(this.value, 10);
+        Store.settings.accentB = parseInt(this.value, 10);
         $("#st-rgb-b-val").text(this.value);
-        save();
+        Persistence.save();
         applyCustomAccentColor();
     });
 
-    $("#st-s-useprofile").prop("checked", settings.useConnectionProfile).on("change", function() {
-        settings.useConnectionProfile = this.checked;
-        save();
+    $("#st-s-useprofile").prop("checked", Store.settings.useConnectionProfile).on("change", function() {
+        Store.settings.useConnectionProfile = this.checked;
+        Persistence.save();
         $("#st-profile-row").toggle(this.checked);
     });
-    $("#st-profile-row").toggle(settings.useConnectionProfile);
+    $("#st-profile-row").toggle(Store.settings.useConnectionProfile);
     // Save the selected scene analysis profile whenever it changes
-    $("#st-s-profile").on("change", function() { settings.connectionProfile = this.value; save(); });
+    $("#st-s-profile").on("change", function() { Store.settings.connectionProfile = this.value; Persistence.save(); });
     $("#st-s-profile-refresh").on("click", function() {
         populateProfileDropdown();
         if (typeof toastr !== "undefined") toastr.info("Connection profile list refreshed.");
     });
 
     // World Agent Settings Element Bindings
-    $("#st-s-world-on").prop("checked", settings.worldEnabled).on("change", function() {
-        settings.worldEnabled = this.checked; save(); renderHUD(); renderModal(); renderAutoInfo();
+    $("#st-s-world-on").prop("checked", Store.settings.worldEnabled).on("change", function() {
+        Store.settings.worldEnabled = this.checked; Persistence.save(); HUD.renderHUD(); renderModal(); renderAutoInfo();
+        Pipeline.injectContextToChat(); // sync the injected prompt immediately, don't wait for the next message
     });
-    $("#st-s-world-inject").prop("checked", settings.injectWorldContext).on("change", function() {
-        settings.injectWorldContext = this.checked; save();
+    $("#st-s-world-useprofile").prop("checked", Store.settings.useWorldProfile).on("change", function() {
+        Store.settings.useWorldProfile = this.checked; Persistence.save();
+        $("#st-world-profile-row").toggle(Store.settings.useWorldProfile);
     });
-    $("#st-s-world-useprofile").prop("checked", settings.useWorldProfile).on("change", function() {
-        settings.useWorldProfile = this.checked; save();
-        $("#st-world-profile-row").toggle(settings.useWorldProfile);
-    });
-    $("#st-world-profile-row").toggle(settings.useWorldProfile);
+    $("#st-world-profile-row").toggle(Store.settings.useWorldProfile);
 
-    $("#st-s-world-profile").on("change", function() { settings.worldConnectionProfile = this.value; save(); });
+    $("#st-s-world-profile").on("change", function() { Store.settings.worldConnectionProfile = this.value; Persistence.save(); });
     $("#st-s-world-profile-refresh").on("click", function() {
         populateProfileDropdown();
         if (typeof toastr !== "undefined") toastr.info("Connection profile list refreshed.");
     });
 
-    $("#st-s-world-freq").val(settings.worldTickFrequency).on("change", function() {
-        settings.worldTickFrequency = this.value; save();
-        renderAutoInfo();
-    });
+    // Scheduler tier intervals (npc/weather/faction/world) — internal to the single World
+    // toggle. Changing these takes effect immediately, same "no save-and-reload needed"
+    // behavior as the scene/relationship interval sliders established earlier.
+    function bindTierMinutesInput(selector, settingKey) {
+        $(selector).val(Store.settings[settingKey]).on("input", function() {
+            var val = Math.max(1, parseInt(this.value, 10) || 1);
+            Store.settings[settingKey] = val;
+            Persistence.save();
+            renderAutoInfo();
+        });
+    }
+    bindTierMinutesInput("#st-s-npc-tier-minutes", "npcTierMinutes");
+    bindTierMinutesInput("#st-s-weather-tier-minutes", "weatherTierMinutes");
+    bindTierMinutesInput("#st-s-faction-tier-minutes", "factionTierMinutes");
+    bindTierMinutesInput("#st-s-world-tier-minutes", "worldTierMinutes");
 
-    $("#st-s-max-ticks").val(settings.maxWorldTicks).on("input", function() {
-        settings.maxWorldTicks = parseInt(this.value, 10);
+    $("#st-s-max-ticks").val(Store.settings.maxWorldTicks).on("input", function() {
+        Store.settings.maxWorldTicks = parseInt(this.value, 10);
         $("#st-max-ticks-val").text(this.value);
-        save();
+        Persistence.save();
     });
-    $("#st-max-ticks-val").text(settings.maxWorldTicks);
+    $("#st-max-ticks-val").text(Store.settings.maxWorldTicks);
+
+    $("#st-s-world-parallel").prop("checked", Store.settings.parallelWorldTiers).on("change", function() {
+        Store.settings.parallelWorldTiers = this.checked; Persistence.save();
+    });
+    $("#st-s-season-hemisphere").val(Store.settings.seasonHemisphere || "northern").on("change", function() {
+        Store.settings.seasonHemisphere = this.value; Persistence.save();
+    });
 
     // Relationship Tracker Settings Element Bindings
-    $("#st-s-rel-on").prop("checked", settings.relationsEnabled).on("change", function() {
-        settings.relationsEnabled = this.checked; save(); renderHUD(); renderModal(); renderAutoInfo();
+    $("#st-s-rel-on").prop("checked", Store.settings.relationsEnabled).on("change", function() {
+        Store.settings.relationsEnabled = this.checked; Persistence.save(); HUD.renderHUD(); renderModal(); renderAutoInfo();
+        Pipeline.injectContextToChat(); // sync the injected prompt immediately, don't wait for the next message
     });
-    $("#st-s-rel-auto").prop("checked", settings.relationsAutoUpdate).on("change", function() {
-        settings.relationsAutoUpdate = this.checked; save();
+    $("#st-s-rel-auto").prop("checked", Store.settings.relationsAutoUpdate).on("change", function() {
+        Store.settings.relationsAutoUpdate = this.checked; Persistence.save();
         $("#st-rel-interval-row").toggle(this.checked);
         renderAutoInfo();
     });
-    $("#st-rel-interval-row").toggle(settings.relationsAutoUpdate);
-    $("#st-s-rel-interval").val(settings.relAutoInterval || 5).on("input", function() {
-        settings.relAutoInterval = parseInt(this.value, 10);
+    $("#st-rel-interval-row").toggle(Store.settings.relationsAutoUpdate);
+    $("#st-s-rel-interval").val(Store.settings.relAutoInterval || 5).on("input", function() {
+        Store.settings.relAutoInterval = parseInt(this.value, 10);
         $("#st-rel-interval-val").text(this.value);
         // Reset the relationship message counter so the new interval is honored from this point
         // forward, instead of waiting for relMsgCounter to naturally re-align to a multiple of it.
-        relMsgCounter = 0;
-        if (storyData) {
-            storyData._relMsgCount = 0;
-            saveStoryData();
+        Store.setRelMsgCounter(0);
+        if (Store.storyData) {
+            Store.storyData._relMsgCount = 0;
+            Persistence.saveStoryData();
         }
-        save();
+        Persistence.save();
         renderAutoInfo();
     });
-    $("#st-rel-interval-val").text(settings.relAutoInterval || 5);
-    $("#st-s-rel-useprofile").prop("checked", settings.useRelProfile).on("change", function() {
-        settings.useRelProfile = this.checked; save();
+    $("#st-rel-interval-val").text(Store.settings.relAutoInterval || 5);
+    $("#st-s-rel-useprofile").prop("checked", Store.settings.useRelProfile).on("change", function() {
+        Store.settings.useRelProfile = this.checked; Persistence.save();
         $("#st-rel-profile-row").toggle(this.checked);
     });
-    $("#st-rel-profile-row").toggle(settings.useRelProfile);
-    $("#st-s-rel-profile").on("change", function() { settings.relConnectionProfile = this.value; save(); });
+    $("#st-rel-profile-row").toggle(Store.settings.useRelProfile);
+    $("#st-s-rel-profile").on("change", function() { Store.settings.relConnectionProfile = this.value; Persistence.save(); });
     $("#st-s-rel-profile-refresh").on("click", function() {
         populateProfileDropdown();
         if (typeof toastr !== "undefined") toastr.info("Connection profile list refreshed.");
     });
-    $("#st-s-rel-inject").prop("checked", settings.injectRelationsContext).on("change", function() {
-        settings.injectRelationsContext = this.checked; save();
-        if (settings.enabled && settings.injectToContext) injectContextToChat();
-    });
 
     populateProfileDropdown();
 
-    $("#st-s-open").on("click", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); });
+    $("#st-s-open").on("click", function() { Persistence.loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); });
 
     updateSettingsUI();
 }
@@ -3576,7 +2464,7 @@ function buildSettingsPanel() {
 function toggleChatButtonVisibility() {
     var $trigger = $("#st-trigger");
     if ($trigger.length) {
-        if (settings.enabled && settings.showChatButton) {
+        if (Store.settings.enabled && Store.settings.showChatButton) {
             $trigger.show();
         } else {
             $trigger.hide();
@@ -3584,91 +2472,153 @@ function toggleChatButtonVisibility() {
     }
 }
 
-// --- Check and Run World Ticks ---
-async function checkAndRunWorldTicks() {
-    if (!settings.worldEnabled || anyBusy() || !worldData || !storyData || !storyData._initialized) return;
+function populateProfileDropdown() {
+    var profiles = ProfileSession.getProfileList();
 
-    var curTime = storyData.time;
-    var curDate = storyData.date;
-
-    var curDateObj = parseRpDateTime(curTime, curDate);
-    if (!curDateObj) return;
-
-    var lastTime = worldData.lastTickTime;
-    var lastDate = worldData.lastTickDate;
-
-    if (!lastTime || !lastDate) {
-        // First tick baseline setup
-        worldData.lastTickTime = curTime;
-        worldData.lastTickDate = curDate;
-        saveWorldData();
-        return;
-    }
-
-    var lastDateObj = parseRpDateTime(lastTime, lastDate);
-    if (!lastDateObj) return;
-
-    var diffMs = curDateObj.getTime() - lastDateObj.getTime();
-    if (diffMs <= 0) return;
-
-    var diffHours = diffMs / (1000 * 60 * 60);
-
-    var thresholdHours = 1;
-    if (settings.worldTickFrequency === "3h") thresholdHours = 3;
-    else if (settings.worldTickFrequency === "1d") thresholdHours = 24;
-    else if (settings.worldTickFrequency === "manual") return; 
-
-    if (diffHours < thresholdHours) return;
-
-    var ticksToRun = Math.floor(diffHours / thresholdHours);
-    if (ticksToRun > settings.maxWorldTicks) {
-        ticksToRun = settings.maxWorldTicks; 
-    }
-
-    console.log(`[Story Tracker] Time progression detected (${diffHours.toFixed(2)}h). Running ${ticksToRun} World Agent tick(s).`);
-
-    // Set the busy lock synchronously, BEFORE any await below, so a rapid second call to this
-    // function (e.g. the next chat message arriving while this tick is still in flight) can't
-    // slip past the anyBusy() guard at the top while a tick is genuinely running.
-    worldBusy = true;
-    // Feedback lives here, not in the caller, so it only ever appears when a tick is actually
-    // about to run — not on every message check, most of which are no-ops (no time has passed
-    // in-RP yet, e.g. the Scene Tracker hasn't extracted an updated date this turn).
-    setHudStatus("World...");
-    if (typeof toastr !== "undefined") toastr.info("Story Tracker: Running world tick...", "", { timeOut: 0, extendedTimeOut: 0 });
-    try {
-        if (ticksToRun === 1) {
-            // Single tick - use the standard one-call-per-tick path
-            var tickTimeOffsetMs = thresholdHours * 60 * 60 * 1000;
-            var tickDateObj = new Date(lastDateObj.getTime() + tickTimeOffsetMs);
-            var tickTimeStr = padZero(tickDateObj.getHours()) + ":" + padZero(tickDateObj.getMinutes());
-            var tickDateStr = padZero(tickDateObj.getDate()) + "/" + padZero(tickDateObj.getMonth() + 1) + "/" + tickDateObj.getFullYear();
-            await runSingleWorldTick(tickTimeStr, tickDateStr);
+    // Context Analysis Profile
+    var $sel = $("#st-s-profile");
+    if ($sel.length) {
+        var html = '<option value="">— Use current / main profile —</option>';
+        if (profiles.length === 0) {
+            html += '<option value="" disabled>(No profiles found — install/enable Connection Profiles)</option>';
         } else {
-            // Multiple ticks needed (catchup) - batch them into ONE LLM call instead of
-            // calling runSingleWorldTick repeatedly. Saves cost/time while still asking
-            // for one event per interval so the world progresses logically, not vaguely.
-            var intervalList = [];
-            for (var i = 0; i < ticksToRun; i++) {
-                var ivOffsetMs = (i + 1) * thresholdHours * 60 * 60 * 1000;
-                var ivDateObj = new Date(lastDateObj.getTime() + ivOffsetMs);
-                intervalList.push({
-                    time: padZero(ivDateObj.getHours()) + ":" + padZero(ivDateObj.getMinutes()),
-                    date: padZero(ivDateObj.getDate()) + "/" + padZero(ivDateObj.getMonth() + 1) + "/" + ivDateObj.getFullYear()
+            profiles.forEach(function (p) {
+                var name = p && p.name ? p.name : "";
+                if (!name) return;
+                html += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
+            });
+        }
+        $sel.html(html);
+        var saved = Store.settings.connectionProfile || "";
+        if (saved && profiles.some(function (p) { return p.name === saved; })) {
+            $sel.val(saved);
+        } else if (saved && profiles.length > 0) {
+            $sel.val("");
+        }
+    }
+
+    // World Agent Profile
+    var $selWorld = $("#st-s-world-profile");
+    if ($selWorld.length) {
+        var htmlWorld = '<option value="">— Use current / main profile —</option>';
+        if (profiles.length === 0) {
+            htmlWorld += '<option value="" disabled>(No profiles found)</option>';
+        } else {
+            profiles.forEach(function (p) {
+                var name = p && p.name ? p.name : "";
+                if (!name) return;
+                htmlWorld += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
+            });
+        }
+        $selWorld.html(htmlWorld);
+        var savedWorld = Store.settings.worldConnectionProfile || "";
+        if (savedWorld && profiles.some(function (p) { return p.name === savedWorld; })) {
+            $selWorld.val(savedWorld);
+        } else if (savedWorld && profiles.length > 0) {
+            $selWorld.val("");
+        }
+    }
+
+    // Relationship Tracker Profile
+    var $selRel = $("#st-s-rel-profile");
+    if ($selRel.length) {
+        var htmlRel = '<option value="">- Use current / main profile -</option>';
+        if (profiles.length === 0) {
+            htmlRel += '<option value="" disabled>(No profiles found)</option>';
+        } else {
+            profiles.forEach(function (p) {
+                var name = p && p.name ? p.name : "";
+                if (!name) return;
+                htmlRel += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
+            });
+        }
+        $selRel.html(htmlRel);
+        var savedRel = Store.settings.relConnectionProfile || "";
+        if (savedRel && profiles.some(function (p) { return p.name === savedRel; })) {
+            $selRel.val(savedRel);
+        } else if (savedRel && profiles.length > 0) {
+            $selRel.val("");
+        }
+    }
+}
+function syncToCharTracker() {
+    try {
+        var meta = Store.scriptModule ? Store.scriptModule.chat_metadata : null;
+        if (!meta) return;
+        var ct = meta["char_tracker"];
+        if (!ct) return; 
+
+        var day = 1, month = 1, year = 2024;
+        var parts = (Store.storyData.date || "").split(/[\/\-\.]/);
+        if (parts.length >= 3) {
+            day   = parseInt(parts[0], 10) || 1;
+            month = parseInt(parts[1], 10) || 1;
+            year  = parseInt(parts[2], 10) || 2024;
+        }
+
+        // sharedTime always lives at the top level regardless of group/solo — only
+        // location (below) differs per-character in a group chat.
+        var container = ct;
+        if (!container.sharedTime) container.sharedTime = {};
+        container.sharedTime.time  = Store.storyData.time  || "--:--";
+        container.sharedTime.day   = day;
+        container.sharedTime.month = month;
+        container.sharedTime.year  = year;
+        container._timeInitialized = true;
+
+        if (ct._isGroup) {
+            var activeChar = ct._activeChar;
+            if (activeChar && ct.characters && ct.characters[activeChar]) {
+                ct.characters[activeChar].location = Store.storyData.location;
+            }
+        } else {
+            ct.location = Store.storyData.location;
+        }
+
+        if (typeof Store.saveMetaFn === "function")
+            Store.saveMetaFn();
+        else if (typeof Store.scriptModule.saveMetadataDebounced === "function")
+            Store.scriptModule.saveMetadataDebounced();
+
+        console.log("[Story Tracker] Synced time/location → Character Tracker");
+        $(document).trigger("CT_FORCE_RENDER");
+    } catch(e) { console.error("[Story Tracker] syncToCharTracker error:", e); }
+}
+var INV_SLOTS        = ["head","torso","legs","feet","hands","lefthand","righthand","accessory1","accessory2"];
+var INV_SLOT_LABELS  = { head:"Head", torso:"Torso", legs:"Legs", feet:"Feet", hands:"Hands", lefthand:"Left Hand", righthand:"Right Hand", accessory1:"Accessory 1", accessory2:"Accessory 2" };
+var INV_SLOT_ICONS  = { head:"🎩", torso:"👕", legs:"👖", feet:"👟", hands:"🧤", lefthand:"🤚", righthand:"右手", accessory1:"💍", accessory2:"💍" };
+
+function getInventoryOutfit() {
+    try {
+        var meta = Store.scriptModule ? Store.scriptModule.chat_metadata : null;
+        if (!meta) return null;
+        var inv = meta["inv_data"];
+        if (!inv || !inv.equipped) return null;
+
+        var eq = inv.equipped;
+
+        var userEquipped = [];
+        for (var i = 0; i < INV_SLOTS.length; i++) {
+            var sl = INV_SLOTS[i];
+            var it = eq[sl];
+            if (it && !it._mirror) {
+                userEquipped.push({
+                    slot:  sl,
+                    label: INV_SLOT_LABELS[sl],
+                    icon:  INV_SLOT_ICONS[sl],
+                    name:  it.name || "?",
+                    description: it.description || ""
                 });
             }
-            var lastInterval = intervalList[intervalList.length - 1];
-            await runBatchWorldTick(intervalList, lastTime, lastDate, lastInterval.time, lastInterval.date);
         }
-        renderModal(); renderHUD();
-        clearHudStatus();
-        if (typeof toastr !== "undefined") { toastr.clear(); toastr.info(`World simulated: ${ticksToRun} tick(s) processed.`); }
 
-    } catch(e) {
-        console.error("[Story Tracker] World tick evaluation crashed:", e);
-        clearHudStatus();
-        if (typeof toastr !== "undefined") { toastr.clear(); toastr.error("World tick failed: " + e.message); }
-    } finally {
-        worldBusy = false;
+        var charItems = (inv.charItems || []).map(function(ci) {
+            return { name: ci.name, heldBy: ci.heldBy || "Character" };
+        });
+
+        return { userEquipped: userEquipped, charItems: charItems };
+    } catch (e) {
+        console.error("[Story Tracker] getInventoryOutfit error:", e);
+        return null;
     }
 }
