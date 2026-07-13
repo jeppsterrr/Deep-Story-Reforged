@@ -60,7 +60,6 @@ Every other system in this extension is built on top of one guarantee: **the RP 
 
 - Time, date, day of week, location, weather, temperature, and city/country (the LLM infers real places or invents fitting fantasy/sci-fi names).
 - Character position log — who's present and what they're doing right now.
-- Outfit & held-item integration with the Inventory extension, folded into both the character cards and the injected prompt context.
 - A concise, LLM-written summary of what just happened, kept in a scrollable history log.
 - Scene weather is grounded by the World Agent's broader regional trend when one exists, instead of guessing blind on a brand-new chat.
 
@@ -203,7 +202,6 @@ Each of the three trackers (Scene, World, Relationship) can be routed through it
 | Extension | Integration |
 |---|---|
 | **Character Tracker** | Time, date, and location are pushed automatically on each scene update. |
-| **Inventory** | Equipped outfits and held items are pulled into character lines and the injected prompt context. |
 | **Connection Profiles** | Optional — only needed for per-tracker profile routing. |
 
 ---
