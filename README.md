@@ -11,7 +11,7 @@ Originally created by [virgilianshailer](https://github.com/virgilianshailer) as
 1. In SillyTavern, open **Extensions → Install Extension**.
 2. Paste this repository's URL and click **Install**:
 ```
-   `https://github.com/jeppsterrr/Deep-Story-Reforged`
+   https://github.com/jeppsterrr/Deep-Story-Reforged
 ```
 Or install manually — clone or copy the whole folder into `public/scripts/extensions/third-party/`, then reload SillyTavern:
 
