@@ -134,10 +134,6 @@ export function setWorldBusy(v) { worldBusy = v; }
 export function setRelsBusy(v) { relsBusy = v; }
 export function anyBusy() { return busy || worldBusy || relsBusy; }
 
-// --- Misc in-memory-only UI state ---
-export let lastPulseText = null; // last "world pulse" HUD line shown
-export function setLastPulseText(v) { lastPulseText = v; }
-
 // --- Cross-tracker connection-profile session (see ProfileSession.js) ---
 export let trackerProfileSession = null; // { original, current } while a session is open; null otherwise
 export function setTrackerProfileSession(v) { trackerProfileSession = v; }

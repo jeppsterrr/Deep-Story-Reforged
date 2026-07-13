@@ -336,9 +336,14 @@ function pickSignal() {
 
     if (settings.worldEnabled && Store.WorldAgent && worldData && worldData.worldEvents && worldData.worldEvents.length > 0) {
         var pulseCtx = { onscreenNames: (storyData.characters || []).map(function (c) { return c.name; }), currentLocation: storyData.location };
-        var pulse = Store.WorldAgent.selectWorldPulse(worldData.worldEvents, pulseCtx, Store.lastPulseText);
+        // Deterministic pick of the single highest-scoring world event — NO
+        // "exclude what was shown last time" rotation. renderHUD() runs on every
+        // cosmetic redraw (tint toggle, drag, resize, showHUD toggle), so any
+        // state mutation here made the displayed signal flip-flop between events
+        // on actions that changed no story data at all. The most-relevant line
+        // SHOULD persist across redraws; it now only changes when worldEvents do.
+        var pulse = Store.WorldAgent.selectWorldPulse(worldData.worldEvents, pulseCtx);
         if (pulse) {
-            Store.setLastPulseText(pulse.text);
             return { icon: "fa-globe", html: '<span class="st-hud-signal-italic">' + esc(pulse.text) + "</span>", title: "World pulse" };
         }
     }

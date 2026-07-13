@@ -684,18 +684,22 @@ export function rankRevealsByRelevance(reveals, context, maxCount) {
 }
 
 /**
- * selectWorldPulse(worldEvents, context, excludeText)
+ * selectWorldPulse(worldEvents, context)
  *
  * Picks a single "world pulse" line for a HUD/status surface — the
- * highest (importance + scene-relevance) scoring worldEvent, distinct from
- * excludeText where possible (so a HUD re-render doesn't show literally
- * the same line twice in a row). Deliberately sourced ONLY from worldEvents
- * (already-happened offscreen developments), never from pendingReveals —
- * reveals are explicitly "not yet known to the main characters" and
- * surfacing one in a glanceable HUD would leak a secret the narrative
- * hasn't delivered yet. Returns null if there's nothing to show.
+ * highest (importance + scene-relevance) scoring worldEvent. PURE: same
+ * inputs always yield the same pick, so a HUD re-render (which happens on
+ * every cosmetic redraw) never changes the displayed line unless the
+ * underlying events actually changed. An earlier version excluded "whatever
+ * was shown last time" to add variety, but paired with a caller that saved
+ * the pick during render, that made the signal flip-flop between events on
+ * redraws that changed no story data — the opposite of useful. Deliberately
+ * sourced ONLY from worldEvents (already-happened offscreen developments),
+ * never from pendingReveals — reveals are explicitly "not yet known to the
+ * main characters" and surfacing one in a glanceable HUD would leak a secret
+ * the narrative hasn't delivered yet. Returns null if there's nothing to show.
  */
-export function selectWorldPulse(worldEvents, context, excludeText) {
+export function selectWorldPulse(worldEvents, context) {
     var events = (worldEvents || []).filter(function (e) { return e && e.event; });
     if (events.length === 0) return null;
     var scored = events.map(function (e) {
@@ -703,7 +707,7 @@ export function selectWorldPulse(worldEvents, context, excludeText) {
         return { event: e, score: importance + scoreRevealRelevance(e.event, context) };
     });
     scored.sort(function (a, b) { return b.score - a.score; });
-    var pick = scored.find(function (s) { return s.event.event !== excludeText; }) || scored[0];
+    var pick = scored[0];
     return { text: pick.event.event, time: pick.event.time, date: pick.event.date };
 }
 
