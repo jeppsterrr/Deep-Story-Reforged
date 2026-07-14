@@ -833,12 +833,18 @@ export async function doLLMUpdate(timeAnchor) {
         ? revealsSnapshot.map(function(r, i) { return (i + 1) + ". " + r; }).join("\n")
         : "";
 
+    // Genesis-only: deterministic seeding found no time cue in the opening text, so
+    // storyData.time is just the 12:00 placeholder — ask this initial-setup call to
+    // establish the real starting clock instead (see SceneAgent.extractStartingTime).
+    var askStartingTime = !Store.storyData._initialized && Store.storyData._timeSeededFrom === "fallback";
+
     var prompt = Store.SceneAgent.buildScenePrompt({
         currentTime: anchorState.currentTime,
         currentDate: anchorState.currentDate,
         previousState: previousStateInput,
         recentChatText: chatContext,
         userName: userName,
+        askStartingTime: askStartingTime,
         pendingEventsText: scenePending.pendingEventsText,
         pendingRevealsText: pendingRevealsText,
         // Grounds Scene Agent's per-message weather guess in the World Agent's broader
@@ -879,6 +885,25 @@ export async function doLLMUpdate(timeAnchor) {
 
     var patch = Store.SceneAgent.applySceneResponse(data);
     if (patch) Object.assign(Store.storyData, patch);
+
+    // --- Genesis starting time: only consulted when this call was explicitly asked
+    // for one (un-initialized chat whose deterministic seeding fell back to 12:00).
+    // Applied BEFORE the time_advance handling below, and anchorState is rebuilt
+    // from it — otherwise an "elapsed" answer would be measured from the stale
+    // 12:00 placeholder and overwrite the starting time it just established.
+    if (askStartingTime && typeof Store.SceneAgent.extractStartingTime === "function") {
+        var startingTime = Store.SceneAgent.extractStartingTime(data);
+        if (startingTime) {
+            Store.storyData.time = startingTime;
+            var startingDateObj = Store.TimelineEngine.parseDateTime(startingTime, Store.storyData.date);
+            if (startingDateObj) Store.storyData._timeEpoch = startingDateObj.getTime();
+            anchorState = { currentTime: startingTime, currentDate: Store.storyData.date, currentEpoch: Store.storyData._timeEpoch };
+            Store.storyData._timeSeededFrom = "llm";
+            console.log("[Story Tracker] Genesis starting time established by Scene Agent: " + startingTime);
+        } else {
+            console.log("[Story Tracker] Scene Agent returned no usable starting_time — keeping the neutral 12:00 fallback.");
+        }
+    }
 
     // --- Location Codex: the scene just moved somewhere else — persist what the
     // OLD place looked like at departure, keyed by normalized location name, so a

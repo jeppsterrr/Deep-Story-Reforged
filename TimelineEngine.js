@@ -615,17 +615,26 @@ export function applyResolverResult(previousState, resolverResult, config) {
 // guessing. This runs once, at RP start, not on every message.)
 // =============================================================================
 
+// Each anchor covers TWO phrasing families: transition/statement forms ("it's
+// morning", "morning came", "by dusk") AND descriptive scene-setting prose
+// ("the morning sun filtered...", "it was a cold evening", "night had fallen").
+// The second family is how RP opening messages are almost always written —
+// without it, genesis seeding matched mid-story transitions fine but missed
+// nearly every real greeting, silently falling back to the 12:00 default.
+// Descriptive forms are kept high-confidence (day-part noun + a scene noun, or
+// an explicit "it was ..." statement) rather than matching the bare word, so
+// "she thought about that morning" still doesn't fire.
 export var TIME_OF_DAY_ANCHORS = [
-    { re: /\bat dawn\b|\bby dawn\b|\bdawn (?:breaks|broke)\b|\b(?:it'?s|it is)\s+(?:now\s+)?dawn\b/i, hour: 6, minute: 0, label: "dawn" },
-    { re: /\bat sunrise\b|\bthe sun (?:rises|rose)\b|\bsunrise (?:breaks|broke)\b/i, hour: 6, minute: 30, label: "sunrise" },
-    { re: /\b(?:it'?s|it is)\s+(?:now\s+)?morning\b|\bmorning (?:arrives|arrived|comes|came|breaks|broke)\b/i, hour: 8, minute: 0, label: "morning" },
-    { re: /\bat noon\b|\bby noon\b|\bby midday\b|\b(?:it'?s|it is)\s+(?:now\s+)?(?:noon|midday)\b/i, hour: 12, minute: 0, label: "noon" },
-    { re: /\bby afternoon\b|\b(?:it'?s|it is)\s+(?:now\s+)?afternoon\b|\bafternoon (?:arrives|arrived|comes|came)\b/i, hour: 15, minute: 0, label: "afternoon" },
-    { re: /\bat dusk\b|\bby dusk\b|\bdusk (?:falls|fell|arrives|arrived|settles|settled)\b/i, hour: 18, minute: 0, label: "dusk" },
-    { re: /\bat sunset\b|\bthe sun (?:sets|set)\b|\bsunset (?:falls|fell|arrives|arrived)\b/i, hour: 18, minute: 30, label: "sunset" },
-    { re: /\b(?:it'?s|it is)\s+(?:now\s+)?evening\b|\bevening (?:arrives|arrived|comes|came|falls|fell|settles|settled)\b/i, hour: 19, minute: 0, label: "evening" },
-    { re: /\b(?:it'?s|it is)\s+(?:now\s+)?night\b|\bnight (?:falls|fell|arrives|arrived|settles|settled)\b|\bnightfall\b/i, hour: 22, minute: 0, label: "night" },
-    { re: /\bat midnight\b|\bby midnight\b|\b(?:it'?s|it is)\s+(?:now\s+)?midnight\b/i, hour: 0, minute: 0, label: "midnight" },
+    { re: /\bat dawn\b|\bby dawn\b|\bdawn (?:breaks|broke)\b|\b(?:it'?s|it is)\s+(?:now\s+)?dawn\b|\bit was (?:nearly |almost |just )?dawn\b|\b(?:the )?dawn (?:light|sky|air|mist)\b/i, hour: 6, minute: 0, label: "dawn" },
+    { re: /\bat sunrise\b|\bthe sun (?:rises|rose|was rising)\b|\bsunrise (?:breaks|broke)\b/i, hour: 6, minute: 30, label: "sunrise" },
+    { re: /\b(?:it'?s|it is)\s+(?:now\s+)?morning\b|\bmorning (?:arrives|arrived|comes|came|breaks|broke)\b|\bit was (?:a |an )?(?:early |late |cold |warm |gray |grey |bright |quiet )*morning\b|\b(?:the )?(?:early |late )?morning (?:sun|light|sunlight|air|breeze|mist|fog|chill|dew)\b/i, hour: 8, minute: 0, label: "morning" },
+    { re: /\bat noon\b|\bby noon\b|\bby midday\b|\b(?:it'?s|it is)\s+(?:now\s+)?(?:noon|midday)\b|\bit was (?:nearly |almost |just past )?(?:noon|midday)\b|\b(?:the )?midday (?:sun|heat|light)\b/i, hour: 12, minute: 0, label: "noon" },
+    { re: /\bby afternoon\b|\b(?:it'?s|it is)\s+(?:now\s+)?afternoon\b|\bafternoon (?:arrives|arrived|comes|came)\b|\bit was (?:a |an )?(?:early |late |lazy |warm |hot )*afternoon\b|\b(?:the )?(?:early |late )?afternoon (?:sun|light|sunlight|heat|air|breeze)\b/i, hour: 15, minute: 0, label: "afternoon" },
+    { re: /\bat dusk\b|\bby dusk\b|\bdusk (?:falls|fell|arrives|arrived|settles|settled)\b|\bit was (?:nearly |almost )?dusk\b/i, hour: 18, minute: 0, label: "dusk" },
+    { re: /\bat sunset\b|\bthe sun (?:sets|set|was setting)\b|\bsunset (?:falls|fell|arrives|arrived)\b/i, hour: 18, minute: 30, label: "sunset" },
+    { re: /\b(?:it'?s|it is)\s+(?:now\s+)?evening\b|\bevening (?:arrives|arrived|comes|came|falls|fell|settles|settled)\b|\bit was (?:a |an )?(?:early |late |cold |warm |cool |quiet |rainy |stormy )*evening\b|\b(?:the )?(?:early |late )?evening (?:sun|light|air|breeze|sky|chill|rain)\b/i, hour: 19, minute: 0, label: "evening" },
+    { re: /\b(?:it'?s|it is)\s+(?:now\s+)?night\b|\bnight (?:falls|fell|arrives|arrived|settles|settled)\b|\bnightfall\b|\bnight had (?:fully )?(?:fallen|settled|descended)\b|\bit was (?:a |an )?(?:late |cold |dark |quiet |stormy |moonless |moonlit )*night\b|\b(?:the )?night (?:air|sky|breeze|chill|rain)\b|\bmoonlight\b|\bmoonlit\b/i, hour: 22, minute: 0, label: "night" },
+    { re: /\bat midnight\b|\bby midnight\b|\b(?:it'?s|it is)\s+(?:now\s+)?midnight\b|\bit was (?:nearly |almost |just past )?midnight\b/i, hour: 0, minute: 0, label: "midnight" },
 ];
 
 /**

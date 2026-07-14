@@ -225,11 +225,18 @@ export function loadStoryData() {
             var introText = liveChatForGenesis.slice(0, 3).map(function(m) { return m && m.mes ? m.mes : ""; }).join("\n");
             var genesis = Store.TimelineEngine.seedInitialTime(introText);
             storyData.time = genesis ? genesis.time : "12:00";
+            // Record HOW the starting time was determined. "fallback" means the
+            // deterministic scan found no cue and 12:00 is just a placeholder — the
+            // genesis Scene call (see Pipeline.doLLMUpdate's starting_time handling)
+            // uses this to know it should ask the model to establish the real
+            // starting clock instead of leaving the placeholder in place.
+            storyData._timeSeededFrom = genesis ? "text" : "fallback";
             if (genesis) console.log("[Story Tracker] Genesis time seeded from opening text: " + genesis.time + " (" + genesis.reason + ")");
             var genesisDate = Store.TimelineEngine.parseDateTime(storyData.time, storyData.date);
             storyData._timeEpoch = genesisDate ? genesisDate.getTime() : null;
         } else {
             storyData.time = "12:00"; // TimelineEngine not loaded yet — safe neutral fallback
+            storyData._timeSeededFrom = "fallback";
         }
         if (meta) meta[DATA_KEY] = storyData;
         Store.setMsgCounter(0);

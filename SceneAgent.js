@@ -28,11 +28,16 @@
  * ENFORCEMENT, NOT JUST WORDING: applySceneResponse() below never reads
  * `data.time` or `data.date` from the model's response at all, even
  * defensively — there is no code path left that lets an LLM value reach
- * storyData.time/storyData.date directly. The ONLY time-related value read
- * from the response is `data.time_advance`, and even that goes through
- * TimelineEngine.applyTimeResolverResponse() for validation before the
- * caller (index.js) is allowed to touch the clock with it — see
- * applySceneTimeAdvance() below.
+ * storyData.time/storyData.date directly. For ONGOING updates the only
+ * time-related value read from the response is `data.time_advance`, and even
+ * that goes through TimelineEngine.applyTimeResolverResponse() for validation
+ * before the caller (index.js) is allowed to touch the clock with it — see
+ * applySceneTimeAdvance() below. One narrow, deliberate exception exists for
+ * GENESIS only: when deterministic seeding found no time cue in the opening
+ * text, the initial-setup call may return a `starting_time` that establishes
+ * the baseline the clock advances from — strictly validated, read exactly
+ * once, never after initialization. See extractStartingTime() for why this
+ * doesn't weaken the ongoing-clock invariant.
  *
  * Depends on TimelineEngine only for that shared validator and the pacing
  * guide text (both pure, no LLM calls) — still no side effects, no ST
@@ -144,6 +149,14 @@ export function buildScenePrompt(input) {
     var weatherGroundingLine = weatherTrendText
         ? (" The broader regional weather trend right now is: \"" + weatherTrendText + "\" — use this as grounding, not something to always copy verbatim: narrow it down to a plausible specific reading for this exact location and moment (still write 'Unknown' if the scene is indoors/underground/otherwise clearly insulated from it).")
         : "";
+    // Genesis-only (see extractStartingTime below): when the deterministic
+    // seeding scan found no time cue in the opening text, the initial-setup call
+    // is the one place the model is invited to establish the starting clock —
+    // anchored to the same hour table everything else uses when the text implies
+    // a time-of-day, free choice when the opening is genuinely ambiguous.
+    var startingTimeInstruction = input.askStartingTime
+        ? "5b. STARTING TIME (initial setup only): The system could not determine this story's starting clock time from the opening text. Include a \"starting_time\" field (\"HH:MM\", 24-hour). If the text states or implies a time of day — even passively (dawn light, midday heat, a moonlit street, characters at breakfast) — use the TIME-OF-DAY ANCHOR HOURS table below to land on the matching hour. If the opening is genuinely ambiguous, choose any plausible time that fits the scene freely — your answer becomes the story's established starting clock. Also set time_advance to {\"type\":\"none\"} for this initial setup: starting_time IS the clock, nothing has elapsed yet.\n"
+        : "";
 
     return (
         "[OOC: You are a narrative assistant. Analyze the roleplay chat so far, determine the current scene context, AND decide how much real narrative time has passed.\n\n" +
@@ -158,6 +171,7 @@ export function buildScenePrompt(input) {
         "3. CHARACTER POSITIONS: List every character present in the current scene (including " + userName + " the player). Use the player's actual name as it appears in the chat - NOT the word 'User'. State exactly where they are and what their physical posture/action is right now.\n" +
         "4. RECENT EVENTS: Write a brief, factual 1-2 sentence summary of what just changed or happened in the last few messages. Use the player's actual name, not 'User'.\n" +
         "5. TIME_ADVANCE: Decide which ONE of four cases applies to how much real time passed across the messages you just reviewed, and fill the `time_advance` field accordingly. This replaces the flat per-message clock tick for this span rather than stacking on top of it, so be realistic and use the whole span, not just the last line.\n" +
+        startingTimeInstruction +
         revealsInstruction + "\n" +
         PACING_EXAMPLE_GUIDE + "\n" +
         TIME_ANCHOR_GUIDE + "\n" +
@@ -185,6 +199,7 @@ export function buildScenePrompt(input) {
         prevStateBlock + "\n\n" +
         "Respond ONLY with valid JSON in the story's language. IMPORTANT: In the characters array, use the player's actual name from the chat - never write 'User'. Do NOT include a \"time\" or \"date\" field anywhere in your response — only the time_advance object above decides elapsed time, and it will be ignored if a raw time/date field is present instead. Use this exact structure (city and country MUST be non-empty strings, never 'Unknown'):\n" +
         "{\"location\":\"Living room\", \"city\":\"Myrenveld\", \"country\":\"Sovereign Realms of Drak'hara\", \"temperature\":\"18°C\", \"weather\":\"Cloudy\", \"characters\":[{\"name\":\"Jepp\", \"state\":\"sitting on floor\"}, {\"name\":\"Char1\", \"state\":\"standing near Jepp\"}], \"recent_events\":\"Char1 entered the living room and spoke to Jepp.\", \"time_advance\":{\"type\":\"elapsed\",\"minutes\":14,\"reason\":\"a short conversation and a walk to the door\"}" +
+        (input.askStartingTime ? ", \"starting_time\":\"19:30\"" : "") +
         (pendingRevealsText ? ", \"revealed_secrets\":[]" : "") +
         "}\n" +
         "]\n\n" +
@@ -273,11 +288,37 @@ export function extractRevealedSecretIndices(data) {
 }
 
 /**
+ * extractStartingTime(data)
+ *
+ * THE ONE SANCTIONED EXCEPTION to "never read a clock value from the model":
+ * at genesis there is no established baseline for time_advance to advance
+ * FROM — the alternative isn't a safer source of truth, it's a hardcoded
+ * 12:00 placeholder. So when (and only when) the deterministic seeding scan
+ * found no cue in the opening text, the caller asks the initial-setup call
+ * for a starting_time and reads it through this strict validator. The
+ * ongoing-clock invariant is untouched: the caller consults this exactly
+ * once, before _initialized is ever set, and applySceneResponse still never
+ * reads time/date on any call.
+ *
+ * Returns a zero-padded "HH:MM" or null for anything missing or malformed
+ * (caller keeps the neutral fallback in that case).
+ */
+export function extractStartingTime(data) {
+    if (!data || typeof data.starting_time !== "string") return null;
+    var m = data.starting_time.trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    var hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+    if (isNaN(hh) || isNaN(mm) || hh > 23 || mm > 59) return null;
+    return (hh < 10 ? "0" + hh : String(hh)) + ":" + (mm < 10 ? "0" + mm : String(mm));
+}
+
+/**
  * applySceneTimeAdvance(data)
  *
  * The ONLY point where a time-related value is read from Scene Agent's
- * response at all — and even here, it's never a raw time/date, only the
+ * ONGOING responses — and even here, it's never a raw time/date, only the
  * validated (type, minutes) contract from TimelineEngine.applyTimeResolverResponse().
+ * (extractStartingTime above is the single, genesis-only exception — see its doc.)
  * `data.time` / `data.date`, if a model hallucinates them out of habit, are
  * simply never looked at (see applySceneResponse above).
  *
