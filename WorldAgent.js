@@ -844,7 +844,11 @@ export function applyNpcTickResponse(data, allowedGoalNames, allowedRoutineNames
     if (!data || !Array.isArray(data.npc_updates)) return { npc_updates: [] };
     var allowedSet = allowedGoalNames ? new Set(allowedGoalNames) : null;
     var allowedRoutineSet = allowedRoutineNames ? new Set(allowedRoutineNames) : null;
-    var updates = data.npc_updates.filter(function (u) { return u && u.name && u.change; }).map(function (u) {
+    // String-only name/change — same non-string-poisoning posture as the
+    // weather/summary validators (truthiness alone let objects/numbers through).
+    var updates = data.npc_updates.filter(function (u) {
+        return u && typeof u.name === "string" && u.name.trim() && typeof u.change === "string" && u.change.trim();
+    }).map(function (u) {
         // Optional scheduling fields — never trusted blindly, same posture as the faction
         // tier's duration_minutes/resolution. A malformed/negative/zero duration just means
         // "not a scheduled action". The caller (index.js) owns actually enqueuing these into
@@ -922,8 +926,14 @@ export function buildWeatherTickPrompt(input) {
 }
 
 export function applyWeatherTickResponse(data) {
-    if (!data || !data.weather_trend) return null;
-    return { weatherTrend: data.weather_trend };
+    // STRING-ONLY: a JSON-valid response can still carry an object/array/number
+    // here, and a non-string weatherTrend persists into worldData and then
+    // crashes every consumer that assumes a string (.toLowerCase() in the HUD's
+    // weather icon picker, .trim() in the scene prompt's grounding line).
+    if (!data || typeof data.weather_trend !== "string") return null;
+    var trend = data.weather_trend.trim();
+    if (!trend) return null;
+    return { weatherTrend: trend.length > 400 ? trend.slice(0, 400) : trend };
 }
 
 // =============================================================================
@@ -1009,7 +1019,9 @@ export function applyFactionTickResponse(data, intervalList, fixedTime, fixedDat
     if (!data) return { events: [], pending_reveals: [] };
 
     var events = Array.isArray(data.events) ? data.events : [];
-    var mapped = events.filter(function (e) { return e && e.event; }).map(function (e) {
+    // String-only event text — capEventText passes non-strings through unchanged,
+    // so an object here would persist and crash the similarity dedupe later.
+    var mapped = events.filter(function (e) { return e && typeof e.event === "string" && e.event.trim(); }).map(function (e) {
         var time, date;
         if (intervalList && intervalList.length > 0) {
             var idx = clampIntervalIndex(e.interval_index, intervalList.length);
@@ -1041,7 +1053,11 @@ export function applyFactionTickResponse(data, intervalList, fixedTime, fixedDat
         };
     });
 
-    var reveals = Array.isArray(data.pending_reveals) ? data.pending_reveals.filter(Boolean) : [];
+    // String-only reveals — a non-string here would crash the similarity dedupe
+    // in capPendingReveals (tokenize calls .toLowerCase()).
+    var reveals = Array.isArray(data.pending_reveals)
+        ? data.pending_reveals.filter(function (r) { return typeof r === "string" && r.trim(); })
+        : [];
 
     return { events: mapped, pending_reveals: reveals };
 }
@@ -1081,6 +1097,9 @@ export function buildWorldTickPrompt(input) {
 }
 
 export function applyWorldTickResponse(data, maxChars) {
-    if (!data || !data.summary) return null;
+    // STRING-ONLY, same reasoning as applyWeatherTickResponse: capWorldSnapshot
+    // passes non-strings through unchanged, so an object summary used to persist
+    // and then crash renderModal's `worldSummary.trim()` check on every render.
+    if (!data || typeof data.summary !== "string" || !data.summary.trim()) return null;
     return { summary: capWorldSnapshot(data.summary, maxChars) };
 }

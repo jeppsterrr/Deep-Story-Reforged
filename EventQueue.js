@@ -71,8 +71,23 @@ export function createEvent(input) {
     if (!base) {
         throw new Error("EventQueue.createEvent: startTime/startDate is missing or unparseable.");
     }
-    var duration = Math.max(0, Number(input.durationMinutes) || 0);
+    // Finite, non-negative, and hard-capped. `Number("Infinity") || 0` is Infinity,
+    // and Infinity (or any value pushing past the JS Date range) turns the execute
+    // time into "NaN:NaN"/"NaN/NaN/NaN" — an event that persists as pending FOREVER,
+    // since an unparseable due-time can never come due and pruning never touches
+    // pending events. Cap matches TimelineEngine.maxExplicitSkipMinutes (~10 years):
+    // nothing in an RP legitimately schedules further out than the largest allowed
+    // explicit time skip.
+    var MAX_EVENT_DURATION_MINUTES = 5256000;
+    var duration = Number(input.durationMinutes);
+    if (!isFinite(duration) || duration < 0) duration = 0;
+    if (duration > MAX_EVENT_DURATION_MINUTES) duration = MAX_EVENT_DURATION_MINUTES;
     var executeDateObj = addMinutesToDate(base, duration);
+    if (isNaN(executeDateObj.getTime())) {
+        // Belt-and-suspenders: with a parseable start and a sane duration this is
+        // unreachable, but a NaN execute time must never be persisted as pending.
+        throw new Error("EventQueue.createEvent: computed execute time is invalid.");
+    }
 
     // Optional recurrence: a positive integer means "after this event resolves,
     // re-enqueue the next occurrence recurringMinutes later" (e.g. 1440 = daily).
@@ -132,7 +147,16 @@ export function processTime(queue, currentTime, currentDate) {
         if (event.status !== "pending") return event;
 
         var dueEpoch = toEpoch(event.executeTime, event.executeDate);
-        if (dueEpoch != null && dueEpoch <= nowEpoch) {
+        if (dueEpoch == null) {
+            // A pending event whose execute time can't be parsed (e.g. "NaN:NaN"
+            // persisted by a save from before durations were sanitized) can NEVER
+            // come due, and pruning never touches pending events — it would sit in
+            // the queue and every prompt's pending list forever. Cancel it (kept
+            // for history per the append-only philosophy, never silently deleted).
+            console.warn("[Story Tracker] EventQueue: cancelling pending event with unparseable execute time:", event.action);
+            return Object.assign({}, event, { status: "cancelled" });
+        }
+        if (dueEpoch <= nowEpoch) {
             var resolvedEvent = Object.assign({}, event, { status: "resolved" });
             resolved.push(resolvedEvent);
             return resolvedEvent;

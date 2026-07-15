@@ -98,25 +98,47 @@ function padZero(n) {
     return n < 10 ? "0" + n : String(n);
 }
 
-/** Parse "HH:MM" + "DD/MM/YYYY" into a JS Date. Returns null if unparseable. */
+/**
+ * Parse "HH:MM" + "DD/MM/YYYY" into a JS Date. Returns null if unparseable.
+ *
+ * STRICT, not lenient: this is the central parser every subsystem's clock math
+ * runs through, and the old parseInt-based version silently NORMALIZED invalid
+ * input instead of rejecting it — "99:99" rolled four days forward, "31/02"
+ * rolled into March, "12abc:34zzz" parsed as 12:34. That let a stored display
+ * string and its computed epoch describe two different moments. Rules now:
+ *   - tokens must be purely numeric (parseInt's prefix-lenience is not accepted)
+ *   - hour 0-23, minute 0-59, month 1-12, day 1-31
+ *   - the constructed Date must round-trip exactly (rejects day-of-month
+ *     rollover like 31/02, and 2-digit years that Date would remap to 19xx —
+ *     while still supporting real 3-4 digit fantasy-calendar years like 347)
+ * A null return means the CALLER decides (hard stop, sanitize, or skip) —
+ * never a silently different moment than the string claims.
+ */
 export function parseDateTime(timeStr, dateStr) {
     if (!timeStr || !dateStr) return null;
 
-    var tParts = String(timeStr).split(":");
-    if (tParts.length < 2) return null;
+    var tParts = String(timeStr).trim().split(":");
+    if (tParts.length !== 2) return null;
+    if (!/^\d{1,2}$/.test(tParts[0].trim()) || !/^\d{1,2}$/.test(tParts[1].trim())) return null;
     var hour = parseInt(tParts[0], 10);
     var min = parseInt(tParts[1], 10);
-    if (isNaN(hour) || isNaN(min)) return null;
+    if (hour > 23 || min > 59) return null;
 
     var dParts = String(dateStr).split(/[\/\-.,]/).map(function (s) { return s.trim(); }).filter(Boolean);
-    if (dParts.length < 3) return null;
+    if (dParts.length !== 3) return null;
+    if (!/^\d{1,2}$/.test(dParts[0]) || !/^\d{1,2}$/.test(dParts[1]) || !/^\d{1,4}$/.test(dParts[2])) return null;
     var day = parseInt(dParts[0], 10);
     var month = parseInt(dParts[1], 10);
     var year = parseInt(dParts[2], 10);
-    if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+    if (day < 1 || day > 31 || month < 1 || month > 12) return null;
 
     var d = new Date(year, month - 1, day, hour, min, 0, 0);
-    return isNaN(d.getTime()) ? null : d;
+    if (isNaN(d.getTime())) return null;
+    // Round-trip check: Date silently rolls impossible days into the next month
+    // (31/02 -> 3 March) and remaps years 0-99 onto 1900-1999 — both mean the
+    // parsed moment isn't the moment the string claims, so reject instead.
+    if (d.getDate() !== day || d.getMonth() !== month - 1 || d.getFullYear() !== year) return null;
+    return d;
 }
 
 export function formatTime(d) {
@@ -545,7 +567,10 @@ export function applyTimeResolverResponse(data) {
     }
 
     var type = data.type;
-    var minutes = Math.max(0, Number(data.minutes) || 0);
+    // isFinite, not just truthiness — `Number("Infinity") || 0` is Infinity, which
+    // would sail through the downstream Math.min caps' arithmetic as NaN dates.
+    var minutes = Number(data.minutes);
+    if (!isFinite(minutes) || minutes < 0) minutes = 0;
     var reason = String(data.reason || data.description || "").trim();
 
     if (type === "schedule") {

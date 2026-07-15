@@ -74,7 +74,11 @@ export function sanitizeDateStr(dateStr, fallbackDateStr) {
 
     if (isNaN(day) || day < 1 || day > 31) day = 1;
     if (isNaN(month) || month < 1 || month > 12) month = 1;
-    if (isNaN(year) || year < 1000) year = 2026;
+    // Upper bound matters too: TimelineEngine.parseDateTime only accepts 1-4 digit
+    // years, so a 5+ digit year here would produce a "sanitized" value the strict
+    // parser still rejects — defeating the repair paths that rely on this function
+    // always returning something parseable.
+    if (isNaN(year) || year < 1000 || year > 9999) year = 2026;
 
     // Clamp to a real day of that month — "31/02" would otherwise keep the nonsense
     // string as the display date while every epoch computation silently rolled it
@@ -210,6 +214,23 @@ export function loadStoryData() {
         if (!storyData.history) storyData.history = [];
         if (storyData.autoUpdate === undefined) storyData.autoUpdate = settings.autoUpdate;
         if (storyData._passiveAccumMinutes === undefined) storyData._passiveAccumMinutes = 0;
+        // Self-repair for stored clock strings the (now strict) parser rejects —
+        // e.g. a pre-fork save where the LLM wrote "7:30 PM" directly, or a rolled
+        // "31/02" date from before input clamping. Left unrepaired, advanceBaseline
+        // would throw on every message and dead-stop the whole pipeline for this
+        // chat. sanitizeTimeStr/sanitizeDateStr always yield parseable values
+        // (falling back to a neutral 12:00 / a valid date), and the epoch is
+        // recomputed so display and math agree again.
+        if (Store.TimelineEngine && !Store.TimelineEngine.parseDateTime(storyData.time, storyData.date)) {
+            var repairedTime = sanitizeTimeStr(storyData.time, "12:00");
+            var repairedDate = sanitizeDateStr(storyData.date, "01/01/2026");
+            console.warn("[Story Tracker] Stored clock \"" + storyData.time + " " + storyData.date + "\" is not a valid HH:MM DD/MM/YYYY — repaired to \"" + repairedTime + " " + repairedDate + "\".");
+            storyData.time = repairedTime;
+            storyData.date = repairedDate;
+            var repairedEpochDate = Store.TimelineEngine.parseDateTime(repairedTime, repairedDate);
+            storyData._timeEpoch = repairedEpochDate ? repairedEpochDate.getTime() : null;
+        }
+
         if (typeof storyData._timeEpoch !== "number" || isNaN(storyData._timeEpoch)) {
             // Old save predating this field — reconstruct from the display strings (can't be
             // more precise than "HH:MM", but every call after this carries fractional

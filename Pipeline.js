@@ -1098,8 +1098,14 @@ export async function doLLMUpdate(timeAnchor) {
                 catch(e) { logGenRawFailure("city/country fallback", e); return await Store.genRaw(ccPrompt, null, false, true); }
             });
             var ccData = cleanAndParseJSON(ccRaw);
-            var ccPatch = Store.SceneAgent.applyCityCountryResponse(ccData);
-            if (ccPatch) Object.assign(Store.storyData, ccPatch);
+            // The check AFTER this block only stops the explicit save — but mutating
+            // Store.storyData here already persists, because after a chat switch this
+            // object IS the new chat's chat_metadata entry (ST saves it on its own
+            // cadence). So the chat-identity check must gate the assign itself.
+            if (Store.getCurrentChatId() === chatIdAtEntry) {
+                var ccPatch = Store.SceneAgent.applyCityCountryResponse(ccData);
+                if (ccPatch) Object.assign(Store.storyData, ccPatch);
+            }
         } catch(e) {
             console.warn("[Story Tracker] City/country fallback failed:", e);
         }
@@ -1295,27 +1301,33 @@ function buildWorldTierContext() {
     var curDateObj = parseRpDateTime(Store.storyData.time, Store.storyData.date);
     var historyTimelineText = "";
     if (Store.storyData && Store.storyData.history && Store.storyData.history.length > 0) {
-        var reversedHist = [...Store.storyData.history].reverse();
-        var addedCount = 0;
+        // history is stored NEWEST-first. Walk it in that order collecting up to
+        // the cap, THEN reverse the collected lines for chronological output —
+        // reversing the whole array before capping (the old order of operations)
+        // selected the OLDEST 12 entries once more than 12 existed, handing the
+        // world prompts ancient history and omitting exactly the recent entries
+        // they most need.
         var HISTORY_INJECT_CAP = 12;
-        reversedHist.forEach(function(h) {
-            if (addedCount >= HISTORY_INJECT_CAP) return;
+        var timelineLines = [];
+        for (var hi = 0; hi < Store.storyData.history.length && timelineLines.length < HISTORY_INJECT_CAP; hi++) {
+            var h = Store.storyData.history[hi];
+            if (!h) continue;
             // Entries saved before history carried a `date` field can't be
             // compared against the current clock — include them anyway (they were
             // all genuinely recorded in the past) rather than silently dropping
             // them, which used to leave this whole timeline permanently empty.
             if (!h.date) {
-                historyTimelineText += `- Time: ${h.time} (Event: ${h.events})\n`;
-                addedCount++;
-                return;
+                timelineLines.push(`- Time: ${h.time} (Event: ${h.events})\n`);
+                continue;
             }
             var entryDateObj = parseRpDateTime(h.time, h.date);
             if (entryDateObj && curDateObj && entryDateObj.getTime() <= curDateObj.getTime()) {
-                historyTimelineText += `- Time: ${h.time} | Date: ${h.date} (Event: ${h.events})\n`;
-                addedCount++;
+                timelineLines.push(`- Time: ${h.time} | Date: ${h.date} (Event: ${h.events})\n`);
             }
-        });
-        if (addedCount === 0) historyTimelineText = "No past history recorded before this tick.";
+        }
+        historyTimelineText = timelineLines.length > 0
+            ? timelineLines.reverse().join("")
+            : "No past history recorded before this tick.";
     } else {
         historyTimelineText = "No past history recorded yet.";
     }
