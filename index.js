@@ -736,6 +736,12 @@ function buildModal() {
         Store.storyData.time = newTime;
         Store.storyData.date = newDate;
         Store.storyData._timeEpoch = parsed.getTime();
+        // A manual correction re-establishes the clock — the scene tracker's span
+        // time-anchor must follow, or the next scene call would measure its
+        // elapsed answer from the PRE-correction clock and undo the fix.
+        Store.storyData._sceneAnchorTime = newTime;
+        Store.storyData._sceneAnchorDate = newDate;
+        Store.storyData._sceneAnchorEpoch = parsed.getTime();
 
         var resync = $("#st-time-correct-resync").is(":checked");
         if (resync) {
@@ -1014,12 +1020,15 @@ function renderModal() {
     let hHtml = "";
     if (Store.storyData.history && Store.storyData.history.length > 0) {
         Store.storyData.history.forEach((h, i) => {
-            let weatherInfo = (h.temperature || h.weather) ? ` | ${h.temperature || ""}${h.weather ? " " + esc(h.weather) : ""}` : "";
+            // EVERY interpolated field is escaped — h.temperature used to be the one
+            // exception here, which made it a stored-XSS sink: applySceneResponse
+            // persisted it from raw model output, and this template fed it to .html().
+            let weatherInfo = (h.temperature || h.weather) ? ` | ${h.temperature ? esc(h.temperature) : ""}${h.weather ? " " + esc(h.weather) : ""}` : "";
             hHtml += `<div class="st-history-item" style="position: relative;">
                 <div class="st-history-meta" style="display: flex; justify-content: space-between; align-items: center;">
-                    <span>Update at Msg #${h.msg}</span>
+                    <span>Update at Msg #${esc(h.msg)}</span>
                     <span style="display: flex; align-items: center; gap: 8px;">
-                        ${h.time} | ${esc(h.loc)}${weatherInfo}
+                        ${esc(h.time)} | ${esc(h.loc)}${weatherInfo}
                         <button class="st-del-hist st-hdr-btn menu_button" data-index="${i}" title="Delete Summary" style="padding: 2px 6px !important; font-size: 10px; color: #ff453a; border-color: rgba(255,255,255,0.1); background: transparent;"><i class="fa-solid fa-trash-can"></i></button>
                     </span>
                 </div>

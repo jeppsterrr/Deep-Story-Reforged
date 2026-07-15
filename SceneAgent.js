@@ -222,6 +222,23 @@ export function buildScenePrompt(input) {
  *
  * Returns null if `data` is falsy (caller should treat as a failed call).
  */
+/**
+ * cleanScalarField(value, maxChars)
+ * Scalar scene fields go straight from raw model output into persisted storage
+ * and, from there, into rendered HTML — so they must be validated to be plain,
+ * bounded strings HERE, not trusted to be sane. Accepts strings (trimmed) and
+ * finite numbers (stringified); anything else — objects, arrays, booleans —
+ * returns null and the field is simply not patched. Length-capped so a
+ * runaway response can't bloat every future prompt injection either.
+ */
+function cleanScalarField(value, maxChars) {
+    if (typeof value === "number" && isFinite(value)) value = String(value);
+    if (typeof value !== "string") return null;
+    var trimmed = value.trim();
+    if (!trimmed) return null;
+    return trimmed.length > maxChars ? trimmed.slice(0, maxChars) : trimmed;
+}
+
 export function applySceneResponse(data) {
     if (!data) return null;
 
@@ -230,11 +247,16 @@ export function applySceneResponse(data) {
     // Deliberately absent: patch.time, patch.date. Do not add them here —
     // see file header for why.
 
-    if (data.location) patch.location = data.location;
-    if (data.city && data.city !== "Unknown") patch.city = data.city;
-    if (data.country && data.country !== "Unknown") patch.country = data.country;
-    if (data.temperature) patch.temperature = data.temperature;
-    if (data.weather) patch.weather = data.weather;
+    var location = cleanScalarField(data.location, 200);
+    if (location) patch.location = location;
+    var city = cleanScalarField(data.city, 120);
+    if (city && city !== "Unknown") patch.city = city;
+    var country = cleanScalarField(data.country, 120);
+    if (country && country !== "Unknown") patch.country = country;
+    var temperature = cleanScalarField(data.temperature, 60);
+    if (temperature) patch.temperature = temperature;
+    var weather = cleanScalarField(data.weather, 120);
+    if (weather) patch.weather = weather;
     // Characters are validated per-entry, never passed through raw: a malformed
     // array (bare name strings, entries missing `name`) previously went straight
     // into storyData and got SAVED, after which every renderModal/renderHUD call
@@ -242,19 +264,20 @@ export function applySceneResponse(data) {
     if (Array.isArray(data.characters)) {
         var characters = data.characters
             .map(function (c) {
-                if (typeof c === "string" && c.trim()) return { name: c.trim(), state: "present" };
+                if (typeof c === "string" && c.trim()) return { name: cleanScalarField(c, 100), state: "present" };
                 if (c && typeof c === "object" && typeof c.name === "string" && c.name.trim()) {
                     return {
-                        name: c.name.trim(),
-                        state: (typeof c.state === "string" && c.state.trim()) ? c.state.trim() : "present",
+                        name: cleanScalarField(c.name, 100),
+                        state: cleanScalarField(c.state, 300) || "present",
                     };
                 }
                 return null;
             })
-            .filter(Boolean);
+            .filter(function (c) { return c && c.name; });
         if (characters.length > 0) patch.characters = characters;
     }
-    if (data.recent_events) patch.recent_events = data.recent_events;
+    var recentEvents = cleanScalarField(data.recent_events, 600);
+    if (recentEvents) patch.recent_events = recentEvents;
 
     return patch;
 }

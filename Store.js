@@ -68,6 +68,27 @@ export function isChatOpen() {
     }
 }
 
+/**
+ * Identifies WHICH chat is currently open (chat file name for solo chats, group
+ * chat id for groups) — the guard every async tracker path checks after each
+ * `await` boundary. Store.storyData/worldData and ST's chat_metadata are all
+ * LIVE bindings that CHAT_CHANGED swaps mid-flight, so an in-flight LLM call
+ * that resumes after a chat switch would otherwise write the previous chat's
+ * analysis into the newly opened chat. isChatOpen() alone can't catch that —
+ * it only says A chat is open, not the SAME one.
+ */
+export function getCurrentChatId() {
+    try {
+        var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function")
+            ? SillyTavern.getContext()
+            : null;
+        if (context && context.chatId !== undefined && context.chatId !== null) return context.chatId;
+        return scriptModule ? (scriptModule.chatId !== undefined ? scriptModule.chatId : null) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 /** Resolves the live chat array the same resilient way isChatOpen() does. */
 export function getLiveChat() {
     try {

@@ -380,9 +380,16 @@ export function resolveCanonicalName(nodes, name) {
             if (String(name).length <= String(nodes[i].name).length) {
                 return { name: nodes[i].name, nodes: nodes };
             }
+            // Upgrading the node's display name to the longer variant. `renamedFrom`
+            // tells the caller which name the node USED to have — edges stored under
+            // that old name must be re-keyed by whoever owns them (see the
+            // Persistence.resolveCanonicalName shim), or they dangle: an edge
+            // endpoint with no matching node, which the graph renderer then
+            // resurrects as a duplicate alias node.
+            var oldName = nodes[i].name;
             var upgraded = nodes.slice();
             upgraded[i] = Object.assign({}, upgraded[i], { name: name });
-            return { name: name, nodes: upgraded };
+            return { name: name, nodes: upgraded, renamedFrom: oldName };
         }
     }
     return { name: name, nodes: nodes };
@@ -402,6 +409,14 @@ export function dedupeNodes(nodes, edges) {
     edges = edges || [];
     if (nodes.length < 2) return { nodes: nodes, edges: edges };
 
+    // Maps each original node name -> the merged node OBJECT, not its name string.
+    // The object's .name can still be UPGRADED by a later, longer variant
+    // ("Ara" merged first, then "Ara Vorn" arrives and mutates match.name) — a
+    // string map recorded before that upgrade kept pointing at the old name, so
+    // the edge re-keying below mapped "Ara"→"Ara" while the node was already
+    // "Ara Vorn", leaving dangling edge endpoints the graph renderer then
+    // resurrected as duplicate alias nodes. Resolving through the object means
+    // every entry always reads the final post-merge name.
     var canonicalMap = {};
     var merged = [];
 
@@ -413,10 +428,11 @@ export function dedupeNodes(nodes, edges) {
             if (String(node.name).length > String(match.name).length) match.name = node.name;
             if (!match.bio && node.bio) match.bio = node.bio; // keep whichever variant already had a bio
             if (match.x == null && node.x != null) { match.x = node.x; match.y = node.y; } // keep a saved layout position if either had one
-            canonicalMap[node.name] = match.name;
+            canonicalMap[node.name] = match;
         } else {
-            merged.push(Object.assign({}, node, { id: node.name, name: node.name }));
-            canonicalMap[node.name] = node.name;
+            var copy = Object.assign({}, node, { id: node.name, name: node.name });
+            merged.push(copy);
+            canonicalMap[node.name] = copy;
         }
     });
 
@@ -426,8 +442,8 @@ export function dedupeNodes(nodes, edges) {
     var edgeMap = {};
     edges.forEach(function(e) {
         if (!e) return;
-        var from = canonicalMap[e.from] || e.from;
-        var to = canonicalMap[e.to] || e.to;
+        var from = canonicalMap[e.from] ? canonicalMap[e.from].name : e.from;
+        var to = canonicalMap[e.to] ? canonicalMap[e.to].name : e.to;
         if (!from || !to || from === to) return; // collapsed onto the same character
 
         var reKeyed = (from !== e.from || to !== e.to) ? Object.assign({}, e, { from: from, to: to }) : e;

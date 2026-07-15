@@ -164,6 +164,18 @@ export function resolveCanonicalName(name) {
     if (!name || !Store.RelationshipAgent || !Store.relationshipData) return name;
     var result = Store.RelationshipAgent.resolveCanonicalName(Store.relationshipData.nodes, name);
     Store.relationshipData.nodes = result.nodes;
+    // The matched node was upgraded to a longer display name — re-key every edge
+    // still stored under the old name, or they dangle (no matching node) and the
+    // graph renderer resurrects the old name as a duplicate alias node.
+    if (result.renamedFrom && result.renamedFrom !== result.name) {
+        Store.relationshipData.edges = (Store.relationshipData.edges || []).map(function (e) {
+            if (!e || (e.from !== result.renamedFrom && e.to !== result.renamedFrom)) return e;
+            return Object.assign({}, e, {
+                from: e.from === result.renamedFrom ? result.name : e.from,
+                to: e.to === result.renamedFrom ? result.name : e.to,
+            });
+        });
+    }
     return result.name;
 }
 

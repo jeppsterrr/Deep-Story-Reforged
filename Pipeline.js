@@ -394,6 +394,16 @@ export function bindEvents() {
         if (!Store.storyData) loadStoryData();
         if (!Store.storyData) return;
 
+        // Which chat this whole pipeline run belongs to. Every resumption point
+        // after an `await` (startup delay, LLM calls, inter-tracker delays)
+        // re-checks this: Store.storyData/worldData and ST's chat_metadata are
+        // live bindings that CHAT_CHANGED swaps mid-flight, so continuing after
+        // a chat switch would write this chat's analysis into the new chat.
+        var pipelineChatId = Store.getCurrentChatId();
+        function pipelineChatChanged() {
+            return Store.getCurrentChatId() !== pipelineChatId;
+        }
+
         Store.setLastCountedMsgId(id);
         saveStoryData();
 
@@ -405,6 +415,10 @@ export function bindEvents() {
 
         if (!Store.isChatOpen()) {
             console.warn("[Story Tracker] Event ignored: No active chat is open.");
+            return;
+        }
+        if (pipelineChatChanged()) {
+            console.warn("[Story Tracker] Chat switched during the startup delay — abandoning this message's tracker run.");
             return;
         }
 
@@ -524,8 +538,28 @@ export function bindEvents() {
                 }
                 var sceneUpdateFailed = false;
                 try {
-                    var sceneTl = await doLLMUpdate(preResolveState);
-                    if (sceneTl) tlResult = sceneTl;
+                    // The span anchor: the clock AS OF THE LAST SCENE UPDATE, not the clock
+                    // just before this message. Scene reviews the whole span since its last
+                    // checkpoint and reports elapsed time for ALL of it — measuring that
+                    // from the pre-this-message clock double-counted every interim message's
+                    // flat baseline tick (4 interim ticks + a 10-minute span answer produced
+                    // +14, not +10, contradicting the documented "replaces the flat ticks").
+                    var sceneSpanAnchor = (typeof Store.storyData._sceneAnchorEpoch === "number" && isFinite(Store.storyData._sceneAnchorEpoch))
+                        ? { currentTime: Store.storyData._sceneAnchorTime, currentDate: Store.storyData._sceneAnchorDate, currentEpoch: Store.storyData._sceneAnchorEpoch }
+                        : preResolveState; // old saves without the anchor fields — previous behavior
+                    var sceneTl = await doLLMUpdate(sceneSpanAnchor);
+                    if (sceneTl) {
+                        // sceneTl's clock is already forward-clamped by doLLMUpdate (a span
+                        // answer smaller than the interim ticks can't wind the visible clock
+                        // backward). The Scheduler, though, must only be credited with what's
+                        // NEW this message — the interim baseline ticks were already credited
+                        // on their own messages, so crediting the whole span again would
+                        // drift every world tier ahead by (interval-1) minutes per cycle.
+                        var newlyElapsed = (typeof preResolveEpoch === "number" && isFinite(preResolveEpoch))
+                            ? Math.max(0, (sceneTl.currentEpoch - preResolveEpoch) / 60000)
+                            : sceneTl.elapsedMinutes;
+                        tlResult = Object.assign({}, sceneTl, { elapsedMinutes: newlyElapsed });
+                    }
                     // Cadence counters only reset on a SUCCESSFUL update — resetting them
                     // unconditionally (the old behavior) meant a failed call silently ate a
                     // full Message Mode cadence / Smart Time interval, identical to the
@@ -543,9 +577,23 @@ export function bindEvents() {
                 console.log("[Story Tracker] Scene tier due but a previous analysis is still running (or no generator available) — will retry next message.");
             }
 
+            if (pipelineChatChanged()) {
+                console.warn("[Story Tracker] Chat switched during the scene analysis — abandoning this message's tracker run before writing anything.");
+                return;
+            }
+
             Store.storyData.time = tlResult.currentTime;
             Store.storyData.date = tlResult.currentDate;
             Store.storyData._timeEpoch = tlResult.currentEpoch;
+            // Refresh the span anchor to the final applied clock whenever scene ran
+            // this message — the NEXT span's elapsed answer measures from here.
+            // (doLLMUpdate sets these too, but this message's own tick/clamp is only
+            // known after tlResult is applied, so last-write-wins here.)
+            if (sceneAlreadyFiredThisMessage && !sceneUpdateFailed) {
+                Store.storyData._sceneAnchorTime = tlResult.currentTime;
+                Store.storyData._sceneAnchorDate = tlResult.currentDate;
+                Store.storyData._sceneAnchorEpoch = tlResult.currentEpoch;
+            }
             saveStoryData();
             console.log("[Story Tracker] Timeline advanced " + tlResult.elapsedMinutes.toFixed(1) + "min (" + tlResult.source + ") -> " + Store.storyData.time + " " + Store.storyData.date);
 
@@ -710,6 +758,10 @@ export function bindEvents() {
         if (Store.settings.enabled && Store.settings.worldEnabled && worldTiersDue.length > 0) {
             if (!Store.worldBusy) {
                 await new Promise(function(r) { setTimeout(r, 1500); });
+                if (pipelineChatChanged()) {
+                    console.warn("[Story Tracker] Chat switched before the world tiers could run — abandoning them for this message.");
+                    return;
+                }
                 // runDueWorldTiers() owns its own HUD/toast feedback internally, and only shows
                 // it when tiers are genuinely about to run — not on every message check.
                 await runDueWorldTiers(worldTiersDue, timeBeforeMsg, rollbackTotals, bigSkipInfo);
@@ -735,6 +787,10 @@ export function bindEvents() {
             Store.setRelsBusy(true);
             try {
                 await new Promise(function(r) { setTimeout(r, 1500); });
+                if (pipelineChatChanged()) {
+                    console.warn("[Story Tracker] Chat switched before the relationship update could run — abandoning it for this message.");
+                    return;
+                }
                 HUD.setHudStatus("Relations...");
                 if (typeof toastr !== "undefined") toastr.info("Story Tracker: Analyzing relationships...", "", { timeOut: 0, extendedTimeOut: 0 });
                 await doRelationshipUpdate();
@@ -758,14 +814,17 @@ export function bindEvents() {
 
 // --- UI Rendering ---
 // --- Core LLM Scene Update Engine ---
-// timeAnchor (optional): { currentTime, currentDate, currentEpoch } — the clock as it stood
-// BEFORE this message's flat baseline tick, i.e. the reference point Scene Agent's own
-// time_advance answer measures the reviewed span from. Defaults to storyData's current
-// clock if not supplied (manual "Update Now" button, or the genesis call). Returns the
-// resulting clock info ({ elapsedMinutes, currentTime, currentDate, currentEpoch, source })
-// if time_advance produced a real correction (elapsed/advance_to_event), or null if it
-// didn't (schedule/none/invalid) — caller should keep whatever flat-baseline tlResult it
-// already had in that case.
+// timeAnchor (optional): { currentTime, currentDate, currentEpoch } — the clock as of the
+// LAST SCENE UPDATE (the start of the span this call reviews), i.e. the reference point
+// Scene Agent's time_advance answer measures the whole reviewed span from. Defaults to the
+// stored span anchor (falling back to storyData's current clock) when not supplied — the
+// manual "Update Now" button and the genesis call. The resulting clock is clamped
+// forward-only against the CURRENT clock, so a span answer smaller than the interim
+// baseline ticks can never wind the visible clock backward. Returns the resulting clock
+// info ({ elapsedMinutes, currentTime, currentDate, currentEpoch, source }) if time_advance
+// produced a real correction (elapsed/advance_to_event), or null if it didn't
+// (schedule/none/invalid) — caller should keep whatever flat-baseline tlResult it already
+// had in that case.
 export async function doLLMUpdate(timeAnchor) {
     if (!Store.genRaw) throw new Error("Story Tracker: Raw LLM generation not available.");
     if (!Store.isChatOpen()) throw new Error("Story Tracker: No active chat is open.");
@@ -774,7 +833,27 @@ export async function doLLMUpdate(timeAnchor) {
     loadStoryData();
     if (!Store.storyData) throw new Error("Story Tracker: No story data available.");
 
-    var anchorState = timeAnchor || { currentTime: Store.storyData.time, currentDate: Store.storyData.date, currentEpoch: Store.storyData._timeEpoch };
+    // Chat identity guard — checked again after every LLM await below, before any
+    // result is written. Store.storyData/chat_metadata are live bindings; a chat
+    // switch mid-call would otherwise land this chat's analysis in the new chat.
+    var chatIdAtEntry = Store.getCurrentChatId();
+
+    var anchorState = timeAnchor || (
+        (typeof Store.storyData._sceneAnchorEpoch === "number" && isFinite(Store.storyData._sceneAnchorEpoch))
+            ? { currentTime: Store.storyData._sceneAnchorTime, currentDate: Store.storyData._sceneAnchorDate, currentEpoch: Store.storyData._sceneAnchorEpoch }
+            : { currentTime: Store.storyData.time, currentDate: Store.storyData.date, currentEpoch: Store.storyData._timeEpoch }
+    );
+
+    // Forward-only floor for the resulting clock: whatever the visible clock reads
+    // RIGHT NOW. The span anchor above sits in the past (interim messages' baseline
+    // ticks have advanced the display since), so a small span answer computes a
+    // target before the current clock — clamp rather than ever moving backward.
+    var clockFloorEpoch = (typeof Store.storyData._timeEpoch === "number" && isFinite(Store.storyData._timeEpoch))
+        ? Store.storyData._timeEpoch
+        : (function () {
+            var parsed = Store.TimelineEngine.parseDateTime(Store.storyData.time, Store.storyData.date);
+            return parsed ? parsed.getTime() : null;
+        })();
 
     // Build recent chat context using checkpoint system.
     // First run: last 20 messages. Subsequent runs: only messages since last scene checkpoint.
@@ -868,6 +947,13 @@ export async function doLLMUpdate(timeAnchor) {
     var data = cleanAndParseJSON(raw);
     if (!data) throw new Error("Story Tracker: Failed to parse LLM scene analysis response.");
 
+    // The chat may have been switched while the LLM call was in flight — everything
+    // below MUTATES Store.storyData/worldData, which now belong to the new chat.
+    // Discard the stale result instead of contaminating the newly opened chat.
+    if (Store.getCurrentChatId() !== chatIdAtEntry) {
+        throw new Error("Story Tracker: chat changed during scene analysis — discarded the stale result.");
+    }
+
     // applySceneResponse() never reads a time/date field from the response even if present —
     // see SceneAgent.js. The only time-related value read anywhere is time_advance, handled
     // just below via the same validated (type, minutes) contract the old dedicated Time
@@ -898,6 +984,10 @@ export async function doLLMUpdate(timeAnchor) {
             var startingDateObj = Store.TimelineEngine.parseDateTime(startingTime, Store.storyData.date);
             if (startingDateObj) Store.storyData._timeEpoch = startingDateObj.getTime();
             anchorState = { currentTime: startingTime, currentDate: Store.storyData.date, currentEpoch: Store.storyData._timeEpoch };
+            // The forward-only floor was captured from the 12:00 placeholder — lower it
+            // to the just-established starting time, or an earlier pick (e.g. 08:30)
+            // would be clamped straight back up to the placeholder it replaced.
+            clockFloorEpoch = Store.storyData._timeEpoch;
             Store.storyData._timeSeededFrom = "llm";
             console.log("[Story Tracker] Genesis starting time established by Scene Agent: " + startingTime);
         } else {
@@ -980,6 +1070,18 @@ export async function doLLMUpdate(timeAnchor) {
         console.warn("[Story Tracker] Scene Agent time_advance application failed, keeping flat baseline:", e);
     }
     if (correctedTl) {
+        // Forward-only clamp: the span answer is measured from the last scene
+        // update's clock, which sits BEHIND the currently displayed clock (interim
+        // baseline ticks). A small answer must not wind the visible clock backward.
+        if (clockFloorEpoch != null && correctedTl.currentEpoch < clockFloorEpoch) {
+            var floorDate = new Date(clockFloorEpoch);
+            console.log("[Story Tracker] time_advance landed before the current clock (" + correctedTl.currentTime + ") — clamping forward-only to " + Store.TimelineEngine.formatTime(floorDate) + ".");
+            correctedTl = Object.assign({}, correctedTl, {
+                currentEpoch: clockFloorEpoch,
+                currentTime: Store.TimelineEngine.formatTime(floorDate),
+                currentDate: Store.TimelineEngine.formatDate(floorDate),
+            });
+        }
         Store.storyData.time = correctedTl.currentTime;
         Store.storyData.date = correctedTl.currentDate;
         Store.storyData._timeEpoch = correctedTl.currentEpoch;
@@ -1003,6 +1105,12 @@ export async function doLLMUpdate(timeAnchor) {
         }
     }
 
+    // Second chat-identity check: the city/country fallback above was another await
+    // the user could have switched chats during. Everything below persists state.
+    if (Store.getCurrentChatId() !== chatIdAtEntry) {
+        throw new Error("Story Tracker: chat changed during the city/country fallback — discarded the stale result.");
+    }
+
     // Mark initialized and record a history entry (uses fields expected by renderModal)
     Store.storyData._initialized = true;
     if (data.recent_events) {
@@ -1011,6 +1119,11 @@ export async function doLLMUpdate(timeAnchor) {
         Store.storyData.history.unshift({
             msg:         Store.storyData._historyCount,
             time:        Store.storyData.time,
+            // date was missing here for a long time, which silently disabled the
+            // PAST HISTORY TIMELINE grounding in every world/faction prompt:
+            // buildWorldTierContext calls parseRpDateTime(h.time, h.date), which
+            // returns null without a date, so every entry failed the filter.
+            date:        Store.storyData.date,
             loc:         Store.storyData.location,
             events:      data.recent_events,
             temperature: Store.storyData.temperature || "",
@@ -1027,6 +1140,13 @@ export async function doLLMUpdate(timeAnchor) {
         Store.storyData._sceneCheckpointAnchor = (lastSceneMsg && lastSceneMsg.mes)
             ? String(lastSceneMsg.mes).slice(0, 40) : "";
     }
+    // Span time-anchor for the NEXT scene call: elapsed answers measure from the
+    // clock as of THIS update's end. (handleMsg refreshes these again after
+    // applying its own tlResult, so the auto path includes this message's
+    // baseline/clamp too; this write covers the manual-update and genesis paths.)
+    Store.storyData._sceneAnchorTime = Store.storyData.time;
+    Store.storyData._sceneAnchorDate = Store.storyData.date;
+    Store.storyData._sceneAnchorEpoch = Store.storyData._timeEpoch;
     saveStoryData();
     window.syncToCharTracker();
     if (Store.settings.enabled) injectContextToChat();
@@ -1180,6 +1300,15 @@ function buildWorldTierContext() {
         var HISTORY_INJECT_CAP = 12;
         reversedHist.forEach(function(h) {
             if (addedCount >= HISTORY_INJECT_CAP) return;
+            // Entries saved before history carried a `date` field can't be
+            // compared against the current clock — include them anyway (they were
+            // all genuinely recorded in the past) rather than silently dropping
+            // them, which used to leave this whole timeline permanently empty.
+            if (!h.date) {
+                historyTimelineText += `- Time: ${h.time} (Event: ${h.events})\n`;
+                addedCount++;
+                return;
+            }
             var entryDateObj = parseRpDateTime(h.time, h.date);
             if (entryDateObj && curDateObj && entryDateObj.getTime() <= curDateObj.getTime()) {
                 historyTimelineText += `- Time: ${h.time} | Date: ${h.date} (Event: ${h.events})\n`;
@@ -1320,6 +1449,7 @@ function canonicalizeNpcName(npcStates, name) {
 // under it. Falls back to building its own (and the caller must save its own checkpoint —
 // see regenerateWorldSection) when called standalone with no sharedCtx.
 async function runNpcTier(isBatch, elapsedMinutes, sharedCtx) {
+    var tierChatId = Store.getCurrentChatId();
     var ctx = sharedCtx || buildWorldTierContext();
     // Cross-tier grounding: already-generated, already-stored faction/plot events, shown
     // as established background awareness only — see WorldAgent's CROSS-TIER GROUNDING
@@ -1337,6 +1467,13 @@ async function runNpcTier(isBatch, elapsedMinutes, sharedCtx) {
         elapsedMinutesSinceLastTick: elapsedMinutes,
     });
     var data = cleanAndParseJSON(await callWorldAgentPrompt(prompt));
+    // Chat switched mid-call: everything below writes into Store.worldData, which now
+    // belongs to the newly opened chat — discard rather than contaminate it.
+    if (Store.getCurrentChatId() !== tierChatId) throw new Error("chat changed during the npc tier's LLM call — discarded its stale result");
+    // A null parse is a FAILED call (garbage/truncated response), not a valid empty
+    // update — throwing lets the caller's rollback machinery retry next message.
+    // (A parseable {"npc_updates":[]} is still a legitimate "nothing happened".)
+    if (!data) throw new Error("failed to parse the npc tier's LLM response");
     // allowedGoalNames / allowedRoutineNames: the exact allow-lists offered in the prompt
     // above — hard-enforced here too, not just by prompt wording (see applyNpcTickResponse).
     var allowedGoalNames = ctx.npcsNeedingGoalText ? ctx.npcsNeedingGoalText.split(",").map(function(s) { return s.trim(); }) : null;
@@ -1413,6 +1550,7 @@ async function runNpcTier(isBatch, elapsedMinutes, sharedCtx) {
 
 // --- Weather tier ---
 async function runWeatherTier(isBatch, elapsedMinutes, sharedCtx) {
+    var tierChatId = Store.getCurrentChatId();
     var ctx = sharedCtx || buildWorldTierContext();
     var prompt = Store.WorldAgent.buildWeatherTickPrompt({
         currentTime: Store.storyData.time, currentDate: Store.storyData.date, isBatch: isBatch,
@@ -1421,6 +1559,8 @@ async function runWeatherTier(isBatch, elapsedMinutes, sharedCtx) {
         elapsedMinutesSinceLastTick: elapsedMinutes,
     });
     var data = cleanAndParseJSON(await callWorldAgentPrompt(prompt));
+    if (Store.getCurrentChatId() !== tierChatId) throw new Error("chat changed during the weather tier's LLM call — discarded its stale result");
+    if (!data) throw new Error("failed to parse the weather tier's LLM response"); // null parse = failed call, not a valid empty tick — throw so it retries
     var patch = Store.WorldAgent.applyWeatherTickResponse(data);
     if (patch) Store.worldData.weatherTrend = patch.weatherTrend;
     Store.worldData._initialized = true;
@@ -1430,6 +1570,7 @@ async function runWeatherTier(isBatch, elapsedMinutes, sharedCtx) {
 
 // --- Faction tier — the one tier with genuine per-event timestamps ---
 async function runFactionTier(isBatch, intervalList, elapsedMinutes, sharedCtx) {
+    var tierChatId = Store.getCurrentChatId();
     var ctx = sharedCtx || buildWorldTierContext();
     // Cross-tier grounding: already-persisted NPC activity, established-facts framing —
     // see WorldAgent's CROSS-TIER GROUNDING section.
@@ -1452,6 +1593,8 @@ async function runFactionTier(isBatch, intervalList, elapsedMinutes, sharedCtx) 
         elapsedMinutesSinceLastTick: isBatch ? null : elapsedMinutes,
     });
     var data = cleanAndParseJSON(await callWorldAgentPrompt(prompt));
+    if (Store.getCurrentChatId() !== tierChatId) throw new Error("chat changed during the faction tier's LLM call — discarded its stale result");
+    if (!data) throw new Error("failed to parse the faction tier's LLM response"); // null parse = failed call, not a valid empty tick — throw so it retries
     var patch = Store.WorldAgent.applyFactionTickResponse(data, isBatch ? intervalList : null, Store.storyData.time, Store.storyData.date);
 
     Store.worldData.worldEvents = Store.WorldAgent.mergeWorldEvents(Store.worldData.worldEvents, patch.events, 15);
@@ -1503,6 +1646,7 @@ async function runFactionTier(isBatch, intervalList, elapsedMinutes, sharedCtx) 
 
 // --- World tier (daily macro synthesis) ---
 async function runWorldTier(isBatch, elapsedMinutes, sharedCtx) {
+    var tierChatId = Store.getCurrentChatId();
     var ctx = sharedCtx || buildWorldTierContext();
     var recentFactionText = (Store.worldData.worldEvents || []).slice(0, 8).map(function(e) { return "- " + e.event; }).join("\n") || "None yet.";
     var prompt = Store.WorldAgent.buildWorldTickPrompt({
@@ -1514,6 +1658,8 @@ async function runWorldTier(isBatch, elapsedMinutes, sharedCtx) {
         elapsedMinutesSinceLastTick: elapsedMinutes,
     });
     var data = cleanAndParseJSON(await callWorldAgentPrompt(prompt));
+    if (Store.getCurrentChatId() !== tierChatId) throw new Error("chat changed during the world tier's LLM call — discarded its stale result");
+    if (!data) throw new Error("failed to parse the world tier's LLM response"); // null parse = failed call, not a valid empty tick — throw so it retries
     var patch = Store.WorldAgent.applyWorldTickResponse(data, 500);
     if (patch) Store.worldData.worldSummary = patch.summary;
     Store.worldData.lastTickTime = Store.storyData.time;
@@ -1606,6 +1752,10 @@ export async function runDueWorldTiers(orderedDueTiers, timeBeforeMsg, rollbackT
 
     rollbackTotals = rollbackTotals || {};
     bigSkipInfo = (bigSkipInfo && bigSkipInfo.isBigSkip && bigSkipInfo.totalElapsedMinutes > 0) ? bigSkipInfo : null;
+    // Which chat this batch belongs to — a switch mid-batch means the accumulators/
+    // checkpoint now live in the NEW chat's worldData, so neither the failure
+    // rollback nor the post-batch bookkeeping below may touch them anymore.
+    var batchChatId = Store.getCurrentChatId();
     Store.setWorldBusy(true);
     HUD.setHudStatus("World...");
     if (typeof toastr !== "undefined") toastr.info("Story Tracker: Running world tiers...", "", { timeOut: 0, extendedTimeOut: 0 });
@@ -1666,10 +1816,17 @@ export async function runDueWorldTiers(orderedDueTiers, timeBeforeMsg, rollbackT
             succeeded.push(due.tier);
         } catch (tierErr) {
             failed.push(due.tier);
-            console.warn("[Story Tracker] World tier '" + due.tier + "' failed — rolling back its scheduler accumulator so it retries next message instead of waiting a full fresh interval:", tierErr);
-            if (Store.worldData && Store.worldData._schedulerAccumulated && rollbackTotals.hasOwnProperty(due.tier)) {
-                Store.worldData._schedulerAccumulated[due.tier] = rollbackTotals[due.tier];
-                saveWorldData();
+            if (Store.getCurrentChatId() !== batchChatId) {
+                // The failure IS the chat switch (the tier's own guard threw) — the
+                // accumulators now belong to the newly opened chat, so restoring the
+                // OLD chat's rollback totals into them would corrupt the new chat.
+                console.warn("[Story Tracker] World tier '" + due.tier + "' abandoned — chat switched mid-batch; skipping rollback (the accumulators belong to the new chat now).");
+            } else {
+                console.warn("[Story Tracker] World tier '" + due.tier + "' failed — rolling back its scheduler accumulator so it retries next message instead of waiting a full fresh interval:", tierErr);
+                if (Store.worldData && Store.worldData._schedulerAccumulated && rollbackTotals.hasOwnProperty(due.tier)) {
+                    Store.worldData._schedulerAccumulated[due.tier] = rollbackTotals[due.tier];
+                    saveWorldData();
+                }
             }
         }
     }
@@ -1706,15 +1863,20 @@ export async function runDueWorldTiers(orderedDueTiers, timeBeforeMsg, rollbackT
         // Advance the shared checkpoint exactly once for the whole batch, and only if at
         // least one tier actually consumed this window — mirrors the old per-tier behavior
         // (which only ever saved on that tier's success path) without letting a later tier
-        // in the batch see an already-advanced checkpoint from an earlier one.
-        if (succeeded.length > 0) {
+        // in the batch see an already-advanced checkpoint from an earlier one. Skipped
+        // entirely if the chat switched mid-batch: worldData now belongs to the new chat,
+        // and this checkpoint/accumulator bookkeeping describes the OLD one.
+        if (succeeded.length > 0 && Store.getCurrentChatId() === batchChatId) {
             saveWorldCheckpoint(sharedCtx.originalChat);
             if (bigSkipInfo && Store.worldData && Store.worldData._schedulerAccumulated) {
                 // The whole gap was just accounted for above regardless of what the normal
                 // per-tier tick math says, so every tier (not just the ones that happened to
-                // be "due") starts its next cadence fresh from here.
+                // be "due") starts its next cadence fresh from here — EXCEPT tiers that
+                // failed this batch: their rollback was just restored a few lines up, and
+                // zeroing it here would erase their retry, silently losing the skipped
+                // interval for exactly the tiers that never got to process it.
                 ["npc", "weather", "faction", "world"].forEach(function (t) {
-                    Store.worldData._schedulerAccumulated[t] = 0;
+                    if (failed.indexOf(t) === -1) Store.worldData._schedulerAccumulated[t] = 0;
                 });
             }
             saveWorldData();
@@ -1937,10 +2099,18 @@ export async function doRelationshipUpdate() {
     });
 
     console.log("[Story Tracker] Running relationship analysis...");
+    var relChatId = Store.getCurrentChatId();
     var raw = await withRelConnectionProfile(async function() {
         try { return await Store.genRaw({ prompt: prompt, quietToLoud: true }); }
         catch(e) { logGenRawFailure("relationship tracker", e); return await Store.genRaw(prompt, null, false, true); }
     });
+
+    // Chat switched while the LLM call was in flight — the merge below would write
+    // this chat's relationships into the newly opened chat's data. Discard.
+    if (Store.getCurrentChatId() !== relChatId) {
+        console.warn("[Story Tracker] Chat changed during relationship analysis — discarded the stale result.");
+        return;
+    }
 
     var rawData = cleanAndParseJSON(raw);
     var validated = Store.RelationshipAgent.applyRelationshipResponse(rawData);
@@ -1992,7 +2162,16 @@ export async function doRelationshipUpdate() {
         strength = Math.max(-1, Math.min(1, strength));
 
         var pairKey = rel.from < rel.to ? (rel.from + "\u241F" + rel.to) : (rel.to + "\u241F" + rel.from);
-        var isAsymmetricPair = directionsByPairKey[pairKey] && directionsByPairKey[pairKey].size > 1;
+        var responseAsymmetric = directionsByPairKey[pairKey] && directionsByPairKey[pairKey].size > 1;
+        // STORED state counts too, not just this response's directions: if both A\u2192B
+        // and B\u2192A already exist as separate edges, the pair is established as
+        // asymmetric \u2014 a response that happens to mention only one side this tick
+        // must update exactly that side. Inferring mutuality from the response
+        // alone let a single-direction update land on whichever stored direction
+        // sorted first, overwriting the OTHER character's side of the pair.
+        var storedAsymmetric = Store.RelationshipAgent.findEdgeIndex(Store.relationshipData.edges, rel.from, rel.to) !== -1 &&
+                               Store.RelationshipAgent.findEdgeIndex(Store.relationshipData.edges, rel.to, rel.from) !== -1;
+        var isAsymmetricPair = responseAsymmetric || storedAsymmetric;
 
         // Ensure both character nodes exist (already-resolved names match
         // existing nodes exactly, so this only adds genuinely new characters)
