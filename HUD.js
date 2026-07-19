@@ -298,11 +298,69 @@ function weatherIconFor(text) {
     return "fa-cloud-sun";
 }
 
-/** One flex row: icon in a fixed gutter, text taking the rest of the width so a
- * wrap indents under the text rather than back under the icon. */
-function metaRow(icon, html, extraClass) {
-    return '<div class="st-hud-meta-row' + (extraClass ? " " + extraClass : "") + '">' +
-        '<i class="fa-solid ' + icon + '"></i><span class="st-hud-meta-text">' + html + "</span></div>";
+/** One pill chip: accent icon + truncating text. Location/weather/city rows
+ * render as these instead of full-width meta rows (Glance Card redesign). */
+function chip(icon, text) {
+    if (!text) return "";
+    return '<span class="st-hud-chip" title="' + esc(text) + '">' +
+        '<i class="fa-solid ' + icon + '"></i><span>' + esc(text) + "</span></span>";
+}
+
+/** Monogram for the avatar disc — same "+N"/digit-aware extraction the modal's
+ * character cards use, reduced to the single-glyph HUD size. */
+function charInitial(name) {
+    var trimmed = String(name || "").trim();
+    if (!trimmed) return "?";
+    var m = trimmed.match(/^(\+\d+|\d+)/);
+    if (m) return m[1];
+    return trimmed.charAt(0).toUpperCase();
+}
+
+/** Day-part icon for the clock disc, mapped from the same describeTimeOfDay()
+ * labels every tracker prompt uses — so the disc and the prompts can never
+ * disagree about what "evening" means. */
+function dayPartInfo(timeStr) {
+    var label = (Store.TimelineEngine && typeof Store.TimelineEngine.describeTimeOfDay === "function")
+        ? Store.TimelineEngine.describeTimeOfDay(timeStr)
+        : "";
+    var icon = "fa-clock";
+    if (label === "night") icon = "fa-moon";
+    else if (label === "early morning") icon = "fa-cloud-sun";
+    else if (label === "morning" || label === "midday" || label === "afternoon") icon = "fa-sun";
+    else if (label === "evening") icon = "fa-cloud-moon";
+    return { label: label, icon: icon };
+}
+
+/**
+ * pickNextCheck()
+ * The thin progress hairline under the signal line: when the next automatic
+ * Scene check is coming, as a 0..1 fraction + a short label. Renders the SAME
+ * numbers the modal footer's countdown already computes (message counter in
+ * Message Mode, the scene accumulator in Smart Time) — no new state, purely a
+ * second surface for it. Returns null when auto-update is off for this chat
+ * (no bar is shown rather than a permanently-empty one).
+ */
+function pickNextCheck() {
+    var storyData = Store.storyData, settings = Store.settings;
+    var autoUpdate = (storyData.autoUpdate !== undefined) ? storyData.autoUpdate : settings.autoUpdate;
+    if (!autoUpdate) return null;
+
+    if (settings.timeMode === "message") {
+        var interval = settings.messageModeInterval || 5;
+        var count = storyData._timeModeMsgCounter || 0;
+        var rem = Math.max(0, interval - count);
+        return {
+            frac: Math.max(0, Math.min(1, count / interval)),
+            label: rem === 0 ? "Scene check · due" : "Scene check · " + rem + " msg" + (rem === 1 ? "" : "s"),
+        };
+    }
+    var intervalMin = settings.sceneTierMinutes || 5;
+    var accum = (Store.worldData && Store.worldData._schedulerAccumulated) ? (Store.worldData._schedulerAccumulated.scene || 0) : 0;
+    var remMin = Math.max(0, intervalMin - accum);
+    return {
+        frac: Math.max(0, Math.min(1, accum / intervalMin)),
+        label: remMin === 0 ? "Scene check · due" : "Scene check · ~" + remMin.toFixed(0) + "min RP",
+    };
 }
 
 /** Picks the single most relevant "what's worth knowing right now" line, in
@@ -328,6 +386,7 @@ function pickSignal() {
                 : "~" + (u.minsUntil / 60).toFixed(u.minsUntil % 60 === 0 ? 0 : 1) + "h";
             return {
                 icon: "fa-hourglass-half",
+                kind: "event",
                 html: esc(u.ev.action) + ' <span class="st-hud-signal-meta">(' + etaStr + ")</span>",
                 title: u.ev.action,
             };
@@ -344,7 +403,7 @@ function pickSignal() {
         // SHOULD persist across redraws; it now only changes when worldEvents do.
         var pulse = Store.WorldAgent.selectWorldPulse(worldData.worldEvents, pulseCtx);
         if (pulse) {
-            return { icon: "fa-globe", html: '<span class="st-hud-signal-italic">' + esc(pulse.text) + "</span>", title: "World pulse" };
+            return { icon: "fa-globe", kind: "world", html: '<span class="st-hud-signal-italic">' + esc(pulse.text) + "</span>", title: "World pulse" };
         }
     }
 
@@ -366,6 +425,7 @@ function pickSignal() {
             var arrow = ((mostChanged.strength || 0) > (mostChanged.history[0].strength || 0)) ? "\u2197" : "\u2198";
             return {
                 icon: "fa-share-nodes",
+                kind: "rel",
                 html: esc(mostChanged.from) + (isAsymmetric ? " \u2192 " : " \u2194 ") + esc(mostChanged.to) +
                     ' <span class="st-hud-signal-meta">' + arrow + " " + esc(mostChanged.type) + "</span>",
                 title: "Relationship shift",
@@ -389,21 +449,31 @@ export function renderHUD() {
     var storyData = Store.storyData, settings = Store.settings;
     var dow = window.getDayOfWeek ? window.getDayOfWeek(storyData.date) : null;
 
-    var h = '<div class="st-hud-meta">';
-    h += metaRow("fa-clock", "<strong>" + esc(storyData.time) + "</strong> &middot; " + (dow ? esc(dow) + ", " : "") + esc(storyData.date));
-    h += metaRow("fa-location-dot", esc(storyData.location));
+    // --- Clock focal block (Glance Card): big tabular digits lead, weekday/date
+    // tucked beside them, and a day-part disc that makes the time-tint feature
+    // legible as an actual sun/moon cue instead of only a background wash.
+    var dayPart = dayPartInfo(storyData.time);
+    var h = '<div class="st-hud-clock">';
+    h += '<div class="st-hud-clock-time">' + esc(storyData.time) + "</div>";
+    h += '<div class="st-hud-clock-side">' +
+        (dow ? "<span>" + esc(dow) + "</span>" : "") +
+        "<span>" + esc(storyData.date) + "</span></div>";
+    h += '<div class="st-hud-daypart"' + (dayPart.label ? ' title="' + esc(dayPart.label) + '"' : "") + '><i class="fa-solid ' + dayPart.icon + '"></i></div>';
+    h += "</div>";
+
+    // --- Location / city / weather as compact chips instead of full-width rows.
+    var chips = chip("fa-location-dot", storyData.location);
     if (settings.showCityCountry) {
         var city = storyData.city || "", country = storyData.country || "";
         var ccText = [city, country].filter(function (v) { return v && v !== "Unknown"; }).join(", ");
-        if (ccText) h += metaRow("fa-earth-europe", esc(ccText));
+        if (ccText) chips += chip("fa-earth-europe", ccText);
     }
     if ((storyData.temperature && storyData.temperature !== "Unknown") || (storyData.weather && storyData.weather !== "Unknown")) {
-        var tempStr = storyData.temperature && storyData.temperature !== "Unknown" ? esc(storyData.temperature) : "";
-        var weatherStr = storyData.weather && storyData.weather !== "Unknown" ? esc(storyData.weather) : "";
-        var sep = tempStr && weatherStr ? " &middot; " : "";
-        h += metaRow(weatherIconFor(storyData.weather), tempStr + sep + weatherStr);
+        var tempStr = storyData.temperature && storyData.temperature !== "Unknown" ? storyData.temperature : "";
+        var weatherStr = storyData.weather && storyData.weather !== "Unknown" ? storyData.weather : "";
+        chips += chip(weatherIconFor(storyData.weather), [tempStr, weatherStr].filter(Boolean).join(" · "));
     }
-    h += "</div>";
+    if (chips) h += '<div class="st-hud-chips">' + chips + "</div>";
 
     var outfit = window.getInventoryOutfit ? window.getInventoryOutfit() : null;
     var userName = (Store.scriptModule && Store.scriptModule.name1) ? Store.scriptModule.name1 : null;
@@ -424,8 +494,14 @@ export function renderHUD() {
                 var held = outfit.charItems.filter(function (ci) { return ci.heldBy && ci.heldBy.toLowerCase() === c.name.toLowerCase(); });
                 if (held.length > 0) stateText += ", holding " + held.map(function (ci) { return ci.name; }).join(", ");
             }
-            h += '<div class="st-hud-char-row"><div class="st-hud-char-name">' + esc(c.name) + '</div>' +
-                '<div class="st-hud-char-state">' + esc(stateText) + "</div></div>";
+            // Monogram avatar (accent ring) + stacked name/state — mirrors the
+            // modal's character cards so HUD and modal read as one system. The
+            // player's row carries a small "· you" tag.
+            h += '<div class="st-hud-char-row">' +
+                '<span class="st-hud-avatar">' + esc(charInitial(c.name)) + "</span>" +
+                '<div class="st-hud-char-txt">' +
+                '<div class="st-hud-char-name">' + esc(c.name) + (isUser ? ' <span class="st-hud-char-you">&middot; you</span>' : "") + "</div>" +
+                '<div class="st-hud-char-state">' + esc(stateText) + "</div></div></div>";
         });
         h += "</div>";
     }
@@ -433,8 +509,19 @@ export function renderHUD() {
     var signal = pickSignal();
     if (signal) {
         h += '<div class="st-hud-divider"></div>';
-        h += '<div class="st-hud-signal" title="' + esc(signal.title || "") + '">' +
+        // Kind-coded left tick: accent for a scheduled event, fixed semantic hues
+        // for world pulse / relationship shift (see style.css) — learn the color
+        // once, then read the HUD without reading it.
+        h += '<div class="st-hud-signal st-hud-signal-' + (signal.kind || "event") + '" title="' + esc(signal.title || "") + '">' +
             '<i class="fa-solid ' + signal.icon + '"></i><span class="st-hud-signal-text">' + signal.html + "</span></div>";
+    }
+
+    // --- Next-check hairline: the same countdown the modal footer prints, as a
+    // 3px progress bar + tiny label. Hidden entirely when auto-update is off.
+    var next = pickNextCheck();
+    if (next) {
+        h += '<div class="st-hud-progress"><span class="st-hud-progress-fill" style="width:' + Math.round(next.frac * 100) + '%"></span></div>' +
+            '<div class="st-hud-progress-label">' + esc(next.label) + "</div>";
     }
 
     $("#st-hud-body").html(h);

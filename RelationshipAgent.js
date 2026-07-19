@@ -492,3 +492,63 @@ export function buildStrengthTimeline(edge, maxPoints) {
     oldestFirst.push(typeof edge.strength === "number" ? edge.strength : 0);
     return oldestFirst;
 }
+
+// =============================================================================
+// CROSS-TIER GROUNDING — relationship context for the World Agent's tiers.
+// Same principle as WorldAgent's own CROSS-TIER GROUNDING section: this only
+// ever formats ALREADY-VALIDATED, ALREADY-STORED edges as established-facts
+// reference material for another tier's prompt — nothing here is freshly
+// synthesized, and the world tiers are never invited to update relationship
+// state themselves (the relationship tracker keeps sole write authority).
+// The payoff: offscreen NPC behavior and faction developments can stay
+// emotionally consistent with the tracked story — a rival doesn't run
+// friendly errands, a devoted ally doesn't quietly undermine — instead of
+// the world simulation being blind to how its actors feel about each other.
+// =============================================================================
+
+/**
+ * formatRelationshipsForWorldPrompt(edges, relevantNames, maxCount)
+ *
+ * Selects the edges touching anyone in `relevantNames` (matched via
+ * normalizeNameKey, the same normalization the rest of this module uses, so
+ * "Capt. Reyes" in npcStates still matches the "Captain Reyes" node), sorts
+ * them strongest-feeling-first (|strength| — the bonds and grudges that most
+ * shape behavior), caps the list, and renders one line per edge in the same
+ * arrow convention as the main context injection: ↔ for a mutual dynamic,
+ * → with an explicit one-sided tag for an asymmetric one, so a world tier
+ * never lets the unaware party act on a feeling they were never shown.
+ *
+ * Returns null (not "") when nothing qualifies, so callers can cleanly omit
+ * the whole prompt block — same convention as WorldAgent's formatters.
+ */
+export function formatRelationshipsForWorldPrompt(edges, relevantNames, maxCount) {
+    maxCount = maxCount || 8;
+    edges = edges || [];
+    if (edges.length === 0) return null;
+
+    var relevantKeys = {};
+    (relevantNames || []).forEach(function (n) {
+        var key = normalizeNameKey(n);
+        if (key) relevantKeys[key] = true;
+    });
+
+    var matched = edges.filter(function (e) {
+        if (!e || !e.from || !e.to) return false;
+        return relevantKeys[normalizeNameKey(e.from)] || relevantKeys[normalizeNameKey(e.to)];
+    });
+    if (matched.length === 0) return null;
+
+    matched = matched.slice().sort(function (a, b) {
+        return Math.abs(b.strength || 0) - Math.abs(a.strength || 0);
+    });
+
+    return matched.slice(0, maxCount).map(function (e) {
+        var sign = (e.strength || 0) >= 0 ? "+" : "";
+        var oneSided = hasReciprocalEdge(edges, e.from, e.to);
+        var line = "- " + e.from + (oneSided ? " → " : " ↔ ") + e.to +
+                   ": " + (e.type || "neutral") + " (" + sign + (e.strength || 0).toFixed(1) + ")";
+        if (e.summary) line += " — " + e.summary;
+        if (oneSided) line += " [one-sided: " + e.to + " has not been shown to share or know of this]";
+        return line;
+    }).join("\n");
+}

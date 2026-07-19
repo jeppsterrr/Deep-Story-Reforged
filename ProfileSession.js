@@ -46,6 +46,21 @@ export async function switchProfile(name) {
         console.warn("[Story Tracker] Connection profile '" + name + "' was not found in the profile list; skipping switch and using the currently active profile instead.");
         return false;
     }
+    // Flush any pending (debounced) chat-metadata writes to DISK before switching:
+    // applying a connection profile makes ST re-apply its preset/instruct settings,
+    // which can RELOAD the current chat from disk — and any tracker data still
+    // sitting in the debounce window is silently wiped by that reload. Observed
+    // as: genesis data flashes on the HUD, then everything reverts to "Waiting
+    // for the story to begin…" the moment the pipeline restores the original
+    // profile. With the flush, the reload re-reads the data instead of erasing it
+    // (CHAT_CHANGED then reloads it into the trackers as usual).
+    try {
+        if (Store.isChatOpen() && Store.scriptModule && typeof Store.scriptModule.saveMetadata === "function") {
+            await Store.scriptModule.saveMetadata();
+        }
+    } catch (e) {
+        console.warn("[Story Tracker] Pre-switch metadata flush failed (continuing with the profile switch):", e);
+    }
     var t0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
     try {
         await Store.runSlash('/profile "' + String(name).replace(/"/g, '\\"') + '"');

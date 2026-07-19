@@ -34,6 +34,26 @@ function getRandomDate() {
     return padZero(d.getDate()) + "/" + padZero(d.getMonth() + 1) + "/" + d.getFullYear();
 }
 
+/**
+ * mergeSeededDate(fallbackDateStr, seed)
+ *
+ * Lays TimelineEngine.seedInitialDate()'s per-field partial result over the
+ * random fallback date: any part the opening text explicitly stated (day/
+ * month/year) overrides the random one, anything unstated keeps the random
+ * value — so "Christmas Eve" pins 24/12 with a random year, "in 1899" pins
+ * the year with a random day/month. Day is clamped to the real length of the
+ * resolved month/year so a merge can never produce "31/02".
+ */
+function mergeSeededDate(fallbackDateStr, seed) {
+    var parts = String(fallbackDateStr || "01/01/2026").split("/");
+    var day = seed.day != null ? seed.day : (parseInt(parts[0], 10) || 1);
+    var month = seed.month != null ? seed.month : (parseInt(parts[1], 10) || 1);
+    var year = seed.year != null ? seed.year : (parseInt(parts[2], 10) || 2026);
+    var maxDay = new Date(year, month, 0).getDate();
+    if (day > maxDay) day = maxDay;
+    return padZero(day) + "/" + padZero(month) + "/" + year;
+}
+
 // --- Time and Date Sanitization Helpers (used by the manual "Correct Tracked Time" UI) ---
 export function sanitizeTimeStr(timeStr, fallbackTimeStr) {
     if (typeof timeStr !== "string") return fallbackTimeStr || "12:00";
@@ -98,7 +118,7 @@ export function makeDefaultData() {
         city: "Unknown", country: "Unknown",
         temperature: "Unknown", weather: "Unknown",
         characters: [], recent_events: "Story just started.",
-        history: [], _initialized: false, _msgCount: 0, _relMsgCount: 0, _historyCount: 0,
+        history: [], _initialized: false, _relMsgCount: 0, _historyCount: 0,
         _lastCountedMsgId: -1,
         autoUpdate: Store.settings ? Store.settings.autoUpdate : true,
         _passiveAccumMinutes: 0, // legacy field, no longer written to; left for old saves
@@ -120,6 +140,7 @@ export function makeDefaultWorldData() {
         worldSummary: "",
         weatherTrend: "",
         locationCodex: {},
+        loreDigest: [], // "World Rules" — genesis-distilled card lore; see WorldAgent's WORLD RULES DIGEST section
         _initialized: false,
         _schedulerAccumulated: { scene: 0, npc: 0, weather: 0, faction: 0, world: 0 },
         _eventQueue: []
@@ -209,7 +230,6 @@ export function loadStoryData() {
     var storyData;
     if (stored) {
         storyData = stored;
-        Store.setMsgCounter(storyData._msgCount || 0);
         Store.setRelMsgCounter(storyData._relMsgCount || 0);
         if (!storyData.history) storyData.history = [];
         if (storyData.autoUpdate === undefined) storyData.autoUpdate = settings.autoUpdate;
@@ -244,11 +264,6 @@ export function loadStoryData() {
             storyData._lastCountedMsgId = (liveChat && liveChat.length) ? liveChat.length - 1 : -1;
         }
         Store.setLastCountedMsgId(storyData._lastCountedMsgId);
-
-        if (typeof storyData._lastTimelineMsgId !== "number") {
-            storyData._lastTimelineMsgId = storyData._lastCountedMsgId;
-        }
-        Store.setLastTimelineMsgId(storyData._lastTimelineMsgId);
     } else {
         storyData = makeDefaultData();
         // --- Genesis seeding --- TimelineEngine can only ADVANCE time from a known baseline,
@@ -265,14 +280,34 @@ export function loadStoryData() {
             // starting clock instead of leaving the placeholder in place.
             storyData._timeSeededFrom = genesis ? "text" : "fallback";
             if (genesis) console.log("[Story Tracker] Genesis time seeded from opening text: " + genesis.time + " (" + genesis.reason + ")");
+
+            // --- Genesis DATE seeding --- same philosophy as the time scan above:
+            // deterministic, no LLM, honest fallback. makeDefaultData() started from
+            // a random date; any parts the opening text explicitly states (day/month/
+            // year — often only some of them) override the random ones via
+            // mergeSeededDate(). _dateSeededFrom mirrors _timeSeededFrom exactly:
+            // "fallback" tells the genesis Scene call to ask the model for a
+            // starting_date (see Pipeline.doLLMUpdate), so the random date only ever
+            // survives when neither the scan nor the model produced anything usable.
+            var dateSeed = (typeof Store.TimelineEngine.seedInitialDate === "function")
+                ? Store.TimelineEngine.seedInitialDate(introText, { hemisphere: Store.settings ? Store.settings.seasonHemisphere : "northern" })
+                : null;
+            if (dateSeed) {
+                storyData.date = mergeSeededDate(storyData.date, dateSeed);
+                storyData._dateSeededFrom = "text";
+                console.log("[Story Tracker] Genesis date seeded from opening text: " + storyData.date + " (" + dateSeed.reason + ")");
+            } else {
+                storyData._dateSeededFrom = "fallback";
+            }
+
             var genesisDate = Store.TimelineEngine.parseDateTime(storyData.time, storyData.date);
             storyData._timeEpoch = genesisDate ? genesisDate.getTime() : null;
         } else {
             storyData.time = "12:00"; // TimelineEngine not loaded yet — safe neutral fallback
             storyData._timeSeededFrom = "fallback";
+            storyData._dateSeededFrom = "fallback";
         }
         if (meta) meta[DATA_KEY] = storyData;
-        Store.setMsgCounter(0);
         Store.setLastCountedMsgId(storyData._lastCountedMsgId);
     }
     Store.setStoryData(storyData);
@@ -293,6 +328,7 @@ export function loadWorldData() {
         if (!worldData.pendingReveals) worldData.pendingReveals = [];
         if (worldData.weatherTrend === undefined) worldData.weatherTrend = "";
         if (!worldData.locationCodex) worldData.locationCodex = {};
+        if (!Array.isArray(worldData.loreDigest)) worldData.loreDigest = [];
         if (!worldData._schedulerAccumulated) worldData._schedulerAccumulated = { scene: 0, npc: 0, weather: 0, faction: 0, world: 0 };
         if (!worldData._eventQueue) worldData._eventQueue = [];
     } else {
@@ -326,10 +362,8 @@ export function saveStoryData() {
     // CHAT_CHANGED/loadStoryData has run this session (init race) — bail instead
     // of throwing on `storyData._msgCount = ...` below.
     if (!storyData || !Store.isChatOpen() || !Store.scriptModule || !Store.scriptModule.chat_metadata) return;
-    storyData._msgCount = Store.msgCounter;
     storyData._relMsgCount = Store.relMsgCounter;
     storyData._lastCountedMsgId = Store.lastCountedMsgId;
-    storyData._lastTimelineMsgId = Store.lastTimelineMsgId;
     Store.scriptModule.chat_metadata[DATA_KEY] = storyData;
     if (typeof Store.saveMetaFn === "function") {
         Store.saveMetaFn();

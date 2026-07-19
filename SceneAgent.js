@@ -33,11 +33,12 @@
  * that goes through TimelineEngine.applyTimeResolverResponse() for validation
  * before the caller (index.js) is allowed to touch the clock with it — see
  * applySceneTimeAdvance() below. One narrow, deliberate exception exists for
- * GENESIS only: when deterministic seeding found no time cue in the opening
- * text, the initial-setup call may return a `starting_time` that establishes
- * the baseline the clock advances from — strictly validated, read exactly
- * once, never after initialization. See extractStartingTime() for why this
- * doesn't weaken the ongoing-clock invariant.
+ * GENESIS only: when deterministic seeding found no time cue (or no date cue)
+ * in the opening text, the initial-setup call may return a `starting_time`
+ * and/or `starting_date` that establishes the baseline the clock advances
+ * from — strictly validated, read exactly once, never after initialization.
+ * See extractStartingTime()/extractStartingDate() for why this doesn't weaken
+ * the ongoing-clock invariant.
  *
  * Depends on TimelineEngine only for that shared validator and the pacing
  * guide text (both pure, no LLM calls) — still no side effects, no ST
@@ -45,7 +46,8 @@
  * ---------------------------------------------------------------------------
  */
 
-import { applyTimeResolverResponse, PACING_EXAMPLE_GUIDE, TIME_ANCHOR_GUIDE, formatTimeForPrompt } from "./TimelineEngine.js";
+import { applyTimeResolverResponse, PACING_EXAMPLE_GUIDE, TIME_ANCHOR_GUIDE, formatTimeForPrompt, parseDateTime, formatDate } from "./TimelineEngine.js";
+import { LORE_DIGEST_GUIDE } from "./WorldAgent.js";
 
 // =============================================================================
 // PREVIOUS STATE BLOCK
@@ -157,6 +159,41 @@ export function buildScenePrompt(input) {
     var startingTimeInstruction = input.askStartingTime
         ? "5b. STARTING TIME (initial setup only): The system could not determine this story's starting clock time from the opening text. Include a \"starting_time\" field (\"HH:MM\", 24-hour). If the text states or implies a time of day — even passively (dawn light, midday heat, a moonlit street, characters at breakfast) — use the TIME-OF-DAY ANCHOR HOURS table below to land on the matching hour. If the opening is genuinely ambiguous, choose any plausible time that fits the scene freely — your answer becomes the story's established starting clock. Also set time_advance to {\"type\":\"none\"} for this initial setup: starting_time IS the clock, nothing has elapsed yet.\n"
         : "";
+    // Genesis-only, mirror of starting_time above (see extractStartingDate): the
+    // deterministic date scan found no calendar cue, so the fallback date is
+    // random — the one call allowed to replace it with something that actually
+    // fits the story.
+    var startingDateInstruction = input.askStartingDate
+        ? "5c. STARTING DATE (initial setup only): The system could not determine this story's starting calendar date from the opening text. Include a \"starting_date\" field (\"DD/MM/YYYY\"). If the text states or implies anything usable — a named day or holiday, a season, a stated year, an era or level of technology — pick a date consistent with it (a modern-day setting should get a plausible present-day date, a historical one a fitting historical year). For a fictional world with its own calendar, still return DD/MM/YYYY with whatever year FEELS right for the setting (any year from 100 to 9999 is accepted). If genuinely ambiguous, choose any plausible date freely — your answer becomes the story's established starting date.\n"
+        : "";
+
+    // --- Genesis seeds (initial setup only) ---------------------------------
+    // The one moment where scene, world, relationships, and the lore digest all
+    // share an IDENTICAL evidence base (the opening text + card lore), so
+    // establishing them in this single call costs one context payload instead of
+    // several. Each section is validated independently by the caller (see
+    // Pipeline.applyGenesisSeeds) — a fumbled section just leaves that subsystem
+    // to initialize lazily the way it always did, never poisoning the others.
+    var worldSeedInstruction = input.askWorldSeed
+        ? ("7. WORLD SEED (initial setup only): Establish the wider world's starting state in a \"world_seed\" object:\n" +
+           "   - \"summary\": 2-3 grounded, chronicle-like sentences on the state of the wider world implied by the lore/opening — the big picture beyond this one scene (tensions, powers in motion, what the region is living through). No flowery language.\n" +
+           "   - \"weather_trend\": ONE short sentence describing the broader REGIONAL weather pattern right now (distinct from the scene's immediate weather above).\n" +
+           "   - \"npc_states\": 0-6 entries of {\"name\",\"change\"} for named characters the lore/opening establishes as existing OFFSCREEN — what each is plausibly doing right now. Only people explicitly named in the lore or opening text, never invented ones, and never characters already listed as present in the scene. You MAY add a \"goal\" field for an NPC when the lore explicitly states what they're working toward.\n" +
+           "   - \"pending_reveals\": 0-2 secrets the lore/opening explicitly establishes that the protagonists do NOT yet know (a hidden identity, a concealed agenda, an unrevealed danger). Empty array if none are stated — never invent one.\n")
+        : "";
+    var relationshipSeedInstruction = input.askRelationshipSeed
+        ? ("8. RELATIONSHIP SEED (initial setup only): In \"relationship_seed\", record the story's STARTING relationship web:\n" +
+           "   - Pairs the lore/opening text EXPLICITLY establishes — stated bonds, family ties, rivalries, allegiances (\"X serves Y\", \"they grew up together\"). This is canon-recording, not inference: no entry for a pair the text says nothing specific about.\n" +
+           "   - INCLUDE " + userName + " (the player character) — they are a full participant in this web, not an observer. If the lore defines a relationship to the player, record it. ADDITIONALLY, for each character " + userName + " directly interacts with in the opening messages, record ONE mutual entry for that pair describing the current first-impression dynamic between them (typically 'neutral' with a small strength between -0.2 and +0.2 and a summary like \"Wary curiosity on both sides\") — grounded in what the text shows, never invented shared history. Do NOT leave " + userName + " with zero entries if they interacted with anyone in the opening.\n" +
+           "   - An empty list is only correct when nothing is stated in the lore AND nobody interacted in the opening.\n" +
+           "   \"type\" must be exactly one of: " + (input.relationshipTypesText || "romance, friendship, family, alliance, rivalry, hostile, mentor, neutral") + ". \"strength\" is a decimal from -1.0 (hostile) to 1.0 (deeply bonded). Keep each \"summary\" under 20 words. ONE entry per pair is the rule — the from/to order doesn't matter for a mutual dynamic. Two directional entries for the same pair are the RARE exception, reserved for a stated, significant asymmetry (unrequited love, a betrayal only one of them knows about); a mild difference in attitude is still ONE mutual entry — put the nuance in the summary instead of splitting the pair. Optionally include \"character_bios\": one plain sentence per named character establishing who they are.\n")
+        : "";
+    var loreDigestInstruction = input.askLoreDigest
+        ? ("9. WORLD RULES DIGEST (initial setup only): Include a \"lore_digest\" array distilling the ESTABLISHED CHARACTER CARD LORE below (plus anything the opening text establishes) into this world's stable ground rules. This digest is stored permanently and shown to the world-simulation system INSTEAD of the full card text from now on, so accuracy matters more than completeness.\n" + LORE_DIGEST_GUIDE)
+        : "";
+    var loreBlock = (input.characterLoreText && String(input.characterLoreText).trim())
+        ? "ESTABLISHED CHARACTER CARD LORE (ground truth — source material for the seed sections above):\n" + input.characterLoreText + "\n\n"
+        : "";
 
     return (
         "[OOC: You are a narrative assistant. Analyze the roleplay chat so far, determine the current scene context, AND decide how much real narrative time has passed.\n\n" +
@@ -172,10 +209,15 @@ export function buildScenePrompt(input) {
         "4. RECENT EVENTS: Write a brief, factual 1-2 sentence summary of what just changed or happened in the last few messages. Use the player's actual name, not 'User'.\n" +
         "5. TIME_ADVANCE: Decide which ONE of four cases applies to how much real time passed across the messages you just reviewed, and fill the `time_advance` field accordingly. This replaces the flat per-message clock tick for this span rather than stacking on top of it, so be realistic and use the whole span, not just the last line.\n" +
         startingTimeInstruction +
-        revealsInstruction + "\n" +
+        startingDateInstruction +
+        revealsInstruction +
+        worldSeedInstruction +
+        relationshipSeedInstruction +
+        loreDigestInstruction + "\n" +
         PACING_EXAMPLE_GUIDE + "\n" +
         TIME_ANCHOR_GUIDE + "\n" +
         revealsSection +
+        loreBlock +
         "PENDING SCHEDULED EVENTS (things already queued to happen in the future — reference one by its number if the scene is explicitly filling time until it):\n" +
         pendingEventsText + "\n\n" +
         "The four time_advance cases:\n" +
@@ -200,7 +242,11 @@ export function buildScenePrompt(input) {
         "Respond ONLY with valid JSON in the story's language. IMPORTANT: In the characters array, use the player's actual name from the chat - never write 'User'. Do NOT include a \"time\" or \"date\" field anywhere in your response — only the time_advance object above decides elapsed time, and it will be ignored if a raw time/date field is present instead. Use this exact structure (city and country MUST be non-empty strings, never 'Unknown'):\n" +
         "{\"location\":\"Living room\", \"city\":\"Myrenveld\", \"country\":\"Sovereign Realms of Drak'hara\", \"temperature\":\"18°C\", \"weather\":\"Cloudy\", \"characters\":[{\"name\":\"Jepp\", \"state\":\"sitting on floor\"}, {\"name\":\"Char1\", \"state\":\"standing near Jepp\"}], \"recent_events\":\"Char1 entered the living room and spoke to Jepp.\", \"time_advance\":{\"type\":\"elapsed\",\"minutes\":14,\"reason\":\"a short conversation and a walk to the door\"}" +
         (input.askStartingTime ? ", \"starting_time\":\"19:30\"" : "") +
+        (input.askStartingDate ? ", \"starting_date\":\"24/12/1899\"" : "") +
         (pendingRevealsText ? ", \"revealed_secrets\":[]" : "") +
+        (input.askWorldSeed ? ", \"world_seed\":{\"summary\":\"2-3 sentence world snapshot.\",\"weather_trend\":\"One-sentence regional trend.\",\"npc_states\":[{\"name\":\"Balthor\",\"change\":\"working his forge across town\"}],\"pending_reveals\":[]}" : "") +
+        (input.askRelationshipSeed ? ", \"relationship_seed\":{\"relationships\":[{\"from\":\"CharA\",\"to\":\"CharB\",\"type\":\"alliance\",\"strength\":0.5,\"summary\":\"Sworn shield-brothers per the lore\"}],\"character_bios\":[]}" : "") +
+        (input.askLoreDigest ? ", \"lore_digest\":[\"One short factual world rule per entry.\"]" : "") +
         "}\n" +
         "]\n\n" +
         "[Player character name: " + userName + ". Always use this exact name in the JSON output, never write 'User'.]\n" +
@@ -336,6 +382,29 @@ export function extractStartingTime(data) {
 }
 
 /**
+ * extractStartingDate(data)
+ *
+ * Genesis-only companion to extractStartingTime above — the same narrowly-
+ * sanctioned exception, for the calendar date. Only consulted when the
+ * deterministic seedInitialDate() scan found no cue in the opening text
+ * (the alternative isn't a safer source of truth, it's a RANDOM date), read
+ * exactly once, before _initialized is ever set. Validated through the SAME
+ * strict parser every other clock value goes through — parseDateTime's
+ * round-trip check — so "31/02/2026", a 2-digit year, or any silently-
+ * rolling-over nonsense can never seep into storage. Returns a normalized
+ * "DD/MM/YYYY" or null for anything missing/malformed (caller keeps the
+ * random fallback date in that case).
+ */
+export function extractStartingDate(data) {
+    if (!data || typeof data.starting_date !== "string") return null;
+    var raw = data.starting_date.trim();
+    if (!/^\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{1,4}$/.test(raw)) return null;
+    var d = parseDateTime("00:00", raw);
+    if (!d) return null;
+    return formatDate(d);
+}
+
+/**
  * applySceneTimeAdvance(data)
  *
  * The ONLY point where a time-related value is read from Scene Agent's
@@ -374,7 +443,13 @@ export function buildCityCountryPrompt(location) {
 export function applyCityCountryResponse(data) {
     if (!data) return null;
     var patch = {};
-    if (data.city && data.city !== "Unknown") patch.city = data.city;
-    if (data.country && data.country !== "Unknown") patch.country = data.country;
+    // Same cleanScalarField validation (and the same 120-char cap) as the main
+    // applySceneResponse path — this fallback was the one validator left trusting
+    // raw output, so a JSON-valid object/array here persisted into storyData and
+    // flowed into the HUD and every future prompt injection.
+    var city = cleanScalarField(data.city, 120);
+    if (city && city !== "Unknown") patch.city = city;
+    var country = cleanScalarField(data.country, 120);
+    if (country && country !== "Unknown") patch.country = country;
     return patch;
 }

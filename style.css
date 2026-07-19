@@ -907,24 +907,100 @@
     color: #ffffff !important;
 }
 
-/* --- Meta block: time/date, location, weather --- */
-.st-hud-meta {
+/* --- Glance Card: clock focal block. Big tabular digits lead; weekday/date sit
+   beside them; the day-part disc renders the time-of-day tint as a legible
+   sun/moon medallion (falls back to the accent wash when the tint is off, so
+   it always themes with the user's custom color). --- */
+.st-hud-clock {
     display: flex !important;
-    flex-direction: column !important;
-    gap: 4px !important;
+    align-items: center !important;
+    gap: 10px !important;
 }
 
-.st-hud-meta-row,
-.st-hud-signal,
-.st-hud-char-row {
+.st-hud-clock-time {
+    font-size: 25px !important;
+    font-weight: 650 !important;
+    line-height: 1 !important;
+    letter-spacing: 0.01em !important;
+    color: #f2f2f4 !important;
+    font-variant-numeric: tabular-nums !important;
+}
+
+.st-hud-clock-side {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 1px !important;
+    min-width: 0 !important;
+    font-size: 10px !important;
+    line-height: 1.3 !important;
+    color: #aeaeb2 !important;
+}
+
+.st-hud-daypart {
+    flex: 0 0 26px !important;
+    width: 26px !important;
+    height: 26px !important;
+    margin-left: auto !important;
+    border-radius: 50% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    background: radial-gradient(circle at 35% 32%, var(--st-hud-tint, var(--st-custom-accent-alpha-high)), rgba(255, 255, 255, 0.03) 78%) !important;
+    border: 1px solid rgba(255, 255, 255, 0.14) !important;
+}
+
+.st-hud-daypart i {
+    font-size: 11px !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+}
+
+/* --- Chips row: location / city / weather as truncating pills instead of
+   full-width rows — two lines of height saved, long names ellipsize. --- */
+.st-hud-chips {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 5px !important;
+    margin-top: 9px !important;
+}
+
+.st-hud-chip {
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 5px !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    padding: 3px 9px !important;
+    border-radius: 20px !important;
+    background: rgba(255, 255, 255, 0.04) !important;
+    border: 1px solid rgba(255, 255, 255, 0.09) !important;
+    font-size: 10.5px !important;
+    line-height: 1.35 !important;
+    color: #c9c9ce !important;
+}
+
+.st-hud-chip i {
+    flex: 0 0 auto !important;
+    font-size: 9.5px !important;
+    color: var(--st-custom-accent) !important;
+    opacity: 0.9 !important;
+}
+
+.st-hud-chip span {
+    min-width: 0 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+}
+
+/* --- Signal base row (kind-coded tick colors further below) --- */
+.st-hud-signal {
     display: flex !important;
     align-items: flex-start !important;
     gap: 7px !important;
+    border-left: 2px solid var(--st-custom-accent) !important;
+    padding: 2px 0 2px 8px !important;
 }
 
-/* Icon sits in a fixed gutter; the text takes the rest of the row's width, so a
-   wrapped second line indents under the TEXT, never back under the icon. */
-.st-hud-meta-row i,
 .st-hud-signal > i {
     flex: 0 0 13px !important;
     width: 13px !important;
@@ -935,7 +1011,6 @@
     opacity: 0.85 !important;
 }
 
-.st-hud-meta-text,
 .st-hud-signal-text {
     flex: 1 1 auto !important;
     min-width: 0 !important;
@@ -944,11 +1019,6 @@
     color: #aeaeb2 !important;
     white-space: normal !important;
     word-break: break-word !important;
-}
-
-.st-hud-meta-text strong {
-    color: var(--st-custom-accent) !important;
-    font-weight: 600 !important;
 }
 
 .st-hud-divider {
@@ -987,13 +1057,47 @@
     border-radius: 2px !important;
 }
 
+/* Avatar row: accent-ringed monogram disc + stacked name/state text — mirrors
+   the modal's character cards so HUD and modal read as one system. The old
+   accent border-left is replaced by the avatar ring itself. */
 .st-hud-char-row {
-    flex-direction: column !important;
-    gap: 1px !important;
+    display: flex !important;
+    align-items: flex-start !important;
+    gap: 8px !important;
     background: rgba(255, 255, 255, 0.02) !important;
     padding: 5px 7px !important;
     border-radius: 6px !important;
-    border-left: 2px solid var(--st-custom-accent) !important;
+}
+
+.st-hud-avatar {
+    flex: 0 0 22px !important;
+    width: 22px !important;
+    height: 22px !important;
+    margin-top: 1px !important;
+    border-radius: 50% !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    background: rgba(255, 255, 255, 0.05) !important;
+    border: 1.5px solid var(--st-custom-accent) !important;
+    font-size: 9.5px !important;
+    font-weight: 700 !important;
+    color: #e8e8ea !important;
+}
+
+.st-hud-char-txt {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 1px !important;
+}
+
+.st-hud-char-you {
+    color: var(--st-custom-accent) !important;
+    font-size: 9px !important;
+    font-weight: 500 !important;
+    opacity: 0.9 !important;
 }
 
 .st-hud-char-name {
@@ -1024,6 +1128,52 @@
 .st-hud-signal-meta {
     color: #8e8e93 !important;
     font-size: 10px !important;
+}
+
+/* Kind-coded signal ticks: accent = scheduled event (themes with the user's
+   custom color); fixed semantic hues for world pulse and relationship shift,
+   tuned to sit on the dark panel beside any accent choice. */
+.st-hud-signal-world {
+    border-left-color: #82a9ce !important;
+}
+
+.st-hud-signal-world > i {
+    color: #82a9ce !important;
+}
+
+.st-hud-signal-rel {
+    border-left-color: #ce8fa8 !important;
+}
+
+.st-hud-signal-rel > i {
+    color: #ce8fa8 !important;
+}
+
+/* Next-check hairline: 3px progress toward the next automatic Scene check +
+   a tiny uppercase label. Fill runs on the accent so it themes too. */
+.st-hud-progress {
+    display: block !important;
+    height: 3px !important;
+    margin-top: 9px !important;
+    border-radius: 2px !important;
+    background: rgba(255, 255, 255, 0.07) !important;
+    overflow: hidden !important;
+}
+
+.st-hud-progress-fill {
+    display: block !important;
+    height: 100% !important;
+    border-radius: 2px !important;
+    background: linear-gradient(90deg, var(--st-custom-accent-alpha-high), var(--st-custom-accent)) !important;
+    transition: width 0.3s ease !important;
+}
+
+.st-hud-progress-label {
+    margin-top: 4px !important;
+    font-size: 8.5px !important;
+    letter-spacing: 0.09em !important;
+    text-transform: uppercase !important;
+    color: #8e8e93 !important;
 }
 
 .st-hud-waiting {
@@ -1663,4 +1813,786 @@
 #extensions_settings2 .st-settings-root .inline-drawer-content > .inline-drawer .inline-drawer-content,
 #extensions_settings .st-settings-root .inline-drawer-content > .inline-drawer .inline-drawer-content {
     padding-left: 6px !important;
+}
+
+/* ─── Direction C: tab-state chips ──────────────────────────────────────── */
+/* Relations shows its tracked-edge count; World gets a due-dot. Both accent-
+   driven so they follow the user's custom color. */
+.st-tab-badge {
+    display: inline-block !important;
+    margin-left: 5px !important;
+    padding: 0 6px !important;
+    border-radius: 10px !important;
+    background: var(--st-custom-accent-alpha-high) !important;
+    color: var(--st-custom-accent) !important;
+    font-size: 9px !important;
+    font-weight: 700 !important;
+    line-height: 14px !important;
+}
+
+.st-tab-due {
+    display: inline-block !important;
+    width: 6px !important;
+    height: 6px !important;
+    margin-left: 5px !important;
+    border-radius: 50% !important;
+    background: var(--st-custom-accent) !important;
+    box-shadow: 0 0 6px var(--st-custom-accent) !important;
+}
+
+/* ─── Direction C: footer countdown progress strip ──────────────────────── */
+.st-auto-wrap {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 4px !important;
+    min-width: 100% !important;
+    margin-top: 2px !important;
+}
+
+.st-auto-bar {
+    height: 3px !important;
+    border-radius: 2px !important;
+    background: rgba(255, 255, 255, 0.08) !important;
+    overflow: hidden !important;
+}
+
+#st-auto-bar-fill {
+    display: block !important;
+    height: 100% !important;
+    width: 0 !important;
+    border-radius: 2px !important;
+    background: linear-gradient(90deg, var(--st-custom-accent-alpha-high), var(--st-custom-accent)) !important;
+    transition: width 0.3s ease !important;
+}
+
+.st-auto-wrap .st-auto-info {
+    min-width: 0 !important;
+    margin-top: 0 !important;
+}
+
+/* ─── Direction C: Relations board (graph pinned above, bonds scroll below) ── */
+.st-rel-board {
+    margin-top: 10px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+}
+
+.st-rel-board-head {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    /* nowrap on purpose: the bio truncates (ellipsis) so the ✕ clear button
+       always stays on the same line instead of wrapping under the header. */
+    flex-wrap: nowrap !important;
+    min-height: 20px !important;
+    font-size: 11px !important;
+    color: #aeaeb2 !important;
+}
+
+.st-rel-board-filter {
+    color: var(--st-custom-accent) !important;
+    font-weight: 600 !important;
+}
+
+.st-rel-board-filter i {
+    font-size: 9px !important;
+    margin-right: 4px !important;
+    opacity: 0.85 !important;
+}
+
+.st-rel-board-bio {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    font-style: italic !important;
+    opacity: 0.7 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+}
+
+.st-rel-board-hint {
+    margin-left: auto !important;
+    font-size: 9.5px !important;
+    opacity: 0.5 !important;
+}
+
+.st-rel-board-clear {
+    margin-left: auto !important;
+    flex: 0 0 auto !important;
+    width: 20px !important;
+    height: 20px !important;
+    border-radius: 50% !important;
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    color: #aeaeb2 !important;
+    font-size: 12px !important;
+    line-height: 1 !important;
+    cursor: pointer !important;
+    padding: 0 !important;
+}
+
+.st-rel-board-clear:hover {
+    color: #ffffff !important;
+    border-color: var(--st-custom-accent) !important;
+}
+
+/* The list scrolls on its own so a large cast never stretches the tab — the
+   graph above stays put. Same scrollbar treatment as the HUD character list. */
+.st-rel-board-list {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 7px !important;
+    max-height: 250px !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+    overscroll-behavior: contain !important;
+    padding-right: 4px !important;
+}
+
+.st-rel-board-list::-webkit-scrollbar {
+    width: 4px !important;
+}
+
+.st-rel-board-list::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12) !important;
+    border-radius: 2px !important;
+}
+
+.st-rel-card {
+    background: rgba(255, 255, 255, 0.025) !important;
+    border: 1px solid rgba(255, 255, 255, 0.07) !important;
+    border-radius: 8px !important;
+    padding: 8px 10px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 6px !important;
+    transition: border-color 0.25s ease, background 0.25s ease !important;
+}
+
+.st-rel-card-hot {
+    border-color: var(--st-custom-accent) !important;
+    background: var(--st-custom-accent-alpha) !important;
+}
+
+.st-rel-card-top {
+    display: flex !important;
+    align-items: center !important;
+    gap: 7px !important;
+    flex-wrap: wrap !important;
+}
+
+.st-rel-card-pair {
+    font-size: 11.5px !important;
+    font-weight: 600 !important;
+    color: #e8e8ea !important;
+}
+
+.st-rel-card-oneside {
+    font-size: 8.5px !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+    color: #ce8fa8 !important;
+    border: 1px solid rgba(206, 143, 168, 0.4) !important;
+    border-radius: 8px !important;
+    padding: 0 5px !important;
+}
+
+.st-rel-card-type {
+    margin-left: auto !important;
+    font-size: 10px !important;
+}
+
+.st-rel-card-meter {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+}
+
+/* The banded strength slider: hostile→neutral→bonded gradient track (semantic,
+   deliberately NOT the accent), draggable knob = the edit control. */
+.st-rel-card-strength {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    height: 6px !important;
+    margin: 0 !important;
+    border: none !important;
+    border-radius: 3px !important;
+    background: linear-gradient(90deg, #b2574e, #7a756a 45%, #7a756a 55%, #6fa262) !important;
+    outline: none !important;
+    cursor: pointer !important;
+}
+
+.st-rel-card-strength::-webkit-slider-runnable-track {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    height: 6px !important;
+    border-radius: 3px !important;
+    background: transparent !important;
+}
+
+.st-rel-card-strength::-webkit-slider-thumb {
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    width: 13px !important;
+    height: 13px !important;
+    margin-top: -3.5px !important;
+    border-radius: 50% !important;
+    background: #f2f2f4 !important;
+    border: 2px solid #1c1c1e !important;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.25) !important;
+    cursor: grab !important;
+}
+
+.st-rel-card-strength::-moz-range-track {
+    height: 6px !important;
+    border-radius: 3px !important;
+    background: linear-gradient(90deg, #b2574e, #7a756a 45%, #7a756a 55%, #6fa262) !important;
+}
+
+.st-rel-card-strength::-moz-range-thumb {
+    width: 12px !important;
+    height: 12px !important;
+    border-radius: 50% !important;
+    background: #f2f2f4 !important;
+    border: 2px solid #1c1c1e !important;
+    cursor: grab !important;
+}
+
+.st-rel-card-band {
+    flex: 0 0 46px !important;
+    text-align: center !important;
+    font-size: 9px !important;
+    letter-spacing: 0.06em !important;
+    text-transform: uppercase !important;
+    color: #aeaeb2 !important;
+}
+
+.st-rel-card-val {
+    flex: 0 0 34px !important;
+    font-size: 10px !important;
+    color: #8e8e93 !important;
+    font-variant-numeric: tabular-nums !important;
+}
+
+.st-rel-card-summary {
+    font-size: 10.5px !important;
+    line-height: 1.4 !important;
+    color: #aeaeb2 !important;
+}
+
+.st-rel-board-empty {
+    font-size: 11px !important;
+    color: #8e8e93 !important;
+    font-style: italic !important;
+    padding: 8px 0 !important;
+}
+
+/* ─── Direction B: World Briefing card ──────────────────────────────────── */
+.st-world-brief {
+    background: rgba(255, 255, 255, 0.03) !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-left: 3px solid var(--st-custom-accent) !important;
+    border-radius: 10px !important;
+    padding: 11px 13px !important;
+    margin-bottom: 12px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 7px !important;
+}
+
+.st-world-brief-top {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    flex-wrap: nowrap !important;
+}
+
+.st-world-brief-title {
+    font-size: 10px !important;
+    letter-spacing: 0.12em !important;
+    text-transform: uppercase !important;
+    font-weight: 700 !important;
+    color: var(--st-custom-accent) !important;
+    margin-right: auto !important;
+    white-space: nowrap !important;
+}
+
+.st-world-brief-title i {
+    margin-right: 4px !important;
+    opacity: 0.85 !important;
+}
+
+.st-world-brief-summary {
+    font-size: 12px !important;
+    line-height: 1.55 !important;
+    color: var(--st-journal-text) !important;
+}
+
+.st-world-brief-trend {
+    display: flex !important;
+    align-items: center !important;
+    gap: 7px !important;
+    font-size: 11px !important;
+    color: #aeaeb2 !important;
+    border-top: 1px solid rgba(255, 255, 255, 0.06) !important;
+    padding-top: 7px !important;
+}
+
+.st-world-brief-trend > i {
+    flex: 0 0 auto !important;
+    font-size: 10px !important;
+    color: var(--st-custom-accent) !important;
+    opacity: 0.85 !important;
+}
+
+.st-world-brief-trend span {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+}
+
+.st-world-brief-asof {
+    font-size: 9.5px !important;
+    letter-spacing: 0.06em !important;
+    text-transform: uppercase !important;
+    color: #8e8e93 !important;
+}
+
+/* ─── Direction B: category hues on collapsible sections ────────────────── */
+/* A collapsed section is identifiable by its left edge before its title is
+   read. Events keep the accent (themes with the user's color); the rest are
+   fixed semantic hues tuned for the dark panel. */
+.st-collapse-section { border-left: 3px solid transparent !important; }
+.st-wsec-npc     { border-left-color: #9ab98a !important; }
+.st-wsec-reveals { border-left-color: #a995c9 !important; }
+.st-wsec-events  { border-left-color: var(--st-custom-accent) !important; }
+.st-wsec-codex   { border-left-color: #7fb8ae !important; }
+.st-wsec-rules   { border-left-color: #8e8e93 !important; }
+
+/* ─── Direction B: compactness — expanded lists scroll internally ───────── */
+/* THE many-NPCs/many-events guarantee: an expanded section never grows past
+   ~210px; its list scrolls inside instead of stretching the tab. */
+.st-collapse-body {
+    max-height: 210px !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+    overscroll-behavior: contain !important;
+}
+
+.st-collapse-body::-webkit-scrollbar,
+#st-world-val-pending::-webkit-scrollbar {
+    width: 4px !important;
+}
+
+.st-collapse-body::-webkit-scrollbar-thumb,
+#st-world-val-pending::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12) !important;
+    border-radius: 2px !important;
+}
+
+#st-world-val-pending {
+    max-height: 210px !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+    overscroll-behavior: contain !important;
+}
+
+/* ─── Direction B: NPC routine timeline strip ───────────────────────────── */
+.st-world-npc-routine {
+    display: flex !important;
+    align-items: center !important;
+    gap: 7px !important;
+    margin-top: 5px !important;
+    font-size: 10px !important;
+    color: #aeaeb2 !important;
+}
+
+.st-world-npc-routine > i {
+    flex: 0 0 auto !important;
+    font-size: 9px !important;
+    color: var(--st-custom-accent) !important;
+    opacity: 0.75 !important;
+}
+
+.st-routine-strip {
+    flex: 1 1 auto !important;
+    min-width: 60px !important;
+    position: relative !important;
+    height: 12px !important;
+    border-radius: 3px !important;
+    background: rgba(255, 255, 255, 0.05) !important;
+    overflow: hidden !important;
+}
+
+.st-routine-dot {
+    position: absolute !important;
+    top: 2.5px !important;
+    width: 7px !important;
+    height: 7px !important;
+    margin-left: -3.5px !important;
+    border-radius: 50% !important;
+    background: #9ab98a !important;
+}
+
+.st-routine-now {
+    position: absolute !important;
+    top: 0 !important;
+    width: 2px !important;
+    height: 12px !important;
+    margin-left: -1px !important;
+    background: var(--st-custom-accent) !important;
+    box-shadow: 0 0 4px var(--st-custom-accent) !important;
+}
+
+.st-routine-now-text {
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+    max-width: 45% !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+    font-style: italic !important;
+    opacity: 0.8 !important;
+}
+
+/* ─── Direction B: scheduled-event countdown pill ───────────────────────── */
+.st-eta-pill {
+    flex: 0 0 auto !important;
+    background: var(--st-custom-accent-alpha-high) !important;
+    color: var(--st-custom-accent) !important;
+    border-radius: 12px !important;
+    padding: 1px 8px !important;
+    font-size: 9.5px !important;
+    font-weight: 700 !important;
+    margin-right: 6px !important;
+}
+
+/* ─── Relations board: merged asymmetric-pair (dual) cards ──────────────── */
+.st-rel-card-dual {
+    gap: 5px !important;
+}
+
+.st-rel-card-side {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 4px !important;
+    padding: 5px 0 2px !important;
+    border-top: 1px dashed rgba(255, 255, 255, 0.07) !important;
+}
+
+.st-rel-card-sidehead {
+    display: flex !important;
+    align-items: center !important;
+    gap: 7px !important;
+}
+
+.st-rel-card-dir {
+    font-size: 10.5px !important;
+    font-weight: 600 !important;
+    color: #c9c9ce !important;
+}
+
+.st-rel-card-side .st-rel-card-type {
+    margin-left: auto !important;
+}
+
+/* ─── Routine strip: tap-to-expand schedule (mobile-friendly) ───────────── */
+/* The strip row is a tap target; hover tooltips remain a desktop bonus only.
+   Later rules override the earlier .st-world-npc-routine sizing (both carry
+   !important; source order wins) — user feedback: the 10px text read as tiny. */
+.st-world-npc-routine {
+    cursor: pointer !important;
+    font-size: 11px !important;
+}
+
+.st-routine-caret {
+    flex: 0 0 auto !important;
+    font-size: 8px !important;
+    color: #8e8e93 !important;
+}
+
+.st-routine-now-text {
+    font-size: 11px !important;
+    max-width: 50% !important;
+}
+
+/* Expanded schedule: full rows, nothing truncated, nothing hover-gated. */
+.st-routine-detail {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 4px !important;
+    margin: 5px 0 3px 20px !important;
+    padding-left: 9px !important;
+    border-left: 2px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+.st-routine-detail-row {
+    display: flex !important;
+    align-items: baseline !important;
+    gap: 8px !important;
+    font-size: 11px !important;
+    line-height: 1.45 !important;
+    color: #c9c9ce !important;
+}
+
+.st-routine-detail-time {
+    flex: 0 0 auto !important;
+    color: var(--st-custom-accent) !important;
+    font-weight: 600 !important;
+    font-variant-numeric: tabular-nums !important;
+}
+
+.st-routine-detail-act {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    white-space: normal !important;
+    word-break: break-word !important;
+}
+
+.st-routine-detail-active .st-routine-detail-act {
+    color: #f2f2f4 !important;
+}
+
+.st-routine-detail-nowtag {
+    flex: 0 0 auto !important;
+    font-size: 8.5px !important;
+    letter-spacing: 0.06em !important;
+    text-transform: uppercase !important;
+    font-weight: 700 !important;
+    background: var(--st-custom-accent-alpha-high) !important;
+    color: var(--st-custom-accent) !important;
+    border-radius: 8px !important;
+    padding: 0 6px !important;
+}
+
+/* ─── Relations board: inline editors (replaces the legacy ✎ panel) ─────── */
+/* Small round header buttons: add-bond / remove-character. */
+.st-rel-hbtn {
+    flex: 0 0 auto !important;
+    width: 20px !important;
+    height: 20px !important;
+    border-radius: 50% !important;
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    color: #aeaeb2 !important;
+    font-size: 9px !important;
+    line-height: 1 !important;
+    cursor: pointer !important;
+    padding: 0 !important;
+}
+
+.st-rel-hbtn:hover {
+    color: #ffffff !important;
+    border-color: var(--st-custom-accent) !important;
+}
+
+.st-rel-hbtn-on {
+    color: var(--st-custom-accent) !important;
+    border-color: var(--st-custom-accent) !important;
+    background: var(--st-custom-accent-alpha) !important;
+}
+
+.st-rel-del-node:hover {
+    color: #ff453a !important;
+    border-color: #ff453a !important;
+}
+
+/* Card ✎ toggle. */
+.st-rel-editbtn {
+    flex: 0 0 auto !important;
+    background: transparent !important;
+    border: none !important;
+    color: #8e8e93 !important;
+    font-size: 11px !important;
+    line-height: 1 !important;
+    cursor: pointer !important;
+    padding: 1px 4px !important;
+}
+
+.st-rel-editbtn:hover, .st-rel-editbtn-on {
+    color: var(--st-custom-accent) !important;
+}
+
+/* Bio line / editor above the cards when filtered. */
+.st-rel-bio-row {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 6px !important;
+    padding: 2px 2px 6px !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+}
+
+.st-rel-bio-line {
+    flex-direction: row !important;
+    align-items: center !important;
+    gap: 6px !important;
+}
+
+.st-rel-bio-line .st-rel-board-bio {
+    white-space: normal !important;
+    font-size: 11px !important;
+}
+
+.st-rel-bio-input {
+    width: 100% !important;
+    box-sizing: border-box !important;
+    background: rgba(255, 255, 255, 0.04) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 6px !important;
+    color: #e8e8ea !important;
+    font-size: 11px !important;
+    line-height: 1.45 !important;
+    padding: 6px 8px !important;
+    resize: vertical !important;
+}
+
+/* The per-bond editor block (type + summary + history + actions). */
+.st-rel-edit-block {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 6px !important;
+    margin-top: 3px !important;
+    padding: 8px !important;
+    background: rgba(0, 0, 0, 0.18) !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 7px !important;
+}
+
+.st-rel-edit-row {
+    display: flex !important;
+    align-items: flex-start !important;
+    gap: 8px !important;
+}
+
+.st-rel-edit-row label {
+    flex: 0 0 52px !important;
+    font-size: 9.5px !important;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    color: #8e8e93 !important;
+    padding-top: 5px !important;
+}
+
+.st-rel-edit-row select,
+.st-rel-add-type {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    background: rgba(255, 255, 255, 0.05) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 6px !important;
+    color: #e8e8ea !important;
+    font-size: 11px !important;
+    padding: 4px 6px !important;
+}
+
+.st-rel-edit-row textarea {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+    background: rgba(255, 255, 255, 0.04) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 6px !important;
+    color: #e8e8ea !important;
+    font-size: 11px !important;
+    line-height: 1.45 !important;
+    padding: 6px 8px !important;
+    resize: vertical !important;
+}
+
+.st-rel-edit-histlabel {
+    font-size: 9px !important;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    color: #8e8e93 !important;
+}
+
+.st-rel-edit-hist {
+    display: flex !important;
+    flex-direction: column !important;
+    max-height: 90px !important;
+    overflow-y: auto !important;
+    padding-right: 3px !important;
+}
+
+.st-rel-edit-histrow {
+    display: flex !important;
+    gap: 6px !important;
+    align-items: baseline !important;
+    font-size: 10px !important;
+    color: #aeaeb2 !important;
+    padding: 2px 0 !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+}
+
+.st-rel-edit-histwhen {
+    flex: 0 0 auto !important;
+    color: var(--st-custom-accent) !important;
+    font-variant-numeric: tabular-nums !important;
+}
+
+.st-rel-edit-histsum {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+}
+
+.st-rel-edit-histval {
+    flex: 0 0 auto !important;
+    opacity: 0.7 !important;
+    font-variant-numeric: tabular-nums !important;
+}
+
+.st-rel-edit-actions {
+    display: flex !important;
+    gap: 6px !important;
+    flex-wrap: wrap !important;
+}
+
+.st-rel-mini-btn {
+    background: rgba(255, 255, 255, 0.06) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 14px !important;
+    color: #e8e8ea !important;
+    font-size: 10.5px !important;
+    font-weight: 600 !important;
+    padding: 4px 12px !important;
+    cursor: pointer !important;
+}
+
+.st-rel-mini-save, .st-rel-mini-biosave, .st-rel-mini-addsave {
+    background: var(--st-custom-accent) !important;
+    border-color: var(--st-custom-accent) !important;
+    color: var(--st-custom-accent-text) !important;
+}
+
+.st-rel-mini-delete {
+    color: #ff453a !important;
+    border-color: rgba(255, 69, 58, 0.4) !important;
+    margin-left: auto !important;
+}
+
+/* Add-bond form card. */
+.st-rel-add-card {
+    border-color: var(--st-custom-accent) !important;
+    background: var(--st-custom-accent-alpha) !important;
+}
+
+.st-rel-add-name {
+    width: 100% !important;
+    box-sizing: border-box !important;
+    background: rgba(255, 255, 255, 0.05) !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 6px !important;
+    color: #e8e8ea !important;
+    font-size: 11px !important;
+    padding: 5px 8px !important;
+}
+
+.st-rel-add-card .st-rel-card-meter {
+    gap: 8px !important;
+}
+
+.st-rel-add-type {
+    flex: 0 0 96px !important;
 }

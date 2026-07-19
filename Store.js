@@ -137,13 +137,13 @@ export function setRelEditingNode(v) { relEditingNode = v; }
 export function setRelSelectedNode(v) { relSelectedNode = v; }
 
 // --- Message-counting / dedupe state ---
-export let msgCounter = 0;
+// (msgCounter and lastTimelineMsgId used to live here too — both were write-only
+// leftovers of the pre-rewrite pipeline, fully replaced by storyData's
+// _timeModeMsgCounter and _lastCountedMsgId, so they were removed rather than
+// kept as dead state that still got persisted into every chat's save blob.)
 export let lastCountedMsgId = -1;
-export let lastTimelineMsgId = -1;
 export let relMsgCounter = 0;
-export function setMsgCounter(v) { msgCounter = v; }
 export function setLastCountedMsgId(v) { lastCountedMsgId = v; }
-export function setLastTimelineMsgId(v) { lastTimelineMsgId = v; }
 export function setRelMsgCounter(v) { relMsgCounter = v; }
 
 // --- Concurrency locks ---

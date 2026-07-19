@@ -282,14 +282,35 @@ var TIME_SKIP_TRIGGER_RE = new RegExp(
     "i"
 );
 
-// Safety net, kept intentionally small: if a past-tense/backstory marker is
-// present, don't fire at all — even a legitimate-looking transition phrase
-// nearby is almost always narrating something already behind the characters
-// ("a few hours later, she recalled, they'd found the cave" is describing a
-// memory, not a live skip). This is a local, zero-cost short-circuit — no
-// resolver call happens at all when this matches, exactly the "should not
-// fire" behavior requested for past-event mentions.
+// Safety net, kept intentionally small: a SENTENCE containing a past-tense/
+// backstory marker never fires — a legitimate-looking transition phrase in the
+// same breath is almost always narrating something already behind the
+// characters ("a few hours later, she recalled, they'd found the cave" is
+// describing a memory, not a live skip). Scoped per-SENTENCE, not per-message
+// (see splitIntoSentences below): a reply that mixes a memory in one sentence
+// ("she recalled the fire") with a genuine live skip in another ("The next
+// morning, they set out") used to have the whole message vetoed by the memory,
+// silently suppressing the real skip. Now only the sentence carrying the
+// marker is vetoed; every other sentence still gets its fair trigger check.
+// Still a local, zero-cost short-circuit — no resolver call happens for a
+// vetoed sentence.
 var PAST_TENSE_GUARD_RE = /\b(ago|already|earlier|previously|before (?:this|that|now)|last night|yesterday|the other (?:day|night)|used to|remembered|recalled|had already|years? ago|back then|in the past|in (?:her|his|their) dream|nightmares?|flashback)\b/i;
+
+/**
+ * splitIntoSentences(text)
+ *
+ * Coarse sentence splitter for the per-sentence guard scoping above: splits on
+ * runs of sentence-ending punctuation (. ! ? …) and on newlines. Deliberately
+ * dumb — no abbreviation handling ("Dr. Smith" splits into two fragments) —
+ * because a false split only makes the guard's scope slightly narrower for one
+ * fragment; it can never veto more than the real sentence would have, and both
+ * halves still get their own trigger check. A message with no terminator at
+ * all comes back as one "sentence", i.e. exactly the old whole-message
+ * behavior.
+ */
+function splitIntoSentences(text) {
+    return String(text || "").match(/[^.!?…\n]+/g) || [];
+}
 
 /**
  * detectTimeSkipTrigger(text, customPhrases)
@@ -301,13 +322,14 @@ var PAST_TENSE_GUARD_RE = /\b(ago|already|earlier|previously|before (?:this|that
  * false positive costs one small LLM call (which will itself just answer
  * "none"), never a wrong clock value.
  *
- * Exact phrase match is tried first (cheap, zero false-positive risk beyond
- * what's already tuned into TIME_SKIP_TRIGGER_RE). If that misses, a fuzzy
- * lexicon pass (see below) catches typos and minor paraphrases of the same
- * phrases ("meanwhil", "a good few hours later on") that the exact regex
- * would otherwise let slip through silently. PAST_TENSE_GUARD_RE still
- * short-circuits BOTH passes — a backstory/past-tense marker means "don't
- * even ask", regardless of which pass would have fired.
+ * Runs SENTENCE BY SENTENCE (see PAST_TENSE_GUARD_RE's comment above): a
+ * sentence carrying a past-tense/backstory marker is skipped entirely, and
+ * every remaining sentence gets the full three-pass check — exact phrase
+ * match first (cheap, zero false-positive risk beyond what's already tuned
+ * into TIME_SKIP_TRIGGER_RE), then the time-of-day anchors, then the fuzzy
+ * lexicon pass (typos and minor paraphrases like "meanwhil", "a good few
+ * hours later on"). One non-vetoed sentence matching any pass fires the
+ * trigger.
  *
  * customPhrases: optional array of extra plain-text phrases (the user-editable
  * "extra time-skip phrases" setting, parsed by parseCustomSkipPhrases below) —
@@ -319,17 +341,22 @@ var PAST_TENSE_GUARD_RE = /\b(ago|already|earlier|previously|before (?:this|that
  */
 export function detectTimeSkipTrigger(text, customPhrases) {
     if (!text) return false;
-    if (PAST_TENSE_GUARD_RE.test(text)) return false;
-    if (TIME_SKIP_TRIGGER_RE.test(text)) return true;
-    // Reuses the SAME anchor table seedInitialTime() scans the genesis
-    // message with (see TIME_OF_DAY_ANCHOR_TRIGGER_RE, built further down
-    // this file right after TIME_OF_DAY_ANCHORS). Without this, phrasing
-    // like "it's noon" or "afternoon arrives" mid-story matched at genesis
-    // but was silently invisible to this trigger — Smart Time mode would
-    // never fire Scene Agent for it, so the clock just kept ticking on the
-    // flat baseline and the stated time-of-day was ignored.
-    if (TIME_OF_DAY_ANCHOR_TRIGGER_RE.test(text)) return true;
-    return detectTimeSkipTriggerFuzzy(text, customPhrases);
+    var sentences = splitIntoSentences(text);
+    for (var i = 0; i < sentences.length; i++) {
+        var sentence = sentences[i];
+        if (PAST_TENSE_GUARD_RE.test(sentence)) continue; // memory/backstory sentence — never a live skip
+        if (TIME_SKIP_TRIGGER_RE.test(sentence)) return true;
+        // Reuses the SAME anchor table seedInitialTime() scans the genesis
+        // message with (see TIME_OF_DAY_ANCHOR_TRIGGER_RE, built further down
+        // this file right after TIME_OF_DAY_ANCHORS). Without this, phrasing
+        // like "it's noon" or "afternoon arrives" mid-story matched at genesis
+        // but was silently invisible to this trigger — Smart Time mode would
+        // never fire Scene Agent for it, so the clock just kept ticking on the
+        // flat baseline and the stated time-of-day was ignored.
+        if (TIME_OF_DAY_ANCHOR_TRIGGER_RE.test(sentence)) return true;
+        if (detectTimeSkipTriggerFuzzy(sentence, customPhrases)) return true;
+    }
+    return false;
 }
 
 // =============================================================================
@@ -724,9 +751,10 @@ function convertTo24Hour(hour, minute, meridiem) {
  * signal that the caller (index.js) must decide its own fallback (a fixed
  * neutral default, or a one-time LLM extraction call).
  *
- * NOTE: this only ever determines a TIME, never a DATE — a bare mention of
- * "morning" gives no year/month/day, only an explicit calendar date could,
- * which is rare enough in RP openings that it's left to the caller/settings.
+ * NOTE: this only ever determines a TIME — the calendar DATE has its own
+ * companion scan, seedInitialDate() below, which returns per-field PARTIAL
+ * results (a date cue is often partial: a holiday pins day+month but no year,
+ * "in 1899" pins only the year, a stated season only implies a month).
  */
 export function seedInitialTime(introText) {
     if (!introText) return null;
@@ -785,6 +813,203 @@ export function seedInitialTime(introText) {
     }
 
     return null;
+}
+
+// =============================================================================
+// GENESIS DATE SEEDING — determining the STARTING calendar date from the
+// opening message. Companion to seedInitialTime() above, same philosophy:
+// deterministic scan, no LLM, honest null when the text gives nothing.
+//
+// Unlike time (one cue = one complete answer), a date cue is usually PARTIAL —
+// "Christmas Eve" pins day+month but no year, "in 1899" pins only the year,
+// "a cold winter morning" only implies a month. So this returns per-FIELD
+// results ({ day, month, year }, each possibly null) and the caller merges the
+// stated parts over its fallback date instead of treating the scan as
+// all-or-nothing. Without this, the starting date was ALWAYS random (see
+// Persistence.getRandomDate) — which made the day-of-week display and the
+// seasonal-grounding feature derive from fiction the story never established:
+// an RP opening "On Christmas Eve..." could get seeded to June and told it's
+// summer.
+//
+// English-only, like every other deterministic scan in this file; the LLM
+// genesis fallback (SceneAgent's starting_date, asked only when this scan
+// finds nothing) is what covers non-English and merely-implied openings.
+// =============================================================================
+
+var MONTH_NAME_RE_SRC = "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?";
+var MONTH_BY_PREFIX = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+function monthNameToNumber(name) {
+    return MONTH_BY_PREFIX[String(name || "").toLowerCase().slice(0, 3)] || null;
+}
+
+// "March 3rd", "Dec 24, 1899" — month first, DAY REQUIRED (that's what keeps a
+// bare month word like "may" from matching prose), year optional.
+var DATE_MONTH_FIRST_RE = new RegExp("\\b(" + MONTH_NAME_RE_SRC + ")\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\s*,?\\s+(\\d{3,4}))?\\b", "i");
+// "3rd of March", "24 December 1899" — day first.
+var DATE_DAY_FIRST_RE = new RegExp("\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?(" + MONTH_NAME_RE_SRC + ")\\b(?:\\s*,?\\s+(\\d{3,4}))?", "i");
+// "December 1899" — month + 3-4 digit year, no day (lands mid-month). A 1-2
+// digit day next to the month is caught by the two patterns above instead;
+// digit-boundary rules mean "March 2077" can only parse here (year), never as
+// day 20 + junk.
+var DATE_MONTH_YEAR_RE = new RegExp("\\b(" + MONTH_NAME_RE_SRC + ")\\.?\\s+(\\d{3,4})\\b", "i");
+
+// Small, unambiguous named-day table. Order matters: more specific phrases
+// ("christmas eve") before their prefix ("christmas").
+var HOLIDAY_DATE_TABLE = [
+    { re: /\bchristmas eve\b/i, day: 24, month: 12, label: "Christmas Eve" },
+    { re: /\bchristmas\b/i, day: 25, month: 12, label: "Christmas" },
+    { re: /\bnew year'?s eve\b/i, day: 31, month: 12, label: "New Year's Eve" },
+    { re: /\bnew year'?s day\b/i, day: 1, month: 1, label: "New Year's Day" },
+    { re: /\bhalloween\b/i, day: 31, month: 10, label: "Halloween" },
+    { re: /\bvalentine'?s day\b/i, day: 14, month: 2, label: "Valentine's Day" },
+    { re: /\bmid-?summer\b/i, day: 21, month: 6, label: "midsummer" },
+    { re: /\bmid-?winter\b/i, day: 21, month: 12, label: "midwinter" },
+];
+
+// A stated season lands mid-season (15th of the middle month). Northern
+// baseline; southern flips by 6 months at lookup time.
+var SEASON_MID_MONTH_NORTHERN = { winter: 1, spring: 4, summer: 7, autumn: 10, fall: 10 };
+
+// High-confidence season cues only, same philosophy as TIME_OF_DAY_ANCHORS'
+// descriptive family: season word + a scene noun, an explicit "it was ..."
+// statement, or a "depths of winter"-style construction — never the bare word,
+// so "the Winter Palace" or "her summer dress" don't fire.
+var SEASON_CUE_RES = [
+    /\b(spring|summer|autumn|fall|winter)(?:'s)?\s+(?:morning|day|night|evening|afternoon|air|chill|sun|sunlight|rain|snow|storm|wind|breeze|heat|cold|frost|sky|light)\b/i,
+    /\bit (?:was|is) (?:a |an |the )?(?:cold |warm |hot |harsh |mild |wet |dry |long |late |early |gray |grey )*(spring|summer|autumn|fall|winter)\b/i,
+    /\b(?:early|late|mid|deep)[- ](spring|summer|autumn|fall|winter)\b/i,
+    /\b(?:depths?|heart|height|middle|midst|dead) of (?:the )?(spring|summer|autumn|fall|winter)\b/i,
+];
+// "the winter of 1899" — season AND year in one construction.
+var SEASON_OF_YEAR_RE = /\b(spring|summer|autumn|fall|winter) of (?:the year )?(\d{3,4})\b/i;
+
+// Bare year statements. The "in YYYY" form is restricted to 4-digit
+// modern/historical years (1000-2099) — a 3-digit fantasy year needs the
+// explicit "in the year 347" framing to avoid matching ordinary numbers.
+var YEAR_CUE_RES = [
+    /\b(?:in the year|the year is|the year was|year of(?: our lord)?|anno domini|a\.\s?d\.)\s+(\d{3,4})\b/i,
+    /\bin\s+(1[0-9]{3}|20[0-9]{2})\b/,
+];
+
+/**
+ * seedInitialDate(introText, options)
+ *
+ * Scans the opening message ONCE, at RP start, for deterministic calendar
+ * cues, in priority order (most specific first): an explicit month-name date,
+ * a month+year, a named holiday, a stated season (with or without a year),
+ * a bare year statement. Each of day/month/year is filled by the FIRST
+ * priority tier that provides it, so complementary cues compose ("in 1899...
+ * on Christmas Eve" yields 24/12/1899).
+ *
+ * options.hemisphere: "northern" (default) | "southern" | "none". Season cues
+ * map to the mid-season month for that hemisphere; "none" (the user declared
+ * the story's calendar doesn't map to real seasons) skips season cues entirely
+ * while still honoring explicit dates/years.
+ *
+ * Returns { day, month, year, reason, source } with nulls for anything the
+ * text didn't state, or null if no cue was found at all — this module never
+ * fabricates a date, same contract as seedInitialTime. Years must be >= 100
+ * (parseDateTime's round-trip check rejects 2-digit years, which JS Date
+ * remaps onto 19xx).
+ */
+export function seedInitialDate(introText, options) {
+    if (!introText) return null;
+    options = options || {};
+    var hemisphere = options.hemisphere || "northern";
+
+    var day = null, month = null, year = null;
+    var reasons = [];
+
+    // 1. Explicit month-name date — most specific. Between the two phrasings,
+    //    whichever occurs FIRST in reading order wins (same convention as
+    //    seedInitialTime's literal-clock handling).
+    var mFirst = introText.match(DATE_MONTH_FIRST_RE);
+    var dFirst = introText.match(DATE_DAY_FIRST_RE);
+    if (mFirst || dFirst) {
+        var useMonthFirst = !dFirst || (mFirst && mFirst.index <= dFirst.index);
+        var em = useMonthFirst ? mFirst : dFirst;
+        var candDay = parseInt(useMonthFirst ? em[2] : em[1], 10);
+        var candMonth = monthNameToNumber(useMonthFirst ? em[1] : em[2]);
+        var candYear = em[3] ? parseInt(em[3], 10) : null;
+        if (candMonth && candDay >= 1 && candDay <= 31) {
+            day = candDay;
+            month = candMonth;
+            if (candYear != null && candYear >= 100) year = candYear;
+            reasons.push("explicit date \"" + em[0].trim() + "\"");
+        }
+    }
+
+    // 2. Month + year with no stated day ("a gray December 1899") — mid-month.
+    if (month == null) {
+        var my = introText.match(DATE_MONTH_YEAR_RE);
+        if (my) {
+            var myMonth = monthNameToNumber(my[1]);
+            var myYear = parseInt(my[2], 10);
+            if (myMonth && myYear >= 100) {
+                month = myMonth;
+                day = 15;
+                if (year == null) year = myYear;
+                reasons.push("month+year \"" + my[0].trim() + "\"");
+            }
+        }
+    }
+
+    // 3. Named holiday — pins day+month, never a year.
+    if (month == null) {
+        for (var hi = 0; hi < HOLIDAY_DATE_TABLE.length; hi++) {
+            if (HOLIDAY_DATE_TABLE[hi].re.test(introText)) {
+                day = HOLIDAY_DATE_TABLE[hi].day;
+                month = HOLIDAY_DATE_TABLE[hi].month;
+                reasons.push("holiday \"" + HOLIDAY_DATE_TABLE[hi].label + "\"");
+                break;
+            }
+        }
+    }
+
+    // 4. Stated season — mid-season month for the configured hemisphere.
+    if (month == null && hemisphere !== "none") {
+        var seasonName = null;
+        var sy = introText.match(SEASON_OF_YEAR_RE);
+        if (sy) {
+            seasonName = sy[1].toLowerCase();
+            var syYear = parseInt(sy[2], 10);
+            if (year == null && syYear >= 100) year = syYear;
+        } else {
+            for (var si = 0; si < SEASON_CUE_RES.length && !seasonName; si++) {
+                var sm = introText.match(SEASON_CUE_RES[si]);
+                if (sm) seasonName = sm[1].toLowerCase();
+            }
+        }
+        if (seasonName && SEASON_MID_MONTH_NORTHERN[seasonName]) {
+            var midMonth = SEASON_MID_MONTH_NORTHERN[seasonName];
+            if (hemisphere === "southern") midMonth = ((midMonth + 5) % 12) + 1; // +6 months, wrapped
+            month = midMonth;
+            day = 15;
+            reasons.push("season \"" + seasonName + "\" (mid-season, " + hemisphere + " hemisphere)");
+        }
+    }
+
+    // 5. Bare year statement.
+    if (year == null) {
+        for (var yi = 0; yi < YEAR_CUE_RES.length; yi++) {
+            var ym = introText.match(YEAR_CUE_RES[yi]);
+            if (ym) {
+                var cueYear = parseInt(ym[1], 10);
+                if (cueYear >= 100) {
+                    year = cueYear;
+                    reasons.push("year \"" + ym[0].trim() + "\"");
+                    break;
+                }
+            }
+        }
+    }
+
+    if (day == null && month == null && year == null) return null;
+    return {
+        day: day, month: month, year: year,
+        reason: "genesis: " + reasons.join(", ") + " in opening text",
+        source: "genesis-date",
+    };
 }
 
 // =============================================================================

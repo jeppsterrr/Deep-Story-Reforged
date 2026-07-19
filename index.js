@@ -304,6 +304,16 @@ function registerStoryMacros() {
     }
 }
 
+/** "HH:MM" → 0..100 percent through the 24h day, for the NPC routine timeline
+ * strips (Direction B). Returns null for anything unparseable. */
+function clockToPct(timeStr) {
+    var m = String(timeStr || "").match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    var mins = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    if (isNaN(mins) || mins < 0 || mins > 1439) return null;
+    return (mins / 1440) * 100;
+}
+
 function getDayOfWeek(dateStr) {
     if (!dateStr || dateStr === "Unknown") return "";
     var parts = dateStr.split(/[\/\-\.]/);
@@ -339,7 +349,17 @@ function getChatSubtitle() {
 // Summary and Scheduled Events stay open since they're the primary/actionable content.
 // Collapse state is UI-only, kept in memory for this modal session — not worth a settings
 // field for something this cosmetic, and it re-defaults sensibly on next open.
-var worldCollapseState = { npc: true, reveals: true, events: true, codex: true }; // true = collapsed
+var worldCollapseState = { npc: true, reveals: true, events: true, codex: true, rules: true }; // true = collapsed
+// Which NPCs' routine strips are expanded to the full inline schedule (tap-to-
+// toggle — hover tooltips are useless on touch). In-memory, per modal session,
+// same philosophy as worldCollapseState.
+var routineExpandState = {};
+// Relations-board inline editors (per modal session, file-scope so they survive
+// full graph re-renders): which bond's ✎ editor is open ("from␟to"), and
+// whether the filtered character's bio editor / add-bond form is open.
+var relCardEditKey = null;
+var relBioEditOpen = false;
+var relAddOpen = false;
 function worldCollapseSectionHtml(key, title, icon, tier, contentId, emptyText) {
     var collapsed = worldCollapseState[key] !== false;
     // tier is optional — sections not backed by a regenerable World Agent tier
@@ -347,7 +367,9 @@ function worldCollapseSectionHtml(key, title, icon, tier, contentId, emptyText) 
     var wandHtml = tier
         ? '<button class="st-wand-regen" data-tier="' + tier + '" title="Regenerate ' + esc(title) + '"><i class="fa-solid fa-wand-magic-sparkles"></i></button>'
         : '';
-    return '<div class="st-journal-section st-collapse-section">' +
+    // st-wsec-<key> carries the section's category hue (left border, see style.css) —
+    // a collapsed section stays identifiable by color before its title is read.
+    return '<div class="st-journal-section st-collapse-section st-wsec-' + key + '">' +
         '<div class="st-sec-title-row st-collapse-toggle" data-collapse-key="' + key + '">' +
             '<div class="st-journal-sec-title"><i class="fa-solid ' + icon + '" style="margin-right:6px;opacity:0.75;"></i>' + esc(title) + ' <span class="st-collapse-count" id="' + contentId + '-count"></span></div>' +
             '<div style="display:flex;align-items:center;gap:8px;">' +
@@ -380,11 +402,14 @@ function buildModal() {
     h += '</div>';
     
     // Segmented Pill Tab Controls
+    // Tabs carry state (Direction C): Relations shows its tracked-edge count,
+    // World gets a dot when any tier is due to fire — both kept in sync by
+    // renderModal, so the chrome says where something is happening before you click.
     h += '<div class="st-tabs">' +
          '<div class="st-tab st-tab-active" data-target="st-tab-current">Scene</div>' +
          '<div class="st-tab" data-target="st-tab-history">History</div>' +
-         '<div class="st-tab" data-target="st-tab-world">World</div>' +
-         '<div class="st-tab" data-target="st-tab-relations"><i class="fa-solid fa-share-nodes" style="margin-right:4px;font-size:10px;"></i>Relations</div>' +
+         '<div class="st-tab" data-target="st-tab-world">World<span class="st-tab-due" id="st-world-tab-due" style="display:none;"></span></div>' +
+         '<div class="st-tab" data-target="st-tab-relations"><i class="fa-solid fa-share-nodes" style="margin-right:4px;font-size:10px;"></i>Relations<span class="st-tab-badge" id="st-rel-tab-badge" style="display:none;"></span></div>' +
          '</div>';
     
     h += '<div class="st-body">';
@@ -436,21 +461,33 @@ function buildModal() {
     
     // World Tab
     h += '<div id="st-tab-world" style="display:none;">';
-    // Compact status strip — season + weather trend at a glance, replacing what used to
-    // be a full separate "Regional Weather Trend" box. Season chip only shows once
-    // computed (settings.seasonHemisphere !== "none").
-    h += '  <div class="st-world-status-strip">' +
-         '    <div class="st-world-status-chip" id="st-world-chip-season" style="display:none;"><i class="fa-solid fa-leaf"></i><span id="st-world-chip-season-text"></span></div>' +
-         '    <div class="st-world-status-chip st-world-status-chip-grow" id="st-world-chip-weather"><i class="fa-solid fa-cloud-sun"></i><span id="st-world-chip-weather-text">No weather trend yet.</span></div>' +
-         '    <button class="st-wand-regen" data-tier="weather" title="Regenerate Weather Trend"><i class="fa-solid fa-wand-magic-sparkles"></i></button>' +
+    // Briefing card (Direction B): summary, season chip, weather trend, and an
+    // "as of" clock stamp merged into ONE card — the old separate status strip +
+    // summary box read as two disconnected surfaces. Existing element IDs are
+    // preserved so renderModal's update logic is unchanged.
+    h += '  <div class="st-world-brief">' +
+         '    <div class="st-world-brief-top">' +
+         '      <span class="st-world-brief-title"><i class="fa-solid fa-earth-americas"></i> World Briefing</span>' +
+         '      <span class="st-world-status-chip" id="st-world-chip-season" style="display:none;"><i class="fa-solid fa-leaf"></i><span id="st-world-chip-season-text"></span></span>' +
+         '      <button class="st-wand-regen" data-tier="world" title="Regenerate World Summary"><i class="fa-solid fa-wand-magic-sparkles"></i></button>' +
+         '    </div>' +
+         '    <div class="st-world-brief-summary" id="st-world-val-summary">No summary available yet.</div>' +
+         '    <div class="st-world-brief-trend" id="st-world-chip-weather"><i class="fa-solid fa-cloud-sun"></i><span id="st-world-chip-weather-text">No weather trend yet.</span>' +
+         '      <button class="st-wand-regen" data-tier="weather" title="Regenerate Weather Trend"><i class="fa-solid fa-wand-magic-sparkles"></i></button></div>' +
+         '    <div class="st-world-brief-asof" id="st-world-brief-asof"></div>' +
          '  </div>';
-    h += '  <div class="st-journal-section"><div class="st-sec-title-row"><div class="st-journal-sec-title">World State Summary</div><button class="st-wand-regen" data-tier="world" title="Regenerate World Summary"><i class="fa-solid fa-wand-magic-sparkles"></i></button></div><div class="st-world-preview-box" id="st-world-val-summary">No summary available yet.</div></div>';
     h += worldCollapseSectionHtml('npc', 'NPC Changes', 'fa-users', 'npc', 'st-world-val-npcs', 'No NPC changes.');
     h += worldCollapseSectionHtml('reveals', 'Pending Discoveries', 'fa-eye-slash', 'faction', 'st-world-val-reveals', 'No pending discoveries.');
     h += worldCollapseSectionHtml('events', 'World Events', 'fa-scroll', 'faction', 'st-world-val-events', 'No events.');
     // Location Codex — maintained by the Scene tick on location changes (see
     // Pipeline.doLLMUpdate), not by a World Agent tier, hence no regen wand.
     h += worldCollapseSectionHtml('codex', 'Location Codex', 'fa-map-location-dot', null, 'st-world-val-codex', 'No locations remembered yet — entries appear when the scene moves somewhere else.');
+    // World Rules — the genesis-distilled lore digest (see WorldAgent's WORLD RULES
+    // DIGEST section). Deliberately fully editable: this list is the verification
+    // surface for what the world simulation treats as ground truth, so rules can be
+    // deleted or added by hand, and the wand re-distills from the raw card on
+    // demand (the one post-genesis action that ever sends card text again).
+    h += worldCollapseSectionHtml('rules', 'World Rules', 'fa-scale-balanced', 'rules', 'st-world-val-rules', 'No world rules yet — distilled automatically when a new chat begins.');
     h += '  <div class="st-journal-section" style="position:relative;"><div class="st-sec-title-row"><div class="st-journal-sec-title">Scheduled Events</div><button class="menu_button st-pill-btn" id="st-world-btn-add-event" title="Add a scheduled event"><i class="fa-solid fa-calendar-plus"></i> Add Event</button></div>';
     h += '    <div id="st-world-add-event-popout" class="st-add-event-popout" style="display:none;">' +
          '      <div class="st-add-event-popout-head"><span><i class="fa-solid fa-calendar-plus"></i> Schedule an Event</span><button id="st-evt-close-popout" class="st-hdr-btn" title="Close" style="min-width:28px;min-height:28px;font-size:14px;"><i class="fa-solid fa-xmark"></i></button></div>' +
@@ -501,7 +538,7 @@ function buildModal() {
          '    <button class="menu_button st-pill-btn" id="st-rel-btn-reset-layout" title="Reset node positions and pan/zoom"><i class="fa-solid fa-arrows-to-circle"></i> Reset Layout</button>' +
          '    <button class="menu_button st-pill-btn" id="st-rel-btn-clear" style="color:#ff453a !important;"><i class="fa-solid fa-trash-can"></i> Clear</button>' +
          '  </div>';
-    h += '  <div class="st-auto-info" id="st-auto-info"></div>';
+    h += '  <div class="st-auto-wrap"><div class="st-auto-bar" id="st-auto-bar" style="display:none;"><span id="st-auto-bar-fill"></span></div><div class="st-auto-info" id="st-auto-info"></div></div>';
     h += '</div></div></div>';
     document.body.insertAdjacentHTML("beforeend", h);
 
@@ -552,7 +589,7 @@ function buildModal() {
     // doesn't render a usable grip on most mobile browsers, so on mobile a resizable
     // textarea is effectively stuck at its starting height. Pointer Events unify mouse
     // and touch, so this one handler works on both. Delegated + registered once here
-    // (not inside wireRelEditPanel, which re-runs every time the edit panel opens) so
+    // (delegated once here, never re-bound by panel re-renders) so
     // repeatedly opening/closing the panel never stacks up duplicate listeners.
     $(document).on("pointerdown", ".st-resize-handle", function(e) {
         var $handle = $(this);
@@ -862,6 +899,17 @@ function buildModal() {
         removeNpcField($(this).attr("data-name"), "routine", "_noRoutine", "Routine");
     });
 
+    // Tap a routine strip to expand/collapse the full schedule inline — the
+    // mobile-friendly replacement for dot hover-tooltips. The × delete inside
+    // the row keeps its own behavior.
+    $(document).on("click", ".st-routine-toggle", function(e) {
+        if ($(e.target).closest(".st-del-npc-routine").length) return;
+        var name = $(this).attr("data-name");
+        if (!name) return;
+        routineExpandState[name] = !routineExpandState[name];
+        renderModal();
+    });
+
     // Forget a remembered location from the codex
     $(document).on("click", ".st-del-codex", function() {
         var key = $(this).attr("data-key");
@@ -871,6 +919,45 @@ function buildModal() {
         Persistence.saveWorldData();
         renderModal();
         if (typeof toastr !== "undefined") toastr.info("Location memory removed.");
+    });
+
+    // --- World Rules editing --- the digest is meant to be VERIFIED, and hand
+    // edits are the verification mechanism: delete a wrong rule, type a missing
+    // one. No confirm on single-rule delete (small, easily re-added); the wand's
+    // full-replace regen is the destructive one and confirms in Pipeline.
+    $(document).on("click", ".st-del-rule", function() {
+        var idx = parseInt($(this).attr("data-index"), 10);
+        if (!Store.worldData || !Array.isArray(Store.worldData.loreDigest) || isNaN(idx)) return;
+        if (idx < 0 || idx >= Store.worldData.loreDigest.length) return;
+        Store.worldData.loreDigest.splice(idx, 1);
+        Persistence.saveWorldData();
+        renderModal();
+    });
+    function addWorldRuleFromInput() {
+        if (!Store.worldData) { if (typeof toastr !== "undefined") toastr.warning("No active chat is open."); return; }
+        var $input = $("#st-world-rule-input");
+        var rule = String($input.val() || "").trim().slice(0, 200);
+        if (!rule) return;
+        if (!Array.isArray(Store.worldData.loreDigest)) Store.worldData.loreDigest = [];
+        if (Store.worldData.loreDigest.length >= 20) {
+            if (typeof toastr !== "undefined") toastr.warning("Rule list is full (20 max) — remove one first.");
+            return;
+        }
+        var lower = rule.toLowerCase();
+        if (Store.worldData.loreDigest.some(function(r) { return String(r).toLowerCase() === lower; })) {
+            if (typeof toastr !== "undefined") toastr.info("That rule is already in the list.");
+            $input.val("");
+            return;
+        }
+        Store.worldData.loreDigest.push(rule);
+        Persistence.saveWorldData();
+        renderModal();
+        // renderModal rebuilt the input — refocus the fresh one for quick multi-add.
+        $("#st-world-rule-input").focus();
+    }
+    $(document).on("click", "#st-world-rule-add", addWorldRuleFromInput);
+    $(document).on("keydown", "#st-world-rule-input", function(e) {
+        if (e.key === "Enter") { e.preventDefault(); addWorldRuleFromInput(); }
     });
 
     // Delete past summary from history
@@ -891,11 +978,13 @@ function renderModal() {
         $("#st-world-val-summary").text("No active chat.");
         $("#st-world-chip-weather-text").text("No active chat.");
         $("#st-world-chip-season").hide();
+        $("#st-world-brief-asof").text("");
         $("#st-world-val-events").html("<i>No active chat.</i>");
         $("#st-world-val-npcs").html("<i>No active chat.</i>");
         $("#st-world-val-reveals").html("<i>No active chat.</i>");
         $("#st-world-val-pending").html("<i>No active chat.</i>");
         $("#st-world-val-codex").html("<i>No active chat.</i>");
+        $("#st-world-val-rules").html("<i>No active chat.</i>");
         // These count badges/chips are stateful DOM (jQuery .show()/.hide()), so on
         // returning to a "no chat" state they must be explicitly reset — otherwise
         // they keep showing whatever the previously-open chat last left them at.
@@ -903,6 +992,9 @@ function renderModal() {
         setWorldCollapseCount("st-world-val-npcs", 0);
         setWorldCollapseCount("st-world-val-reveals", 0);
         setWorldCollapseCount("st-world-val-codex", 0);
+        setWorldCollapseCount("st-world-val-rules", 0);
+        $("#st-rel-tab-badge").hide();
+        $("#st-world-tab-due").hide();
         return;
     }
     if (!Store.storyData._initialized) {
@@ -1042,6 +1134,12 @@ function renderModal() {
     if (Store.worldData && Store.worldData._initialized) {
         $("#st-world-val-summary").text(Store.worldData.worldSummary || "No summary available yet.");
         $("#st-world-chip-weather-text").text(Store.worldData.weatherTrend || "No weather trend yet.");
+        // Briefing "as of" stamp — when the world tier last synthesized (RP clock).
+        $("#st-world-brief-asof").text(
+            (Store.worldData.lastTickTime && Store.worldData.lastTickDate)
+                ? "as of " + Store.worldData.lastTickTime + " · " + Store.worldData.lastTickDate
+                : ""
+        );
 
         // Season chip — same computation used to ground the Weather/World prompts,
         // surfaced here so it's not a purely invisible behind-the-scenes input.
@@ -1088,7 +1186,36 @@ function renderModal() {
                     var nowEntry = (Store.storyData && Store.storyData.time)
                         ? Store.WorldAgent.getRoutineActivityAt(n.routine, Store.storyData.time)
                         : null;
-                    routineLine = `<div class="st-world-npc-goal"><i class="fa-solid fa-clock"></i>${esc(routineText)}${nowEntry ? " &middot; now: " + esc(nowEntry.activity) : ""}<button class="st-npc-line-del st-del-npc-routine" data-name="${esc(n.name)}" title="Remove this routine — the tracker won't invent a new one for this NPC (remove the whole NPC entry to reset that)">&times;</button></div>`;
+                    // Routine as a 24h timeline strip (Direction B): a dot per routine
+                    // entry positioned by hour, a gold marker at the current RP clock —
+                    // one 12px line instead of a full text row, so many routine-carrying
+                    // NPCs stay compact. The full text lives in the tooltip.
+                    var routineDots = "";
+                    n.routine.forEach(function(r) {
+                        var pct = clockToPct(r.time);
+                        if (pct != null) routineDots += `<span class="st-routine-dot" style="left:${pct.toFixed(1)}%" title="${esc(r.time + " " + r.activity)}"></span>`;
+                    });
+                    var nowPct = (Store.storyData && Store.storyData.time) ? clockToPct(Store.storyData.time) : null;
+                    var nowMark = (nowPct != null) ? `<span class="st-routine-now" style="left:${nowPct.toFixed(1)}%"></span>` : "";
+                    var routineOpen = !!routineExpandState[n.name];
+                    routineLine = `<div class="st-world-npc-routine st-routine-toggle${routineOpen ? " st-routine-open" : ""}" data-name="${esc(n.name)}" title="${routineOpen ? "" : esc(routineText + (nowEntry ? " — now: " + nowEntry.activity : ""))}">` +
+                        `<i class="fa-solid fa-clock"></i>` +
+                        `<div class="st-routine-strip">${routineDots}${nowMark}</div>` +
+                        (!routineOpen && nowEntry ? `<span class="st-routine-now-text">${esc(nowEntry.activity)}</span>` : "") +
+                        `<i class="fa-solid fa-chevron-${routineOpen ? "up" : "down"} st-routine-caret"></i>` +
+                        `<button class="st-npc-line-del st-del-npc-routine" data-name="${esc(n.name)}" title="Remove this routine — the tracker won't invent a new one for this NPC (remove the whole NPC entry to reset that)">&times;</button></div>`;
+                    // Expanded: the full schedule as readable rows (nothing truncated,
+                    // no hover needed), the currently-active entry tagged "now".
+                    if (routineOpen) {
+                        routineLine += '<div class="st-routine-detail">' + n.routine.map(function(r) {
+                            var active = !!(nowEntry && r === nowEntry);
+                            return `<div class="st-routine-detail-row${active ? " st-routine-detail-active" : ""}">` +
+                                `<span class="st-routine-detail-time">${esc(r.time)}</span>` +
+                                `<span class="st-routine-detail-act">${esc(r.activity)}</span>` +
+                                (active ? '<span class="st-routine-detail-nowtag">now</span>' : "") +
+                                `</div>`;
+                        }).join("") + '</div>';
+                    }
                 }
                 var currentAction = Store.EventQueue
                     ? Store.EventQueue.getPendingMatching(Store.worldData._eventQueue || [], function(ev) {
@@ -1131,6 +1258,7 @@ function renderModal() {
         $("#st-world-val-summary").text("Waiting for first World Tick to run...");
         $("#st-world-chip-weather-text").text("Waiting for first tick...");
         $("#st-world-chip-season").hide();
+        $("#st-world-brief-asof").text("");
         $("#st-world-val-events").html("<i>Waiting for simulation...</i>");
         $("#st-world-val-npcs").html("<i>Waiting for simulation...</i>");
         $("#st-world-val-reveals").html("<i>Waiting for simulation...</i>");
@@ -1160,9 +1288,23 @@ function renderModal() {
                         : ev.recurringMinutes === 10080 ? " &bull; repeats weekly"
                         : " &bull; repeats every " + ev.recurringMinutes + " min";
                 }
+                // Countdown pill (Direction B): "in ~2h" leads, the absolute resolve
+                // time becomes secondary metadata — same ETA language the HUD's signal
+                // line already speaks.
+                var pendingNow = Persistence.parseRpDateTime(Store.storyData.time, Store.storyData.date);
+                var dueObj = Persistence.parseRpDateTime(ev.executeTime, ev.executeDate);
+                var minsUntil = (pendingNow && dueObj) ? Math.round((dueObj.getTime() - pendingNow.getTime()) / 60000) : null;
+                var etaPill = "";
+                if (minsUntil != null) {
+                    var etaStr = minsUntil <= 0 ? "imminent"
+                        : minsUntil < 60 ? "in ~" + minsUntil + "min"
+                        : minsUntil < 1440 ? "in ~" + (minsUntil / 60).toFixed(minsUntil % 60 === 0 ? 0 : 1) + "h"
+                        : "in ~" + (minsUntil / 1440).toFixed(1) + "d";
+                    etaPill = `<span class="st-eta-pill">${etaStr}</span>`;
+                }
                 pendingHtml += `<div class="st-world-event-item">
                     <div class="st-world-event-meta">
-                        <span>Resolves: ${ev.executeTime} ${ev.executeDate}${originLabel}${repeatLabel}</span>
+                        ${etaPill}<span>${ev.executeTime} ${ev.executeDate}${originLabel}${repeatLabel}</span>
                         <button class="st-cancel-pending-evt st-hdr-btn menu_button" data-id="${esc(ev.id)}" title="Cancel this scheduled event" style="padding: 2px 6px !important; font-size: 10px; color: #ff453a; border-color: rgba(255,255,255,0.1); background: transparent;"><i class="fa-solid fa-trash-can"></i></button>
                     </div>
                     <div class="st-world-event-text">${esc(ev.action)}</div>
@@ -1200,6 +1342,40 @@ function renderModal() {
     }
     $("#st-world-val-codex").html(codexHtml);
     setWorldCollapseCount("st-world-val-codex", codexEntries.length);
+
+    // World Rules — like the codex, maintained outside the World Agent's tick
+    // cycle (established at genesis, edited by hand), so it renders whether or
+    // not a world tick has ever run. Each rule row reuses the NPC-goal line
+    // pattern (same CSS, same inline × delete); the add-row at the bottom lets
+    // the user append rules the digest missed.
+    let rulesHtml = "";
+    var rulesList = (Store.worldData && Array.isArray(Store.worldData.loreDigest)) ? Store.worldData.loreDigest : [];
+    if (rulesList.length > 0) {
+        rulesList.forEach(function(r, idx) {
+            rulesHtml += `<div class="st-world-npc-goal"><i class="fa-solid fa-scale-balanced"></i>${esc(r)}<button class="st-npc-line-del st-del-rule" data-index="${idx}" title="Remove this world rule">&times;</button></div>`;
+        });
+    } else {
+        rulesHtml = "<i>No world rules yet — distilled automatically when a new chat begins.</i>";
+    }
+    rulesHtml += '<div style="display:flex;gap:5px;margin-top:8px;">' +
+        '<input type="text" id="st-world-rule-input" class="text_pole" placeholder="Add a rule the world must respect…" style="flex:1;min-width:0;">' +
+        '<button class="menu_button" id="st-world-rule-add" title="Add rule" style="flex:0 0 auto;"><i class="fa-solid fa-plus"></i></button></div>';
+    $("#st-world-val-rules").html(rulesHtml);
+    setWorldCollapseCount("st-world-val-rules", rulesList.length);
+
+    // Tab-state chips (Direction C): edge count on Relations, due-dot on World.
+    var relEdgeCount = (Store.settings.relationsEnabled && Store.relationshipData && Store.relationshipData.edges)
+        ? Store.relationshipData.edges.length : 0;
+    $("#st-rel-tab-badge").text(relEdgeCount).toggle(relEdgeCount > 0);
+    var worldTierDue = false;
+    if (Store.settings.worldEnabled && Store.worldData && Store.worldData._schedulerAccumulated) {
+        var accW = Store.worldData._schedulerAccumulated;
+        worldTierDue = (accW.npc || 0) >= Store.settings.npcTierMinutes ||
+                       (accW.weather || 0) >= Store.settings.weatherTierMinutes ||
+                       (accW.faction || 0) >= Store.settings.factionTierMinutes ||
+                       (accW.world || 0) >= Store.settings.worldTierMinutes;
+    }
+    $("#st-world-tab-due").toggle(worldTierDue);
 
     renderAutoInfo();
     // Refresh graph if relations tab is currently visible
@@ -1265,9 +1441,19 @@ function updateSettingsUI() {
     renderAutoInfo();
 }
 
+/** Footer countdown progress strip (Direction C): fills toward the next
+ * automatic check. Pass null to hide (off/manual/world's multi-cadence view). */
+function setAutoBar(frac) {
+    var $bar = $("#st-auto-bar");
+    if (!$bar.length) return;
+    if (frac == null) { $bar.hide(); return; }
+    $bar.show();
+    $("#st-auto-bar-fill").css("width", Math.round(Math.max(0, Math.min(1, frac)) * 100) + "%");
+}
+
 function renderAutoInfo() {
     var hasData = Store.isChatOpen() && Store.storyData;
-    if (!hasData) { $("#st-auto-info").text("No active chat"); return; }
+    if (!hasData) { $("#st-auto-info").text("No active chat"); setAutoBar(null); return; }
 
     // Show the countdown relevant to whichever tab is currently active, since each
     // agent (scene/world/relations) has its own independent interval and settings.
@@ -1284,7 +1470,7 @@ function renderAutoInfo() {
 
     // Default: Scene tracker countdown (Current / History tabs).
     var autoUpdate = (Store.storyData.autoUpdate !== undefined) ? Store.storyData.autoUpdate : Store.settings.autoUpdate;
-    if (!autoUpdate) { $("#st-auto-info").text("Auto-update: OFF"); return; }
+    if (!autoUpdate) { $("#st-auto-info").text("Auto-update: OFF"); setAutoBar(null); return; }
 
     if (Store.settings.timeMode === "message") {
         // Message Mode: cadence is purely message-count driven (see _timeModeMsgCounter
@@ -1294,6 +1480,7 @@ function renderAutoInfo() {
         var timeModeMsgCounter = Store.storyData._timeModeMsgCounter || 0;
         var msgRem = Math.max(0, msgInterval - timeModeMsgCounter);
         $("#st-auto-info").text(`Scene update in ${msgRem} message(s)`);
+        setAutoBar(timeModeMsgCounter / msgInterval);
         return;
     }
 
@@ -1302,9 +1489,14 @@ function renderAutoInfo() {
     var sceneAccum = (Store.worldData && Store.worldData._schedulerAccumulated) ? (Store.worldData._schedulerAccumulated.scene || 0) : 0;
     var sceneRemMin = Math.max(0, Store.settings.sceneTierMinutes - sceneAccum);
     $("#st-auto-info").text(`Scene update in ~${sceneRemMin.toFixed(1)}min (RP time, or sooner if a skip is detected)`);
+    setAutoBar(Store.settings.sceneTierMinutes > 0 ? sceneAccum / Store.settings.sceneTierMinutes : null);
 }
 
 function renderWorldAutoInfo() {
+    // Four independent cadences don't honestly reduce to one progress bar — the
+    // world tab keeps the text-only readout (the tab's due-dot covers "something
+    // is ready" at a glance instead).
+    setAutoBar(null);
     if (!Store.settings.enabled || !Store.settings.worldEnabled) { $("#st-auto-info").text("World Agent: OFF"); return; }
     if (!Store.worldData || !Store.worldData._schedulerAccumulated) { $("#st-auto-info").text("World Agent: waiting for first tick"); return; }
 
@@ -1319,16 +1511,18 @@ function renderWorldAutoInfo() {
 }
 
 function renderRelAutoInfo() {
-    if (!Store.settings.enabled || !Store.settings.relationsEnabled) { $("#st-auto-info").text("Relationship Tracker: OFF"); return; }
-    if (!Store.settings.relationsAutoUpdate) { $("#st-auto-info").text("Relationship Tracker: Manual only"); return; }
+    if (!Store.settings.enabled || !Store.settings.relationsEnabled) { $("#st-auto-info").text("Relationship Tracker: OFF"); setAutoBar(null); return; }
+    if (!Store.settings.relationsAutoUpdate) { $("#st-auto-info").text("Relationship Tracker: Manual only"); setAutoBar(null); return; }
 
     var relInterval = Store.settings.relAutoInterval || 5;
-    // Mirrors the actual trigger check in handleMsg (relMsgCounter > 0 && % === 0 → due).
-    // Plain `relInterval - (relMsgCounter % relInterval)` reports a full interval remaining
-    // instead of "due now" at the exact moment the counter lands on a multiple.
-    var isDue = Store.relMsgCounter > 0 && Store.relMsgCounter % relInterval === 0;
-    var rem = isDue ? 0 : (relInterval - (Store.relMsgCounter % relInterval));
+    // Mirrors the actual trigger check in handleMsg (relMsgCounter >= interval → due).
+    // The counter only resets when an analysis actually completes, so a skipped or
+    // failed tick correctly keeps reading "due now" here instead of silently
+    // showing (and waiting out) a fresh full interval.
+    var isDue = Store.relMsgCounter >= relInterval;
+    var rem = Math.max(0, relInterval - Store.relMsgCounter);
     $("#st-auto-info").text(isDue ? "Relations update due now" : `Relations update in ${rem} msg(s)`);
+    setAutoBar(Store.relMsgCounter / relInterval);
 }
 function renderRelationshipGraph() {
     var $container = $("#st-rel-graph-container");
@@ -1369,8 +1563,6 @@ function renderRelationshipGraph() {
             if (e.from && !nodeMap[e.from]) { var n1 = { id: e.from, name: e.from }; nodes.push(n1); nodeMap[e.from] = n1; }
             if (e.to && !nodeMap[e.to]) { var n2 = { id: e.to, name: e.to }; nodes.push(n2); nodeMap[e.to] = n2; }
         });
-        // If relEditingNode was deleted or renamed out from under us, close the panel.
-        if (Store.relEditingNode && !nodeMap[Store.relEditingNode]) Store.setRelEditingNode(null);
 
         var width = $container.width();
         if (!width || width < 100) width = 400; // Safeguard if tab is hidden during render
@@ -1468,7 +1660,6 @@ function renderRelationshipGraph() {
             : { tx: 0, ty: 0, scale: 1 };
 
         var html = '';
-        var defaultDetail = '<i style="opacity: 0.6;">Hover or tap a character/connection to see details...</i>';
 
         html += '<div class="st-rel-legend">';
         typeKeys.forEach(function(type) {
@@ -1512,21 +1703,21 @@ function renderRelationshipGraph() {
             html += '<circle class="st-rel-node-circle" r="16" fill="#242421" stroke="var(--st-custom-accent)" stroke-width="2" />';
             html += '<text y="4" text-anchor="middle" fill="#fff" font-size="11px" font-weight="bold" font-family="sans-serif" style="pointer-events:none;">'+esc(initials)+'</text>';
             html += '<text y="28" text-anchor="middle" fill="var(--st-journal-text)" font-size="11px" font-family="sans-serif" font-weight="600" style="pointer-events:none;">'+esc(sn.name)+'</text>';
-            html += '<g class="st-rel-edit-badge" transform="translate(14,-14)">';
-            html += '  <circle r="9" fill="var(--st-custom-accent)" stroke="#1c1c1a" stroke-width="1.5" />';
-            html += '  <text y="3.5" text-anchor="middle" fill="#1c1c1a" font-size="9px" font-family="sans-serif">✎</text>';
-            html += '</g>';
             html += '</g>';
         });
         html += '</g></g></svg>';
 
-        html += '<div class="st-rel-detail" id="st-rel-detail-panel" style="min-height:55px; margin-top:10px;">';
-        html += defaultDetail;
-        html += '</div>';
+        // Relations board (Direction C): the graph stays pinned above as the map;
+        // every relationship lives below as a compact card in its own SCROLLING
+        // list, so a large cast never stretches the tab. Selecting a character in
+        // the graph filters the list; each card's strength slider edits in place.
+        html += '<div class="st-rel-board">' +
+                '<div class="st-rel-board-head" id="st-rel-board-head"></div>' +
+                '<div class="st-rel-board-list" id="st-rel-board-list"></div>' +
+                '</div>';
 
         $container.html(html);
 
-        var $detail = $container.find("#st-rel-detail-panel");
         var svgEl = $container.find(".st-rel-svg")[0];
         var viewportEl = $container.find("#st-rel-viewport")[0];
         var currentView = { tx: view.tx, ty: view.ty, scale: view.scale };
@@ -1558,47 +1749,369 @@ function renderRelationshipGraph() {
         function clearSelection() {
             Store.setRelSelectedNode(null);
             $container.find('.st-rel-node, .st-rel-edge').removeClass('st-rel-dim st-rel-selected');
-            $detail.html(defaultDetail);
+            relCardEditKey = null; relBioEditOpen = false; relAddOpen = false;
+            renderRelBoard(null);
         }
 
-        function historyHtml(edgeData) {
-            var hist = (edgeData && edgeData.history) || [];
-            if (hist.length === 0) return "";
-            var rows = hist.map(function(h) {
-                var when = h.date ? ((h.time || "") + " " + h.date).trim() : ("Msg #" + (h.msg || 0));
-                var sign = (h.strength >= 0) ? "+" : "";
-                return '<div style="display:flex; justify-content:space-between; gap:6px; font-size:10px; opacity:0.85; padding:2px 0; border-bottom:1px solid rgba(255,255,255,0.06);">' +
-                       '<span><span style="color:var(--st-custom-accent);">' + esc(when) + '</span> ' + esc(h.summary || "") + '</span>' +
-                       '<span style="opacity:0.7; flex-shrink:0;">' + sign + (h.strength || 0).toFixed(2) + '</span></div>';
-            }).join("");
-            return '<div style="margin-top:4px;"><div style="font-size:9.5px; text-transform:uppercase; letter-spacing:0.3px; opacity:0.5; margin-bottom:2px;">History (' + hist.length + ')</div>' +
-                   '<div style="max-height:90px; overflow-y:auto; padding-right:4px;">' + rows + '</div></div>';
+        // Same band thresholds the context injection explains to the model —
+        // players and model share one vocabulary for what a strength value MEANS.
+        function bandForStrength(s) {
+            if (s <= -0.6) return "hostile";
+            if (s <= -0.2) return "cold";
+            if (s < 0.2) return "neutral";
+            if (s < 0.6) return "warm";
+            return "bonded";
         }
 
-        function showEdgeDetail(edgeObj) {
-            var eData = edgeObj.data;
+        /**
+         * The scrollable relationship board under the graph (Direction C). The
+         * graph stays pinned above as the map; every relationship lives down here
+         * as a compact card in a list with its own scrollbar, so a large cast
+         * never stretches the tab. filterName limits the list to one character's
+         * bonds (set by tapping their node); null shows everything, strongest
+         * feelings first. Each card's slider EDITS strength in place: labels
+         * update live while dragging, the value persists on release, and the
+         * graph line's thickness refreshes directly — deliberately no full
+         * re-render mid-interaction, which would rebuild this list and lose the
+         * scroll position.
+         */
+        function renderRelBoard(filterName) {
+            var $head = $container.find("#st-rel-board-head");
+            var $list = $container.find("#st-rel-board-list");
+            if (!$head.length) return;
+            var allEdges = Store.relationshipData.edges || [];
+            var shown = filterName
+                ? allEdges.filter(function(e) { return e && (e.from === filterName || e.to === filterName); })
+                : allEdges.slice();
+            shown.sort(function(a, b) { return Math.abs(b.strength || 0) - Math.abs(a.strength || 0); });
+
+            // --- header: when filtered, this doubles as the character's toolbar
+            // (add bond / remove character / back to all) ---
+            if (filterName) {
+                $head.html(
+                    '<span class="st-rel-board-filter"><i class="fa-solid fa-user"></i>' + esc(filterName) + ' · ' + shown.length + ' bond' + (shown.length === 1 ? '' : 's') + '</span>' +
+                    '<button type="button" class="st-rel-hbtn st-rel-add-bond' + (relAddOpen ? ' st-rel-hbtn-on' : '') + '" title="Add a relationship for ' + esc(filterName) + '"><i class="fa-solid fa-plus"></i></button>' +
+                    '<button type="button" class="st-rel-hbtn st-rel-del-node" title="Remove ' + esc(filterName) + ' and all their relationships"><i class="fa-solid fa-trash-can"></i></button>' +
+                    '<button type="button" class="st-rel-board-clear" title="Show all relationships">&times;</button>'
+                );
+                $head.find(".st-rel-board-clear").on("click", function(e) { e.stopPropagation(); clearSelection(); });
+                $head.find(".st-rel-add-bond").on("click", function(e) {
+                    e.stopPropagation();
+                    relAddOpen = !relAddOpen;
+                    renderRelBoard(filterName);
+                });
+                $head.find(".st-rel-del-node").on("click", function(e) {
+                    e.stopPropagation();
+                    if (!confirm('Remove "' + filterName + '" and all their relationships? This cannot be undone.')) return;
+                    var result = Store.RelationshipAgent.removeNodeAndEdges(Store.relationshipData.nodes, Store.relationshipData.edges, filterName);
+                    Store.relationshipData.nodes = result.nodes;
+                    Store.relationshipData.edges = result.edges;
+                    Store.setRelSelectedNode(null);
+                    relCardEditKey = null; relBioEditOpen = false; relAddOpen = false;
+                    Persistence.saveRelationshipData();
+                    renderRelationshipGraph();
+                    HUD.renderHUD();
+                });
+            } else {
+                $head.html('<span class="st-rel-board-filter">All bonds · ' + shown.length + '</span>' +
+                    '<span class="st-rel-board-hint">tap a character to filter · slider = strength · ✎ = edit</span>');
+            }
+
+            // --- card builders ---
+            function editKeyOf(e) { return e.from + "␟" + e.to; }
+            function meterRowHtml(e) {
+                var s = (typeof e.strength === "number") ? e.strength : 0;
+                return '<div class="st-rel-card-meter" data-from="' + esc(e.from) + '" data-to="' + esc(e.to) + '">' +
+                    '<input type="range" class="st-rel-card-strength" min="-1" max="1" step="0.05" value="' + s + '" title="Drag to edit strength">' +
+                    '<span class="st-rel-card-band">' + bandForStrength(s) + '</span>' +
+                    '<span class="st-rel-card-val">' + (s >= 0 ? '+' : '') + s.toFixed(2) + '</span>' +
+                    buildRelStrengthSparkline(e) +
+                    '</div>';
+            }
+            function editBtnHtml(e) {
+                var on = relCardEditKey === editKeyOf(e);
+                return '<button type="button" class="st-rel-editbtn' + (on ? ' st-rel-editbtn-on' : '') + '" data-from="' + esc(e.from) + '" data-to="' + esc(e.to) + '" title="Edit type / summary · delete bond">✎</button>';
+            }
+            // Inline editor for one bond: type + summary + history + actions.
+            // Strength is deliberately NOT here — the card's slider already edits
+            // it live, so the editor only covers what the slider can't.
+            function editBlockHtml(e) {
+                var typeOpts = typeKeys.map(function(t) {
+                    return '<option value="' + esc(t) + '"' + (t === e.type ? ' selected' : '') + '>' + esc(t) + '</option>';
+                }).join('');
+                var hist = e.history || [];
+                var histHtml = hist.length > 0
+                    ? '<div class="st-rel-edit-histlabel">History (' + hist.length + ')</div><div class="st-rel-edit-hist">' + hist.map(function(h) {
+                        var when = h.date ? ((h.time || "") + " " + h.date).trim() : ("msg #" + (h.msg || 0));
+                        var hsign = (h.strength >= 0) ? "+" : "";
+                        return '<div class="st-rel-edit-histrow"><span class="st-rel-edit-histwhen">' + esc(when) + '</span><span class="st-rel-edit-histsum">' + esc(h.summary || "") + '</span><span class="st-rel-edit-histval">' + hsign + (h.strength || 0).toFixed(2) + '</span></div>';
+                    }).join('') + '</div>'
+                    : '';
+                return '<div class="st-rel-edit-block" data-from="' + esc(e.from) + '" data-to="' + esc(e.to) + '">' +
+                    '<div class="st-rel-edit-row"><label>Type</label><select class="st-rel-edit-type">' + typeOpts + '</select></div>' +
+                    '<div class="st-rel-edit-row"><label>Summary</label><textarea class="st-rel-edit-summary" rows="2">' + esc(e.summary || "") + '</textarea></div>' +
+                    histHtml +
+                    '<div class="st-rel-edit-actions">' +
+                    '<button type="button" class="st-rel-mini-btn st-rel-mini-save">Save</button>' +
+                    '<button type="button" class="st-rel-mini-btn st-rel-mini-cancel">Cancel</button>' +
+                    '<button type="button" class="st-rel-mini-btn st-rel-mini-delete">Delete bond</button>' +
+                    '</div></div>';
+            }
+            function dualSideHtml(e) {
+                var sideColor = typeColors[e.type] || "#888";
+                var editing = relCardEditKey === editKeyOf(e);
+                return '<div class="st-rel-card-side">' +
+                    '<div class="st-rel-card-sidehead">' +
+                    '<span class="st-rel-card-dir" title="' + esc(e.from) + '’s feelings toward ' + esc(e.to) + '">' + esc(e.from) + ' →</span>' +
+                    '<span class="st-rel-card-type" style="color:' + sideColor + ';">●&nbsp;' + esc(e.type || 'neutral') + '</span>' +
+                    editBtnHtml(e) +
+                    '</div>' +
+                    meterRowHtml(e) +
+                    (editing ? editBlockHtml(e) : (e.summary ? '<div class="st-rel-card-summary">' + esc(e.summary) + '</div>' : '')) +
+                    '</div>';
+            }
+
+            var lHtml = "";
+
+            // --- filtered-only extras above the cards: bio + add-bond form ---
+            if (filterName) {
+                var nodeData = nodeMap[filterName];
+                if (relBioEditOpen) {
+                    lHtml += '<div class="st-rel-bio-row">' +
+                        '<textarea class="st-rel-bio-input" rows="2" placeholder="One sentence establishing who ' + esc(filterName) + ' is…">' + esc((nodeData && nodeData.bio) || "") + '</textarea>' +
+                        '<div class="st-rel-edit-actions">' +
+                        '<button type="button" class="st-rel-mini-btn st-rel-mini-biosave">Save bio</button>' +
+                        '<button type="button" class="st-rel-mini-btn st-rel-mini-biocancel">Cancel</button>' +
+                        '</div></div>';
+                } else {
+                    lHtml += '<div class="st-rel-bio-row st-rel-bio-line">' +
+                        '<span class="st-rel-board-bio">' + esc((nodeData && nodeData.bio) || "No bio yet.") + '</span>' +
+                        '<button type="button" class="st-rel-editbtn st-rel-bio-editbtn" title="Edit bio">✎</button></div>';
+                }
+                if (relAddOpen) {
+                    var otherNames = (Store.relationshipData.nodes || [])
+                        .map(function(nn) { return nn && nn.name; })
+                        .filter(function(nn) { return nn && nn !== filterName; });
+                    lHtml += '<div class="st-rel-card st-rel-add-card">' +
+                        '<div class="st-rel-card-top"><span class="st-rel-card-pair">New bond · ' + esc(filterName) + ' ↔ …</span></div>' +
+                        '<input type="text" class="st-rel-add-name" list="st-rel-add-names" placeholder="Character name">' +
+                        '<datalist id="st-rel-add-names">' + otherNames.map(function(nn) { return '<option value="' + esc(nn) + '">'; }).join('') + '</datalist>' +
+                        '<div class="st-rel-card-meter">' +
+                        '<select class="st-rel-add-type">' + typeKeys.map(function(t) { return '<option value="' + esc(t) + '"' + (t === "neutral" ? " selected" : "") + '>' + esc(t) + '</option>'; }).join('') + '</select>' +
+                        '<input type="range" class="st-rel-add-strength" min="-1" max="1" step="0.05" value="0">' +
+                        '<span class="st-rel-card-val st-rel-add-val">+0.00</span></div>' +
+                        '<div class="st-rel-edit-actions">' +
+                        '<button type="button" class="st-rel-mini-btn st-rel-mini-addsave">Add</button>' +
+                        '<button type="button" class="st-rel-mini-btn st-rel-mini-addcancel">Cancel</button>' +
+                        '</div></div>';
+                }
+            }
+
+            // An asymmetric pair (A→B AND B→A both stored) merges into ONE card
+            // with a row per side; a single stored edge is a mutual relationship
+            // (rule 4b: one entry per pair) and stays one card.
+            var pairDone = {};
+            shown.forEach(function(e) {
+                var pairKey = e.from < e.to ? (e.from + "␟" + e.to) : (e.to + "␟" + e.from);
+                if (pairDone[pairKey]) return;
+                var reverse = null;
+                for (var ri = 0; ri < allEdges.length; ri++) {
+                    var cand = allEdges[ri];
+                    if (cand && cand.from === e.to && cand.to === e.from) { reverse = cand; break; }
+                }
+                if (reverse) {
+                    pairDone[pairKey] = true;
+                    var first = Math.abs(e.strength || 0) >= Math.abs(reverse.strength || 0) ? e : reverse;
+                    var second = (first === e) ? reverse : e;
+                    lHtml += '<div class="st-rel-card st-rel-card-dual">' +
+                        '<div class="st-rel-card-top">' +
+                        '<span class="st-rel-card-pair">' + esc(first.from) + ' ⇄ ' + esc(first.to) + '</span>' +
+                        '<span class="st-rel-card-oneside" title="Each side feels differently — edit them separately below">two sides</span>' +
+                        '</div>' +
+                        dualSideHtml(first) + dualSideHtml(second) +
+                        '</div>';
+                } else {
+                    var color = typeColors[e.type] || "#888";
+                    var editing = relCardEditKey === editKeyOf(e);
+                    lHtml += '<div class="st-rel-card">' +
+                        '<div class="st-rel-card-top">' +
+                        '<span class="st-rel-card-pair">' + esc(e.from) + ' ↔ ' + esc(e.to) + '</span>' +
+                        '<span class="st-rel-card-type" style="color:' + color + ';">●&nbsp;' + esc(e.type || 'neutral') + '</span>' +
+                        editBtnHtml(e) +
+                        '</div>' +
+                        meterRowHtml(e) +
+                        (editing ? editBlockHtml(e) : (e.summary ? '<div class="st-rel-card-summary">' + esc(e.summary) + '</div>' : '')) +
+                        '</div>';
+                }
+            });
+            if (!lHtml) lHtml = '<div class="st-rel-board-empty">No relationships ' + (filterName ? 'for ' + esc(filterName) + ' yet.' : 'yet.') + '</div>';
+            $list.html(lHtml);
+
+            // --- handlers (direct-bound per render; children replaced wholesale) ---
+            $list.find(".st-rel-card-strength").on("input", function() {
+                var $meter = $(this).closest(".st-rel-card-meter");
+                var v = parseFloat(this.value);
+                $meter.find(".st-rel-card-val").text((v >= 0 ? "+" : "") + v.toFixed(2));
+                $meter.find(".st-rel-card-band").text(bandForStrength(v));
+            });
+            $list.find(".st-rel-card-strength").on("change", function() {
+                var $meter = $(this).closest(".st-rel-card-meter");
+                var from = $meter.attr("data-from"), to = $meter.attr("data-to");
+                var v = parseFloat(this.value);
+                Store.relationshipData.edges = Store.RelationshipAgent.updateEdgeFields(Store.relationshipData.edges, from, to, { strength: v });
+                Persistence.saveRelationshipData();
+                var idx = -1;
+                simEdges.forEach(function(eo, i) { if (eo && eo.data && eo.data.from === from && eo.data.to === to) idx = i; });
+                if (idx !== -1) $container.find('.st-rel-edge[data-idx="' + idx + '"]').attr("stroke-width", 1.5 + Math.abs(v) * 3.5);
+                HUD.renderHUD();
+            });
+            // Card ✎ — toggles that bond's inline editor.
+            $list.find(".st-rel-editbtn").not(".st-rel-bio-editbtn").on("click", function(ev) {
+                ev.stopPropagation();
+                var key = $(this).attr("data-from") + "␟" + $(this).attr("data-to");
+                relCardEditKey = (relCardEditKey === key) ? null : key;
+                renderRelBoard(filterName);
+            });
+            $list.find(".st-rel-mini-save").on("click", function(ev) {
+                ev.stopPropagation();
+                var $block = $(this).closest(".st-rel-edit-block");
+                var from = $block.attr("data-from"), to = $block.attr("data-to");
+                Store.relationshipData.edges = Store.RelationshipAgent.updateEdgeFields(Store.relationshipData.edges, from, to, {
+                    type: $block.find(".st-rel-edit-type").val(),
+                    summary: String($block.find(".st-rel-edit-summary").val() || ""),
+                });
+                Persistence.saveRelationshipData();
+                relCardEditKey = null;
+                // Full re-render: a type change recolors the graph line.
+                renderRelationshipGraph();
+                HUD.renderHUD();
+                if (typeof toastr !== "undefined") toastr.success("Bond updated.");
+            });
+            $list.find(".st-rel-mini-cancel").on("click", function(ev) {
+                ev.stopPropagation();
+                relCardEditKey = null;
+                renderRelBoard(filterName);
+            });
+            $list.find(".st-rel-mini-delete").on("click", function(ev) {
+                ev.stopPropagation();
+                var $block = $(this).closest(".st-rel-edit-block");
+                var from = $block.attr("data-from"), to = $block.attr("data-to");
+                if (!confirm("Delete this bond (" + from + " → " + to + ")?")) return;
+                Store.relationshipData.edges = Store.RelationshipAgent.removeEdge(Store.relationshipData.edges, from, to);
+                Persistence.saveRelationshipData();
+                relCardEditKey = null;
+                renderRelationshipGraph();
+                HUD.renderHUD();
+            });
+            // Bio editing (filtered header area).
+            $list.find(".st-rel-bio-editbtn").on("click", function(ev) {
+                ev.stopPropagation();
+                relBioEditOpen = true;
+                renderRelBoard(filterName);
+            });
+            $list.find(".st-rel-mini-biosave").on("click", function(ev) {
+                ev.stopPropagation();
+                var bio = String($list.find(".st-rel-bio-input").val() || "").trim();
+                var node = (Store.relationshipData.nodes || []).find(function(nn) { return nn && nn.name === filterName; });
+                if (!node) { node = { id: filterName, name: filterName }; Store.relationshipData.nodes.push(node); }
+                node.bio = bio; // manual edit always overrides, unlike the agent's first-write-wins
+                Persistence.saveRelationshipData();
+                relBioEditOpen = false;
+                renderRelBoard(filterName);
+                if (typeof toastr !== "undefined") toastr.success("Bio saved.");
+            });
+            $list.find(".st-rel-mini-biocancel").on("click", function(ev) {
+                ev.stopPropagation();
+                relBioEditOpen = false;
+                renderRelBoard(filterName);
+            });
+            // Add-bond form.
+            $list.find(".st-rel-add-strength").on("input", function() {
+                var v = parseFloat(this.value);
+                $list.find(".st-rel-add-val").text((v >= 0 ? "+" : "") + v.toFixed(2));
+            });
+            $list.find(".st-rel-mini-addsave").on("click", function(ev) {
+                ev.stopPropagation();
+                var otherName = String($list.find(".st-rel-add-name").val() || "").trim();
+                if (!otherName) { if (typeof toastr !== "undefined") toastr.warning("Enter a character name first."); return; }
+                // Same canonical-name resolution the tracker uses, so "aria" reuses
+                // an existing "Aria Stormwind" instead of forking a duplicate.
+                otherName = Persistence.resolveCanonicalName(otherName);
+                if (otherName === filterName) { if (typeof toastr !== "undefined") toastr.warning("Can't add a relationship to yourself."); return; }
+                var before = Store.relationshipData.edges.length;
+                Store.relationshipData.edges = Store.RelationshipAgent.addManualEdge(Store.relationshipData.edges, {
+                    from: filterName, to: otherName,
+                    type: $list.find(".st-rel-add-type").val(),
+                    strength: parseFloat($list.find(".st-rel-add-strength").val()),
+                });
+                if (Store.relationshipData.edges.length === before) {
+                    if (typeof toastr !== "undefined") toastr.warning("That bond already exists — edit it on its card instead.");
+                    return;
+                }
+                [filterName, otherName].forEach(function(nm) {
+                    if (!Store.relationshipData.nodes.find(function(nn) { return nn.name === nm; })) {
+                        Store.relationshipData.nodes.push({ id: nm, name: nm });
+                    }
+                });
+                Persistence.saveRelationshipData();
+                relAddOpen = false;
+                renderRelationshipGraph();
+                HUD.renderHUD();
+                if (typeof toastr !== "undefined") toastr.success("Bond added.");
+            });
+            $list.find(".st-rel-mini-addcancel").on("click", function(ev) {
+                ev.stopPropagation();
+                relAddOpen = false;
+                renderRelBoard(filterName);
+            });
+            // Tapping a card highlights its pair in the graph — but never when the
+            // tap landed on any control (sliders, selects, buttons, text fields).
+            $list.find(".st-rel-card").on("click", function(e) {
+                if ($(e.target).closest("input, select, textarea, button, datalist").length) return;
+                var $meter = $(this).find(".st-rel-card-meter").first();
+                var from = $meter.attr("data-from"), to = $meter.attr("data-to");
+                var eo = null;
+                simEdges.forEach(function(x) { if (x && x.data && x.data.from === from && x.data.to === to) eo = x; });
+                if (eo) highlightEdge(eo);
+            });
+        }
+
+        /** Graph-side emphasis for one edge (dims everything else). */
+        function highlightEdge(edgeObj) {
             $container.find('.st-rel-edge').addClass('st-rel-dim');
             $container.find('.st-rel-edge[data-idx="'+simEdges.indexOf(edgeObj)+'"]').removeClass('st-rel-dim');
             $container.find('.st-rel-node').addClass('st-rel-dim').removeClass('st-rel-selected');
             $container.find('.st-rel-node[data-nidx="'+edgeObj.source.idx+'"], .st-rel-node[data-nidx="'+edgeObj.target.idx+'"]').removeClass('st-rel-dim');
+        }
 
-            var sign = (eData.strength || 0) >= 0 ? "+" : "";
-            var strengthVal = (eData.strength || 0).toFixed(2);
-            // Same mutual-vs-one-sided check as injectContextToChat — a reciprocal edge in
-            // the data means this pair is stored as two asymmetric entries (see
-            // RelationshipAgent.js rule 4b), so it should render with a one-way arrow here too.
-            var edgeOneSided = Store.RelationshipAgent && Store.RelationshipAgent.hasReciprocalEdge(Store.relationshipData.edges, eData.from, eData.to);
-            var edgeArrow = edgeOneSided ? ' \u2192 ' : ' \u2194 ';
-            var dHtml = '<div style="margin-bottom:6px;"><strong style="color:var(--st-custom-accent)">' + esc(eData.from) + edgeArrow + esc(eData.to) + '</strong></div>';
-            dHtml += '<div style="margin-bottom:4px; font-size:11px;"><span style="color:'+(typeColors[eData.type]||'#888')+'">● ' + esc(eData.type||'neutral') + '</span> (Strength: ' + sign + strengthVal + ')</div>';
-            if (eData.summary) dHtml += '<div style="opacity:0.9; margin-bottom:4px; font-size:11px; line-height: 1.4;">' + esc(eData.summary) + '</div>';
-            if (eData.change && eData.change !== "Stable") dHtml += '<div style="opacity:0.75; font-style:italic; font-size:11px;">↗ ' + esc(eData.change) + '</div>';
-            dHtml += historyHtml(eData);
-            $detail.html(dHtml);
+        /** Scrolls the tapped edge's card into view with a brief accent flash. */
+        function flashCard(eData) {
+            function findCard() {
+                // Match via meter rows — a dual card carries two directions, either
+                // of which should land on the same card.
+                return $container.find(".st-rel-card").filter(function() {
+                    return $(this).find(".st-rel-card-meter").filter(function() {
+                        return $(this).attr("data-from") === eData.from && $(this).attr("data-to") === eData.to;
+                    }).length > 0;
+                }).first();
+            }
+            var $card = findCard();
+            if (!$card.length) {
+                // Card hidden by an active filter — reset to the full list first.
+                renderRelBoard(null);
+                $card = findCard();
+            }
+            if (!$card.length) return;
+            if ($card[0].scrollIntoView) $card[0].scrollIntoView({ block: "nearest", behavior: "smooth" });
+            $card.addClass("st-rel-card-hot");
+            setTimeout(function() { $card.removeClass("st-rel-card-hot"); }, 900);
         }
 
         function selectNode(nodeObj) {
             Store.setRelSelectedNode(nodeObj.name);
+            // Selecting (or re-selecting) a character closes any open editors —
+            // they're per-character surfaces.
+            relCardEditKey = null; relBioEditOpen = false; relAddOpen = false;
             var connectedEdges = simEdges.filter(function(eObj) {
                 return eObj.source.idx === nodeObj.idx || eObj.target.idx === nodeObj.idx;
             });
@@ -1619,49 +2132,23 @@ function renderRelationshipGraph() {
                 $(this).toggleClass('st-rel-dim', !connected);
             });
 
-            var dHtml = '<div style="margin-bottom:6px;"><strong style="color:var(--st-custom-accent)">' + esc(nodeObj.name) + '\'s Connections</strong></div>';
-            var nodeData = nodeMap[nodeObj.name] || nodeMap[nodeObj.id];
-            if (nodeData && nodeData.bio) {
-                dHtml += '<div style="opacity:0.85; font-style:italic; font-size:11px; line-height:1.4; margin-bottom:8px;">' + esc(nodeData.bio) + '</div>';
-            }
-            if (connectedEdges.length === 0) {
-                dHtml += '<div style="opacity:0.8; font-size:11px;">No known connections.</div>';
-            } else {
-                dHtml += '<div style="display:flex; flex-direction:column; gap:6px; max-height:240px; overflow-y:auto; padding-right:5px;">';
-                connectedEdges.sort(function(a, b) { return Math.abs(b.data.strength||0) - Math.abs(a.data.strength||0); });
-                connectedEdges.forEach(function(eObj) {
-                    var e = eObj.data;
-                    var otherName = (eObj.source.idx === nodeObj.idx) ? eObj.target.name : eObj.source.name;
-                    var sign = (e.strength || 0) >= 0 ? "+" : "";
-                    var color = typeColors[e.type] || "#888";
-                    // Only annotate direction for genuinely asymmetric pairs (a reciprocal edge
-                    // exists — see RelationshipAgent.js rule 4b); mutual pairs stay unmarked as
-                    // before. Mirrors the badge already used in buildRelEditPanelHtml.
-                    var connOneSided = Store.RelationshipAgent && Store.RelationshipAgent.hasReciprocalEdge(Store.relationshipData.edges, e.from, e.to);
-                    var connDirTag = connOneSided
-                        ? (e.from === nodeObj.name
-                            ? ' <span style="opacity:0.6; font-size:10px;" title="One-sided \u2014 '+esc(nodeObj.name)+'\'s feelings toward '+esc(otherName)+'">(one-sided \u2192)</span>'
-                            : ' <span style="opacity:0.6; font-size:10px;" title="One-sided \u2014 '+esc(otherName)+'\'s feelings toward '+esc(nodeObj.name)+', not necessarily returned">(one-sided \u2190)</span>')
-                        : '';
-                    dHtml += '<div style="font-size:11px; line-height: 1.3;">';
-                    dHtml += '<strong style="color:#fff;">' + esc(otherName) + ':</strong>' + connDirTag + ' ';
-                    dHtml += '<span style="color:'+color+'">' + esc(e.type) + '</span> ';
-                    dHtml += '(' + sign + (e.strength||0).toFixed(1) + ')<br>';
-                    if (e.summary) dHtml += '<span style="opacity:0.8;">' + esc(e.summary) + '</span>';
-                    dHtml += historyHtml(e);
-                    dHtml += '</div>';
-                });
-                dHtml += '</div>';
-            }
-            dHtml += '<div style="margin-top:6px; font-size:10px; opacity:0.55;">Tap the ✎ badge on this character to edit their relationships.</div>';
-            $detail.html(dHtml);
+            // The board below the graph doubles as the detail view: filter it
+            // to this character's bonds (bio shown in its header).
+            renderRelBoard(nodeObj.name);
         }
 
-        $container.find('.st-rel-edge').on('mouseenter click', function(e) {
+        $container.find('.st-rel-edge').on('mouseenter', function(e) {
             e.stopPropagation();
             var idx = $(this).data("idx");
             if (idx === undefined || !simEdges[idx]) return;
-            showEdgeDetail(simEdges[idx]);
+            highlightEdge(simEdges[idx]);
+        });
+        $container.find('.st-rel-edge').on('click', function(e) {
+            e.stopPropagation();
+            var idx = $(this).data("idx");
+            if (idx === undefined || !simEdges[idx]) return;
+            highlightEdge(simEdges[idx]);
+            flashCard(simEdges[idx].data);
         });
 
         // --- Node drag (reposition + persist) and tap-to-select ---
@@ -1721,20 +2208,6 @@ function renderRelationshipGraph() {
 
             nodeEl.addEventListener('pointercancel', function() {
                 dragPointerId = null; dragging = false;
-            });
-        });
-
-        // Edit badge — stops the node's drag handler from firing, opens the inline editor.
-        $container.find('.st-rel-edit-badge').each(function() {
-            var badgeEl = this;
-            badgeEl.addEventListener('pointerdown', function(e) { e.stopPropagation(); });
-            badgeEl.addEventListener('pointerup', function(e) { e.stopPropagation(); });
-            badgeEl.addEventListener('click', function(e) {
-                e.stopPropagation();
-                var name = $(badgeEl).closest('.st-rel-node').data('name');
-                if (!name) return;
-                Store.setRelEditingNode(name);
-                renderRelationshipGraph();
             });
         });
 
@@ -1829,13 +2302,13 @@ function renderRelationshipGraph() {
             persistView();
         });
 
-        // --- Inline edit panel ---
-        if (Store.relEditingNode && nodeMap[Store.relEditingNode]) {
-            $container.append(buildRelEditPanelHtml(Store.relEditingNode, typeKeys, typeColors));
-            wireRelEditPanel($container, Store.relEditingNode);
-            selectNode(simNodes.find(function(sn) { return sn.name === Store.relEditingNode; }) || simNodes[0]);
-            $container.find('.st-rel-node[data-name="'+esc(Store.relEditingNode)+'"]').addClass('st-rel-selected');
-        }
+        // Board fill — restore a persisted node selection (so a save-triggered
+        // full re-render keeps the filter + graph highlight) or show all bonds.
+        var persistedSel = (Store.relSelectedNode && nodeMap[Store.relSelectedNode])
+            ? simNodes.find(function(sn) { return sn.name === Store.relSelectedNode; })
+            : null;
+        if (persistedSel) selectNode(persistedSel);
+        else renderRelBoard(null);
 
     } catch (err) {
         console.error("[Story Tracker] Error rendering relationship graph:", err);
@@ -1866,195 +2339,6 @@ function buildRelStrengthSparkline(edge) {
         "</svg>";
 }
 
-// Builds the inline "editing <character>" panel: one editable row per existing
-// relationship, an add-relationship mini form, and a destructive remove-character
-// action — for correcting whatever the LLM extraction got wrong.
-function buildRelEditPanelHtml(name, typeKeys, typeColors) {
-    var edges = (Store.relationshipData.edges || []).filter(function(e) { return e && (e.from === name || e.to === name); });
-    var allNames = (Store.relationshipData.nodes || [])
-        .map(function(n) { return n.name; })
-        .filter(function(n) { return n && n !== name; });
-    var selfNode = (Store.relationshipData.nodes || []).find(function(n) { return n && n.name === name; });
-
-    function typeOptions(selected) {
-        return typeKeys.map(function(t) {
-            return '<option value="'+esc(t)+'"'+(t === selected ? ' selected' : '')+'>'+esc(t)+'</option>';
-        }).join('');
-    }
-
-    var html = '<div class="st-rel-edit-panel">';
-    html += '<div class="st-rel-edit-header"><strong>Editing: '+esc(name)+'</strong><button type="button" class="st-rel-edit-close" title="Close">✕</button></div>';
-
-    // Character bio — a short, stable "who they are" blurb. Agent-written the first
-    // time it has enough info (first-write-wins, never silently overwritten after),
-    // but always editable by hand here.
-    html += '<div class="st-rel-edit-bio-row">';
-    html += '  <div class="st-rel-edit-bio-label">Bio</div>';
-    html += '  <div class="st-resizable-wrap"><textarea class="st-rel-edit-bio" rows="2" placeholder="No bio yet — the tracker will add one once it has enough info, or type one here.">'+esc((selfNode && selfNode.bio) || '')+'</textarea><div class="st-resize-handle" title="Drag to resize"><i class="fa-solid fa-grip-lines"></i></div></div>';
-    html += '  <button type="button" class="menu_button st-pill-btn st-rel-edit-bio-save">Save Bio</button>';
-    html += '</div>';
-
-    if (edges.length === 0) {
-        html += '<div class="st-rel-edit-empty">No relationships yet for this character — add one below.</div>';
-    } else {
-        html += '<div class="st-rel-edit-list">';
-        edges.forEach(function(e) {
-            var other = e.from === name ? e.to : e.from;
-            var outgoing = e.from === name; // true: this is {name}'s view of {other}. false: {other}'s view of {name}.
-            var strength = (typeof e.strength === "number") ? e.strength : 0;
-            var hist = e.history || [];
-            // Direction matters now that both directions can exist as distinct edges (see
-            // RelationshipAgent.findEdgeIndex) — an arrow instead of "↔" avoids implying
-            // the relationship is automatically mutual when it may not be. A small "2-way"
-            // badge flags when the reverse ALSO exists, so two separate rows for the same
-            // pair read as intentional asymmetry, not a duplicate.
-            var arrowIcon = outgoing ? "fa-arrow-right" : "fa-arrow-left";
-            var arrowTitle = outgoing ? (esc(name) + "'s view of " + esc(other)) : (esc(other) + "'s view of " + esc(name));
-            var hasReverse = Store.RelationshipAgent && Store.RelationshipAgent.hasReciprocalEdge(Store.relationshipData.edges, e.from, e.to);
-            var reciprocalBadge = hasReverse ? '<span class="st-rel-edit-row-badge" title="A separate relationship exists in the other direction too — edit it from the other character\'s panel">2-way</span>' : '';
-            html += '<div class="st-rel-edit-row" data-from="'+esc(e.from)+'" data-to="'+esc(e.to)+'">';
-            html += '  <div class="st-rel-edit-row-name"><i class="fa-solid '+arrowIcon+'" title="'+arrowTitle+'"></i> '+esc(other)+reciprocalBadge+'</div>';
-            html += '  <select class="st-rel-edit-type">'+typeOptions(e.type)+'</select>';
-            html += '  <div class="st-rel-edit-strength-row"><input type="range" class="st-rel-edit-strength" min="-1" max="1" step="0.05" value="'+strength+'"><span class="st-rel-edit-strength-val">'+strength.toFixed(2)+'</span>'+buildRelStrengthSparkline(e)+'</div>';
-            html += '  <div class="st-resizable-wrap"><textarea class="st-rel-edit-summary" rows="2" placeholder="Summary">'+esc(e.summary||'')+'</textarea><div class="st-resize-handle" title="Drag to resize"><i class="fa-solid fa-grip-lines"></i></div></div>';
-            html += '  <div class="st-rel-edit-row-actions">';
-            html += '    <button type="button" class="st-rel-edit-history-toggle" '+(hist.length === 0 ? 'disabled' : '')+'><i class="fa-solid fa-clock-rotate-left"></i> History ('+hist.length+')</button>';
-            html += '    <button type="button" class="menu_button st-pill-btn st-rel-edit-save">Save</button>';
-            html += '    <button type="button" class="menu_button st-pill-btn st-rel-edit-delete" style="color:#ff453a !important;">Delete</button>';
-            html += '  </div>';
-            if (hist.length > 0) {
-                html += '  <div class="st-rel-edit-history-list" style="display:none;">';
-                hist.forEach(function(h) {
-                    var when = h.date ? ((h.time || "") + " " + h.date).trim() : ("Message #" + (h.msg || 0));
-                    var sign = (h.strength >= 0) ? "+" : "";
-                    html += '    <div class="st-rel-edit-history-item"><span class="st-rel-edit-history-when">'+esc(when)+'</span><span class="st-rel-edit-history-strength">'+sign+(h.strength || 0).toFixed(2)+'</span><div class="st-rel-edit-history-text">'+esc(h.summary || '')+'</div></div>';
-                });
-                html += '  </div>';
-            }
-            html += '</div>';
-        });
-        html += '</div>';
-    }
-
-    html += '<div class="st-rel-edit-add">';
-    html += '  <div class="st-rel-edit-add-title">Add relationship <span class="st-rel-edit-add-subtitle">— as '+esc(name)+' sees them</span></div>';
-    html += '  <input type="text" class="st-rel-edit-add-name" list="st-rel-names-list" placeholder="Character name">';
-    html += '  <datalist id="st-rel-names-list">' + allNames.map(function(n) { return '<option value="'+esc(n)+'">'; }).join('') + '</datalist>';
-    html += '  <select class="st-rel-edit-add-type">'+typeOptions('neutral')+'</select>';
-    html += '  <div class="st-rel-edit-strength-row"><input type="range" class="st-rel-edit-add-strength" min="-1" max="1" step="0.05" value="0"><span class="st-rel-edit-add-strength-val">0.00</span></div>';
-    html += '  <button type="button" class="menu_button st-pill-btn st-rel-edit-add-btn"><i class="fa-solid fa-plus"></i> Add</button>';
-    html += '</div>';
-
-    html += '<div class="st-rel-edit-danger">';
-    html += '  <button type="button" class="menu_button st-pill-btn st-rel-edit-remove-node" style="color:#ff453a !important;"><i class="fa-solid fa-trash-can"></i> Remove "'+esc(name)+'" entirely</button>';
-    html += '</div>';
-
-    html += '</div>';
-    return html;
-}
-// Wires up all interactive controls inside the inline edit panel built above.
-function wireRelEditPanel($container, name) {
-    var $editPanel = $container.find('.st-rel-edit-panel');
-
-    $editPanel.find('.st-rel-edit-close').on('click', function() {
-        Store.setRelEditingNode(null);
-        renderRelationshipGraph();
-    });
-
-    $editPanel.find('.st-rel-edit-history-toggle').on('click', function() {
-        $(this).closest('.st-rel-edit-row').find('.st-rel-edit-history-list').slideToggle(120);
-    });
-
-    $editPanel.find('.st-rel-edit-bio-save').on('click', function() {
-        var bio = String($editPanel.find('.st-rel-edit-bio').val() || "").trim();
-        var node = (Store.relationshipData.nodes || []).find(function(n) { return n && n.name === name; });
-        if (!node) {
-            node = { id: name, name: name };
-            Store.relationshipData.nodes.push(node);
-        }
-        node.bio = bio; // manual edit always allowed to override, unlike the agent's first-write-wins
-        Persistence.saveRelationshipData();
-        if (typeof toastr !== "undefined") toastr.success("Bio saved.");
-    });
-
-    $editPanel.find('.st-rel-edit-strength').on('input', function() {
-        $(this).siblings('.st-rel-edit-strength-val').text(parseFloat($(this).val()).toFixed(2));
-    });
-    $editPanel.find('.st-rel-edit-add-strength').on('input', function() {
-        $(this).siblings('.st-rel-edit-add-strength-val').text(parseFloat($(this).val()).toFixed(2));
-    });
-
-    $editPanel.find('.st-rel-edit-save').on('click', function() {
-        var $row = $(this).closest('.st-rel-edit-row');
-        // .attr(), not .data() — jQuery .data() type-coerces attribute values
-        // ("123" -> number), which then fails findEdgeIndex's strict === match
-        // against the stored string name.
-        var from = $row.attr('data-from'), to = $row.attr('data-to');
-        var patch = {
-            type: $row.find('.st-rel-edit-type').val(),
-            strength: parseFloat($row.find('.st-rel-edit-strength').val()),
-            summary: $row.find('.st-rel-edit-summary').val()
-        };
-        Store.relationshipData.edges = Store.RelationshipAgent.updateEdgeFields(Store.relationshipData.edges, from, to, patch);
-        Persistence.saveRelationshipData();
-        renderRelationshipGraph();
-        HUD.renderHUD();
-        if (typeof toastr !== "undefined") toastr.success("Relationship updated.");
-    });
-
-    $editPanel.find('.st-rel-edit-delete').on('click', function() {
-        var $row = $(this).closest('.st-rel-edit-row');
-        var from = $row.attr('data-from'), to = $row.attr('data-to'); // .attr, not .data — see save handler above
-        if (!confirm("Delete this relationship?")) return;
-        Store.relationshipData.edges = Store.RelationshipAgent.removeEdge(Store.relationshipData.edges, from, to);
-        Persistence.saveRelationshipData();
-        renderRelationshipGraph();
-        HUD.renderHUD();
-    });
-
-    $editPanel.find('.st-rel-edit-add-btn').on('click', function() {
-        var otherName = String($editPanel.find('.st-rel-edit-add-name').val() || "").trim();
-        if (!otherName) { if (typeof toastr !== "undefined") toastr.warning("Enter a character name first."); return; }
-        // Resolve against existing nodes first — same guard the automated tracker
-        // uses — so typing "aria" when "Aria Stormwind" already exists reuses that
-        // node/edge instead of creating a second, duplicate character.
-        otherName = Persistence.resolveCanonicalName(otherName);
-        if (otherName === name) { if (typeof toastr !== "undefined") toastr.warning("Can't add a relationship to yourself."); return; }
-
-        var type = $editPanel.find('.st-rel-edit-add-type').val();
-        var strength = parseFloat($editPanel.find('.st-rel-edit-add-strength').val());
-
-        var before = Store.relationshipData.edges.length;
-        Store.relationshipData.edges = Store.RelationshipAgent.addManualEdge(Store.relationshipData.edges, {
-            from: name, to: otherName, type: type, strength: strength
-        });
-        if (Store.relationshipData.edges.length === before) {
-            if (typeof toastr !== "undefined") toastr.warning("That relationship already exists — edit it above instead.");
-            return;
-        }
-        [name, otherName].forEach(function(nm) {
-            if (!Store.relationshipData.nodes.find(function(n) { return n.name === nm; })) {
-                Store.relationshipData.nodes.push({ id: nm, name: nm });
-            }
-        });
-        Persistence.saveRelationshipData();
-        renderRelationshipGraph();
-        HUD.renderHUD();
-        if (typeof toastr !== "undefined") toastr.success("Relationship added.");
-    });
-
-    $editPanel.find('.st-rel-edit-remove-node').on('click', function() {
-        if (!confirm('Remove "'+name+'" and all their relationships? This cannot be undone.')) return;
-        var result = Store.RelationshipAgent.removeNodeAndEdges(Store.relationshipData.nodes, Store.relationshipData.edges, name);
-        Store.relationshipData.nodes = result.nodes;
-        Store.relationshipData.edges = result.edges;
-        Store.setRelEditingNode(null);
-        Persistence.saveRelationshipData();
-        renderRelationshipGraph();
-        HUD.renderHUD();
-        if (typeof toastr !== "undefined") toastr.success("Character removed.");
-    });
-}
 function buildChatButton() {
     if (!document.getElementById("st-trigger")) {
         var btn = '<div id="st-trigger" class="st-trigger interactable" title="Story Tracker"><i class="fa-solid fa-book-open-reader"></i></div>';

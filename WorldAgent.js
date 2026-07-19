@@ -621,6 +621,96 @@ export function formatLocationMemoryForPrompt(entry) {
 }
 
 // =============================================================================
+// WORLD RULES DIGEST (lore digest) — a compact, user-verifiable distillation
+// of the character card(s) into the stable "rules of the world": setting/era,
+// named factions and agendas, key figures and roles, standing constraints.
+//
+// WHY: the npc/faction/world tiers used to receive the FULL card text
+// (description/personality/scenario) on every single tick — hundreds to
+// thousands of tokens of material written to instruct the MAIN model (speech
+// patterns, appearance, formatting), re-billed dozens of times per session,
+// competing for attention with the dynamic context that should actually drive
+// a tier's output. The digest is generated ONCE, at genesis, as a section of
+// the combined initial-setup Scene call (see SceneAgent's genesis seeds) — no
+// recurring cost — and from then on the tiers receive IT instead of the raw
+// cards (see Pipeline.buildWorldTierContext). Stored as a plain array of
+// strings in worldData.loreDigest so the World tab can render it as an
+// editable list: the user is the final authority on what's true of their
+// world — rules can be deleted, added by hand, or manually regenerated (the
+// wand — the one path that ever sends raw card text again, and only on
+// demand).
+// =============================================================================
+
+// Shared between the genesis ask (SceneAgent imports this) and the manual
+// regenerate prompt below, so "what makes a good rule" is defined exactly once.
+export var LORE_DIGEST_GUIDE =
+    "WORLD RULES REQUIREMENTS:\n" +
+    "- 6 to 12 entries, each ONE plain factual sentence under ~25 words.\n" +
+    "- Only facts true of the WORLD itself: setting/era/technology level, named factions and their agendas, named places, key figures and their roles/affiliations, standing laws or constraints (\"magic is outlawed\", \"the war is in its third year\").\n" +
+    "- Do NOT include: writing-style/formatting instructions from the card, physical appearance details, speech patterns, or anything scene-specific/temporary.\n" +
+    "- Every entry must be directly supported by the lore/opening text — never invent facts to fill space; fewer accurate entries beat padded ones.\n";
+
+/**
+ * sanitizeLoreDigest(list, maxEntries)
+ * Validates a model-proposed digest: string-only entries, trimmed, length-
+ * capped (200 chars via capEventText's head-trim), case-insensitive exact
+ * dedupe, hard entry cap (default 12). Returns null if nothing valid survives
+ * — same "absent means nothing happened" posture as the rest of this module,
+ * so a garbage digest never overwrites anything.
+ */
+export function sanitizeLoreDigest(list, maxEntries) {
+    maxEntries = maxEntries || 12;
+    if (!Array.isArray(list)) return null;
+    var seen = {};
+    var out = [];
+    list.forEach(function (r) {
+        if (typeof r !== "string") return;
+        var rule = r.trim();
+        if (!rule) return;
+        rule = capEventText(rule, 200);
+        var key = rule.toLowerCase();
+        if (seen[key]) return;
+        seen[key] = true;
+        out.push(rule);
+    });
+    if (out.length === 0) return null;
+    return out.slice(0, maxEntries);
+}
+
+/** "- rule" lines for prompt injection. Returns null (omit the block) when empty. */
+export function formatLoreDigestForPrompt(digest) {
+    if (!Array.isArray(digest) || digest.length === 0) return null;
+    return digest.map(function (r) { return "- " + r; }).join("\n");
+}
+
+/**
+ * buildLoreDigestPrompt(input)
+ *
+ * Standalone digest-(re)generation prompt — used ONLY by the World tab's
+ * manual "regenerate World Rules" wand (see Pipeline.runLoreDigestRefresh),
+ * never on any automatic cadence. This is deliberately the single place after
+ * genesis that raw card text is ever sent again, and only because the user
+ * explicitly asked for a fresh distillation.
+ */
+export function buildLoreDigestPrompt(input) {
+    input = input || {};
+    return (
+        "[OOC: You are distilling roleplay setup material into a compact reference sheet. Produce this world's WORLD RULES: the stable ground facts a background world-simulation needs in order to stay consistent with the setting.\n\n" +
+        LORE_DIGEST_GUIDE + "\n" +
+        "ESTABLISHED CHARACTER CARD LORE (the source material to distill):\n" +
+        (input.characterLoreText || "None provided.") + "\n\n" +
+        (input.currentDigestText
+            ? "CURRENT WORLD RULES (being replaced — keep whatever here is still accurate, fix or drop what isn't):\n" + input.currentDigestText + "\n\n"
+            : "") +
+        "RECENT CHAT (context only — a world fact clearly established here may be included too):\n" +
+        (input.recentChatText || "No messages yet.") + "\n\n" +
+        "Respond ONLY with valid JSON:\n" +
+        "{\"lore_digest\":[\"The story is set in a frontier port city during a fragile ceasefire.\",\"The Ashen Compact controls the northern trade routes.\"]}\n" +
+        "]"
+    );
+}
+
+// =============================================================================
 // CROSS-TIER GROUNDING — established, already-generated facts from OTHER
 // tiers, threaded into a tier that doesn't otherwise see them. This is safe
 // specifically because the content is never freshly synthesized for the
@@ -790,6 +880,9 @@ export function buildNpcTickPrompt(input) {
         (input.mentionedNpcsText || "None.") + "\n\n" +
         "ESTABLISHED CHARACTER CARD LORE (ground truth — an NPC's offscreen behavior must stay consistent with this, not contradict it):\n" +
         (input.characterLoreText || "None provided.") + "\n\n" +
+        (input.relationshipsText
+            ? ("ESTABLISHED RELATIONSHIPS (tracked separately by the relationship system — established facts about how these characters feel about each other, NOT up for you to re-derive, contradict, or develop further. Let them shape WHAT an NPC chooses to do offscreen — a rival doesn't run friendly errands for their rival, a devoted ally doesn't quietly undermine — but do NOT restate these lines, narrate the feelings themselves, or invent new relationship beats; behavior consistent with the feeling, never commentary on it. A → arrow marks a ONE-SIDED feeling: the other party doesn't necessarily know or share it, so THEIR offscreen behavior must not act on it):\n" + input.relationshipsText + "\n\n")
+            : "") +
         "EXISTING NPC STATES (evolve these naturally, as continuations of their last known activity):\n" +
         (input.npcStatesText || "No tracked NPCs yet.") + "\n\n" +
         "PENDING SCHEDULED EVENTS (already queued and due at the listed time — the system resolves these automatically once RP-time reaches them; don't narrate one of these as already resolved before its due time, and don't invent a duplicate of one already listed here):\n" +
@@ -981,6 +1074,9 @@ export function buildFactionTickPrompt(input) {
             : "") +
         "ESTABLISHED CHARACTER CARD LORE (ground truth — offscreen developments must stay consistent with this, not contradict it):\n" +
         (input.characterLoreText || "None provided.") + "\n\n" +
+        (input.relationshipsText
+            ? ("ESTABLISHED RELATIONSHIPS (tracked separately by the relationship system — established facts about how these characters feel about each other, NOT up for you to re-derive, contradict, or develop further. Offscreen faction/plot developments involving these people must stay consistent with these dynamics — allies act like allies, rivals like rivals — and an event may plausibly grow OUT of a strong bond or grudge, but do NOT restate these lines or narrate the feelings themselves; the relationship system tracks that evolution on its own. A → arrow marks a ONE-SIDED feeling: the other party doesn't necessarily know or share it, and no development may have them act as if they do):\n" + input.relationshipsText + "\n\n")
+            : "") +
         "PAST HISTORY TIMELINE:\n" + (input.historyTimelineText || "No history yet.") + "\n\n" +
         "RECENT CHAT (additional grounding and tone — not the only valid source for an event; see rule 2 below):\n" +
         (input.recentChatText || "No messages yet.") + "\n\n" +

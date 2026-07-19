@@ -699,13 +699,32 @@ export function bindEvents() {
             try {
                 await doLLMUpdate({ currentTime: Store.storyData.time, currentDate: Store.storyData.date, currentEpoch: Store.storyData._timeEpoch });
             } catch (e) { console.error(e); }
+            // The genesis call just seeded the regional weather trend (world_seed), and
+            // opening prose is full of phrases the weather-mention scanner matches
+            // ("the first snow", "fog rolls in") — without this, the scan further down
+            // would immediately spend a second LLM call re-deriving the trend genesis
+            // established seconds ago. Reuses the standard mention-cooldown; the
+            // interval-based weather cadence is unaffected.
+            if (Store.storyData && Store.storyData._initialized) {
+                Store.storyData._weatherChangeCooldown = WEATHER_CHANGE_COOLDOWN_MESSAGES;
+                saveStoryData();
+            }
             Store.setBusy(false);
             HUD.clearHudStatus();
             if (typeof toastr !== "undefined") toastr.clear();
         }
 
+        // ">= interval", NOT "% interval === 0": the counter only resets when an
+        // analysis actually completes (see consumeRelationshipCadence in
+        // doRelationshipUpdate). With the old modulo check, a due tick that got
+        // skipped (relsBusy) or failed (unparseable response) let the counter roll
+        // PAST the exact multiple, and the next chance was a full interval later
+        // (miss at 5 -> next fire at 10). The world tiers already got rollback
+        // machinery for exactly this failure mode; this is the relationship
+        // tracker's equivalent — a missed/failed tick stays due and retries on the
+        // very next message instead of silently waiting out a fresh interval.
         var needsRelUpdate = Store.settings.relationsEnabled && Store.settings.relationsAutoUpdate &&
-                              Store.relMsgCounter > 0 && Store.relMsgCounter % (Store.settings.relAutoInterval || 5) === 0;
+                              Store.relMsgCounter >= (Store.settings.relAutoInterval || 5);
 
         // Scene's own due-ness (interval / message-mode cadence / smart-time skip-language
         // early trigger) was already decided and, if due, already run ABOVE — before
@@ -915,7 +934,27 @@ export async function doLLMUpdate(timeAnchor) {
     // Genesis-only: deterministic seeding found no time cue in the opening text, so
     // storyData.time is just the 12:00 placeholder — ask this initial-setup call to
     // establish the real starting clock instead (see SceneAgent.extractStartingTime).
-    var askStartingTime = !Store.storyData._initialized && Store.storyData._timeSeededFrom === "fallback";
+    // `!== "text"` rather than `=== "fallback"`: an uninitialized chat whose
+    // storyData predates these fields (created before an extension update, replied
+    // to after) has them UNDEFINED — that's still "the scan established nothing",
+    // so the model should be asked, not silently left on the placeholder/random
+    // values. Asking is genesis-only either way, so it can never over-trigger.
+    var askStartingTime = !Store.storyData._initialized && Store.storyData._timeSeededFrom !== "text";
+    // Same for the calendar date: the deterministic seedInitialDate() scan found no
+    // cue, so storyData.date is still the random fallback — ask this initial-setup
+    // call to establish a date that actually fits the story instead (see
+    // SceneAgent.extractStartingDate).
+    var askStartingDate = !Store.storyData._initialized && Store.storyData._dateSeededFrom !== "text";
+
+    // Genesis Prime: the initial-setup call is the ONE moment where scene, world,
+    // relationships, and the World Rules digest all share an identical evidence
+    // base (opening text + card lore), so they're all established by this single
+    // call instead of separate ones — one context payload, several small output
+    // sections, each validated independently (see applyGenesisSeeds below). This
+    // is also deliberately the only AUTOMATIC call that ever carries the raw card
+    // text: afterwards the world tiers run on the distilled digest instead.
+    var isGenesisSetup = !Store.storyData._initialized;
+    var genesisLoreText = isGenesisSetup ? getCharacterLoreText() : null;
 
     var prompt = Store.SceneAgent.buildScenePrompt({
         currentTime: anchorState.currentTime,
@@ -924,6 +963,12 @@ export async function doLLMUpdate(timeAnchor) {
         recentChatText: chatContext,
         userName: userName,
         askStartingTime: askStartingTime,
+        askStartingDate: askStartingDate,
+        askWorldSeed: isGenesisSetup && !!Store.settings.worldEnabled,
+        askRelationshipSeed: isGenesisSetup && !!Store.settings.relationsEnabled,
+        askLoreDigest: isGenesisSetup && !!Store.settings.worldEnabled && !!genesisLoreText,
+        characterLoreText: genesisLoreText,
+        relationshipTypesText: (Store.RelationshipAgent && Store.RelationshipAgent.VALID_TYPES) ? Store.RelationshipAgent.VALID_TYPES.join(", ") : null,
         pendingEventsText: scenePending.pendingEventsText,
         pendingRevealsText: pendingRevealsText,
         // Grounds Scene Agent's per-message weather guess in the World Agent's broader
@@ -972,28 +1017,48 @@ export async function doLLMUpdate(timeAnchor) {
     var patch = Store.SceneAgent.applySceneResponse(data);
     if (patch) Object.assign(Store.storyData, patch);
 
-    // --- Genesis starting time: only consulted when this call was explicitly asked
-    // for one (un-initialized chat whose deterministic seeding fell back to 12:00).
-    // Applied BEFORE the time_advance handling below, and anchorState is rebuilt
-    // from it — otherwise an "elapsed" answer would be measured from the stale
-    // 12:00 placeholder and overwrite the starting time it just established.
+    // --- Genesis starting time/date: only consulted when this call was explicitly
+    // asked for them (un-initialized chat whose deterministic seeding fell back to
+    // the 12:00 placeholder and/or the random date). Applied BEFORE the
+    // time_advance handling below, with anchorState and the forward-only floor
+    // rebuilt from the result — otherwise an "elapsed" answer would be measured
+    // from the stale placeholder and overwrite the starting clock it just
+    // established (or an earlier pick would be clamped straight back up to it).
+    var genesisClockChanged = false;
     if (askStartingTime && typeof Store.SceneAgent.extractStartingTime === "function") {
         var startingTime = Store.SceneAgent.extractStartingTime(data);
         if (startingTime) {
             Store.storyData.time = startingTime;
-            var startingDateObj = Store.TimelineEngine.parseDateTime(startingTime, Store.storyData.date);
-            if (startingDateObj) Store.storyData._timeEpoch = startingDateObj.getTime();
-            anchorState = { currentTime: startingTime, currentDate: Store.storyData.date, currentEpoch: Store.storyData._timeEpoch };
-            // The forward-only floor was captured from the 12:00 placeholder — lower it
-            // to the just-established starting time, or an earlier pick (e.g. 08:30)
-            // would be clamped straight back up to the placeholder it replaced.
-            clockFloorEpoch = Store.storyData._timeEpoch;
             Store.storyData._timeSeededFrom = "llm";
+            genesisClockChanged = true;
             console.log("[Story Tracker] Genesis starting time established by Scene Agent: " + startingTime);
         } else {
             console.log("[Story Tracker] Scene Agent returned no usable starting_time — keeping the neutral 12:00 fallback.");
         }
     }
+    if (askStartingDate && typeof Store.SceneAgent.extractStartingDate === "function") {
+        var startingDate = Store.SceneAgent.extractStartingDate(data);
+        if (startingDate) {
+            Store.storyData.date = startingDate;
+            Store.storyData._dateSeededFrom = "llm";
+            genesisClockChanged = true;
+            console.log("[Story Tracker] Genesis starting date established by Scene Agent: " + startingDate);
+        } else {
+            console.log("[Story Tracker] Scene Agent returned no usable starting_date — keeping the random fallback date.");
+        }
+    }
+    if (genesisClockChanged) {
+        var genesisDateObj = Store.TimelineEngine.parseDateTime(Store.storyData.time, Store.storyData.date);
+        if (genesisDateObj) Store.storyData._timeEpoch = genesisDateObj.getTime();
+        anchorState = { currentTime: Store.storyData.time, currentDate: Store.storyData.date, currentEpoch: Store.storyData._timeEpoch };
+        clockFloorEpoch = Store.storyData._timeEpoch;
+    }
+
+    // --- Genesis seeds: world state, relationships, and the World Rules digest
+    // this same call established (see the isGenesisSetup comment above). Applied
+    // after the starting clock so seeded world state gets stamped with the real
+    // genesis time, and before anything else persists.
+    if (isGenesisSetup) applyGenesisSeeds(data);
 
     // --- Location Codex: the scene just moved somewhere else — persist what the
     // OLD place looked like at departure, keyed by normalized location name, so a
@@ -1160,6 +1225,147 @@ export async function doLLMUpdate(timeAnchor) {
     return correctedTl;
 }
 
+/**
+ * applyGenesisSeeds(data)
+ *
+ * Applies the world/relationship/digest sections of the Genesis Prime response
+ * (see doLLMUpdate's isGenesisSetup). Each section is validated INDEPENDENTLY
+ * inside its own try/catch: a malformed or missing section just leaves that
+ * subsystem uninitialized — it then initializes lazily on its normal path
+ * (first due world tick, first relationship interval), exactly the pre-genesis
+ * behavior — and can never poison the scene update or the other seeds.
+ *
+ * Genesis INITIALIZES, it never ticks: no Scheduler accumulator, checkpoint,
+ * or cadence counter is touched here, so every tier's first EVOLUTION still
+ * happens a full interval away on its normal schedule.
+ */
+function applyGenesisSeeds(data) {
+    if (!data) return;
+
+    // --- World seed (summary / weather trend / initial NPC states / reveals) ---
+    try {
+        if (Store.settings.worldEnabled && Store.worldData && data.world_seed && typeof data.world_seed === "object" && !Array.isArray(data.world_seed)) {
+            var seed = data.world_seed;
+            var applied = false;
+            if (typeof seed.summary === "string" && seed.summary.trim()) {
+                Store.worldData.worldSummary = Store.WorldAgent.capWorldSnapshot(seed.summary.trim(), 500);
+                applied = true;
+            }
+            if (typeof seed.weather_trend === "string" && seed.weather_trend.trim()) {
+                var seedTrend = seed.weather_trend.trim();
+                Store.worldData.weatherTrend = seedTrend.length > 400 ? seedTrend.slice(0, 400) : seedTrend;
+                applied = true;
+            }
+            if (Array.isArray(seed.npc_states)) {
+                // Same string-only validation posture as applyNpcTickResponse; goals are
+                // allowed here (card-stated ones are high quality, and first-write-wins
+                // in upsertNpcState protects them from later agent overwrites). No
+                // routines/durations at genesis — too structured for a seed.
+                var seedUpdates = seed.npc_states
+                    .filter(function (u) { return u && typeof u.name === "string" && u.name.trim() && typeof u.change === "string" && u.change.trim(); })
+                    .slice(0, 6)
+                    .map(function (u) {
+                        return {
+                            name: u.name.trim(),
+                            change: Store.WorldAgent.capEventText(u.change.trim(), 160),
+                            goal: (typeof u.goal === "string" && u.goal.trim()) ? Store.WorldAgent.capNpcGoal(u.goal.trim()) : null,
+                        };
+                    });
+                if (seedUpdates.length > 0) {
+                    Store.worldData.npcStates = Store.WorldAgent.upsertManyNpcStates(Store.worldData.npcStates, seedUpdates);
+                    applied = true;
+                }
+            }
+            if (Array.isArray(seed.pending_reveals)) {
+                var seedReveals = seed.pending_reveals
+                    .filter(function (r) { return typeof r === "string" && r.trim(); })
+                    .slice(0, 3);
+                if (seedReveals.length > 0) {
+                    Store.worldData.pendingReveals = Store.WorldAgent.capPendingReveals(Store.worldData.pendingReveals, seedReveals, 15);
+                    applied = true;
+                }
+            }
+            if (applied) {
+                Store.worldData._initialized = true;
+                Store.worldData.lastTickTime = Store.storyData.time;
+                Store.worldData.lastTickDate = Store.storyData.date;
+                console.log("[Story Tracker] Genesis world seed applied (summary/trend/NPCs/reveals as provided).");
+            }
+        }
+    } catch (e) {
+        console.warn("[Story Tracker] Genesis world seed failed — the World Agent will initialize on its first normal tick instead:", e);
+    }
+
+    // --- World Rules digest ---
+    try {
+        if (Store.settings.worldEnabled && Store.worldData && Array.isArray(data.lore_digest)) {
+            var digest = Store.WorldAgent.sanitizeLoreDigest(data.lore_digest, 12);
+            if (digest) {
+                Store.worldData.loreDigest = digest;
+                console.log("[Story Tracker] Genesis World Rules digest stored (" + digest.length + " rules) — world tiers will use it instead of raw card text.");
+            }
+        }
+    } catch (e) {
+        console.warn("[Story Tracker] Genesis lore digest failed — world tiers keep using raw card text:", e);
+    }
+    if (Store.worldData) saveWorldData();
+
+    // --- Relationship seed (card-established canon only) ---
+    try {
+        if (Store.settings.relationsEnabled && Store.RelationshipAgent && data.relationship_seed && typeof data.relationship_seed === "object" && !Array.isArray(data.relationship_seed)) {
+            loadRelationshipData();
+            if (Store.relationshipData) {
+                // Reuses the standard validator (type/strength clamping, summary caps);
+                // the merge itself is deliberately simpler than doRelationshipUpdate's —
+                // at genesis the graph is empty, so there's no evolution/history/
+                // asymmetry-reconciliation to do, just canonical-name-resolved inserts.
+                var validated = Store.RelationshipAgent.applyRelationshipResponse(data.relationship_seed);
+                var addedEdges = 0;
+                validated.relationships.forEach(function (rel) {
+                    if (!rel || !rel.from || !rel.to) return;
+                    var from = resolveCanonicalName(String(rel.from).trim());
+                    var to = resolveCanonicalName(String(rel.to).trim());
+                    if (!from || !to || from === to) return;
+                    if (Store.RelationshipAgent.findEdgeIndex(Store.relationshipData.edges, from, to) !== -1) return;
+                    [from, to].forEach(function (nm) {
+                        if (!Store.relationshipData.nodes.find(function (n) { return n.name === nm; })) {
+                            Store.relationshipData.nodes.push({ id: nm, name: nm });
+                        }
+                    });
+                    Store.relationshipData.edges.push({
+                        from: from,
+                        to: to,
+                        type: rel.type,
+                        strength: rel.strength,
+                        summary: rel.summary || "",
+                        change: "Established at story start",
+                        history: [],
+                    });
+                    addedEdges++;
+                });
+                var seedBios = validated.characterBios || [];
+                seedBios.forEach(function (b) {
+                    var canonical = resolveCanonicalName(String(b.name).trim());
+                    if (!canonical) return;
+                    var node = Store.relationshipData.nodes.find(function (n) { return n.name === canonical; });
+                    if (!node) {
+                        node = { id: canonical, name: canonical };
+                        Store.relationshipData.nodes.push(node);
+                    }
+                    if (!node.bio) node.bio = b.bio; // first-write-wins, same as the tracker
+                });
+                if (addedEdges > 0 || seedBios.length > 0) {
+                    Store.relationshipData._initialized = true;
+                    saveRelationshipData();
+                    console.log("[Story Tracker] Genesis relationship seed applied: " + addedEdges + " edge(s), " + seedBios.length + " bio(s).");
+                }
+            }
+        }
+    } catch (e) {
+        console.warn("[Story Tracker] Genesis relationship seed failed — the Relationship Tracker will initialize on its first normal analysis instead:", e);
+    }
+}
+
 export async function doManualUpdate() {
     if (!Store.settings.enabled) {
         if (typeof toastr !== "undefined") toastr.warning("Story Tracker is disabled. Enable it in the extension settings.");
@@ -1187,7 +1393,6 @@ export async function doManualUpdate() {
         // Smart Time mode, and _timeModeMsgCounter covers (the default) Message Mode —
         // previously only the former was reset, so in Message Mode an auto update could
         // still fire on the very next message after a manual one.
-        Store.setMsgCounter(0);
         if (Store.storyData) Store.storyData._timeModeMsgCounter = 0;
         if (Store.worldData && Store.worldData._schedulerAccumulated) {
             Store.worldData._schedulerAccumulated.scene = 0;
@@ -1258,13 +1463,37 @@ function getCharacterLoreText() {
         }
 
         if (cards.length === 0) return "";
+        // Card text is written for the MAIN model, where ST substitutes {{user}}/
+        // {{char}} at prompt time — the tracker prompts bypass that substitution,
+        // so without this every consumer of card lore (npc/faction/world tiers,
+        // the genesis seeds, the World Rules digest) read a literal "{{user}}"
+        // and couldn't connect the player to anything the lore says about them.
+        // Done per-card so {{char}} resolves to THAT card's name in group chats
+        // (a global substituteParams would use the active character for all).
+        var playerName = (Store.scriptModule && Store.scriptModule.name1) ? String(Store.scriptModule.name1) : null;
+        function substituteCardMacros(text, charName) {
+            // Replacement CALLBACKS, not replacement strings — a name containing
+            // `$&`/`$'` would otherwise be expanded by String.replace's special
+            // patterns instead of inserted literally.
+            var out = String(text);
+            if (playerName) {
+                out = out.replace(/\{\{user\}\}/gi, function () { return playerName; })
+                         .replace(/<USER>/gi, function () { return playerName; });
+            }
+            if (charName) {
+                out = out.replace(/\{\{char\}\}/gi, function () { return charName; })
+                         .replace(/<BOT>/gi, function () { return charName; });
+            }
+            return out;
+        }
         return cards.map(function(c) {
+            var cardName = c.name || "Character";
             var lines = [];
-            if (c.description) lines.push("Description: " + String(c.description).trim());
-            if (c.personality) lines.push("Personality: " + String(c.personality).trim());
-            if (c.scenario) lines.push("Scenario: " + String(c.scenario).trim());
+            if (c.description) lines.push("Description: " + substituteCardMacros(String(c.description).trim(), cardName));
+            if (c.personality) lines.push("Personality: " + substituteCardMacros(String(c.personality).trim(), cardName));
+            if (c.scenario) lines.push("Scenario: " + substituteCardMacros(String(c.scenario).trim(), cardName));
             if (lines.length === 0) return null;
-            return "=== " + (c.name || "Character") + " ===\n" + lines.join("\n");
+            return "=== " + cardName + " ===\n" + lines.join("\n");
         }).filter(Boolean).join("\n\n");
     } catch (e) {
         console.warn("[Story Tracker] getCharacterLoreText failed:", e);
@@ -1373,9 +1602,26 @@ function buildWorldTierContext() {
     // the player's day is whatever the player does, and offering their name here invited
     // the model to schedule the protagonist's life for them.
     var playerNameLower = (Store.scriptModule && Store.scriptModule.name1) ? String(Store.scriptModule.name1).toLowerCase() : null;
-    var goalRoutineCandidates = Array.from(onscreenNames).concat(recentNPCs).filter(function(n) {
-        return n && (!playerNameLower || String(n).toLowerCase() !== playerNameLower);
-    });
+    // TRACKED npcStates names lead the candidate list — they're the NPCs the tier
+    // actually writes updates for every tick (genesis-seeded offscreen NPCs
+    // included). Previously candidates were only onscreen + recent chat speakers,
+    // which locked seeded offscreen NPCs out of goal/routine slots entirely: in a
+    // solo scenario-card chat the "speaker" is the card itself, and onscreen
+    // characters are discouraged from offscreen updates — so effectively NOBODY
+    // eligible remained and the tier could never propose a routine. Order
+    // matters: the formatters cap the offered list at 8, so best targets first.
+    var seenCandidate = {};
+    var goalRoutineCandidates = (Store.worldData.npcStates || [])
+        .map(function(n) { return n && n.name; })
+        .concat(Array.from(onscreenNames))
+        .concat(recentNPCs)
+        .filter(function(n) {
+            if (!n || (playerNameLower && String(n).toLowerCase() === playerNameLower)) return false;
+            var key = String(n).toLowerCase();
+            if (seenCandidate[key]) return false;
+            seenCandidate[key] = true;
+            return true;
+        });
     var npcsNeedingGoalText = (Store.WorldAgent && Store.worldData)
         ? Store.WorldAgent.formatNpcsNeedingGoalForPrompt(Store.worldData.npcStates, goalRoutineCandidates, 8)
         : null;
@@ -1390,6 +1636,24 @@ function buildWorldTierContext() {
         ? Store.TimelineEngine.formatSeasonForPrompt(Store.storyData.date, Store.settings.seasonHemisphere)
         : null;
 
+    // Cross-tier grounding from the RELATIONSHIP system: how the people currently
+    // in play feel about each other, as already-established facts (see
+    // RelationshipAgent.formatRelationshipsForWorldPrompt). Fed to the npc and
+    // faction tiers so offscreen behavior stays emotionally consistent with the
+    // tracked story — a rival doesn't run friendly errands. Gated on the
+    // relationship tracker being enabled AND initialized, so a disabled/stale
+    // graph never grounds anything; null just means the tiers omit the block,
+    // same as every other optional context input here.
+    var relationshipsText = null;
+    if (Store.settings.relationsEnabled && Store.relationshipData && Store.relationshipData._initialized &&
+        Store.RelationshipAgent && typeof Store.RelationshipAgent.formatRelationshipsForWorldPrompt === "function") {
+        var relRelevantNames = Array.from(onscreenNames)
+            .concat(recentNPCs)
+            .concat((Store.worldData.npcStates || []).map(function(n) { return n && n.name; }).filter(Boolean));
+        relationshipsText = Store.RelationshipAgent.formatRelationshipsForWorldPrompt(
+            Store.relationshipData.edges, relRelevantNames, 8);
+    }
+
     return {
         originalChat: originalChat,
         chatHistoryText: chatHistoryText,
@@ -1401,8 +1665,15 @@ function buildWorldTierContext() {
         npcStatesText: npcStatesText,
         npcsNeedingGoalText: npcsNeedingGoalText,
         npcsNeedingRoutineText: npcsNeedingRoutineText,
+        relationshipsText: relationshipsText,
         season: season,
-        characterLoreText: getCharacterLoreText(),
+        // Once a genesis World Rules digest exists, it REPLACES the raw card text
+        // in every tier prompt — same ground truth, a fraction of the tokens, and
+        // user-verifiable/editable from the World tab. Raw cards are only sent
+        // when no digest exists (pre-digest chats, world agent enabled after
+        // genesis, digest section failed) — i.e. the previous behavior, unchanged.
+        characterLoreText: (Store.WorldAgent && Store.worldData && Store.WorldAgent.formatLoreDigestForPrompt(Store.worldData.loreDigest))
+            || getCharacterLoreText(),
         currentLoc: (Store.storyData && Store.storyData.location) ? Store.storyData.location : "Unknown",
         recentEv: (Store.storyData && Store.storyData.recent_events) ? Store.storyData.recent_events : "None.",
     };
@@ -1476,6 +1747,7 @@ async function runNpcTier(isBatch, elapsedMinutes, sharedCtx) {
         recentWorldEventsText: recentWorldEventsText,
         npcsNeedingGoalText: ctx.npcsNeedingGoalText,
         npcsNeedingRoutineText: ctx.npcsNeedingRoutineText,
+        relationshipsText: ctx.relationshipsText,
         elapsedMinutesSinceLastTick: elapsedMinutes,
     });
     var data = cleanAndParseJSON(await callWorldAgentPrompt(prompt));
@@ -1601,6 +1873,7 @@ async function runFactionTier(isBatch, intervalList, elapsedMinutes, sharedCtx) 
         pendingEventsText: buildPendingEventsPromptText().pendingEventsText,
         recentNpcActivityText: (recentNpcActivityText === "No tracked NPCs yet.") ? null : recentNpcActivityText,
         characterLoreText: ctx.characterLoreText,
+        relationshipsText: ctx.relationshipsText,
         historyTimelineText: ctx.historyTimelineText, recentChatText: ctx.chatHistoryText,
         elapsedMinutesSinceLastTick: isBatch ? null : elapsedMinutes,
     });
@@ -1681,7 +1954,33 @@ async function runWorldTier(isBatch, elapsedMinutes, sharedCtx) {
     saveWorldData();
 }
 
-var WORLD_TIER_RUNNERS = { npc: runNpcTier, weather: runWeatherTier, faction: runFactionTier, world: runWorldTier };
+// --- World Rules (lore digest) manual refresh — NOT a Scheduler tier: it never
+// fires on any automatic cadence, and "rules" never appears in Scheduler config,
+// so the only route here is the World tab's wand via regenerateWorldSection().
+// This is deliberately the single post-genesis path that ever sends raw card
+// text again — and only because the user explicitly asked for a fresh
+// distillation (e.g. after reworking a card, since there's no automatic
+// card-change detection by design).
+async function runLoreDigestRefresh(isBatch, elapsedMinutes, sharedCtx) {
+    var tierChatId = Store.getCurrentChatId();
+    var loreText = getCharacterLoreText();
+    if (!loreText) throw new Error("no character card lore available to distill");
+    var ctx = sharedCtx || buildWorldTierContext();
+    var prompt = Store.WorldAgent.buildLoreDigestPrompt({
+        characterLoreText: loreText,
+        currentDigestText: Store.WorldAgent.formatLoreDigestForPrompt(Store.worldData.loreDigest),
+        recentChatText: ctx.chatHistoryText,
+    });
+    var data = cleanAndParseJSON(await callWorldAgentPrompt(prompt));
+    if (Store.getCurrentChatId() !== tierChatId) throw new Error("chat changed during the World Rules refresh — discarded its stale result");
+    if (!data) throw new Error("failed to parse the World Rules refresh response");
+    var digest = Store.WorldAgent.sanitizeLoreDigest(data.lore_digest, 12);
+    if (!digest) throw new Error("no usable lore_digest in the response");
+    Store.worldData.loreDigest = digest;
+    saveWorldData();
+}
+
+var WORLD_TIER_RUNNERS = { npc: runNpcTier, weather: runWeatherTier, faction: runFactionTier, world: runWorldTier, rules: runLoreDigestRefresh };
 
 // --- Manual "regenerate this section" (wand icon): re-runs ONE tier immediately,
 // independent of its scheduled interval, instead of "Run Tick"'s all-four-at-once.
@@ -1706,6 +2005,10 @@ export async function regenerateWorldSection(tier, $btn) {
     }
     var runner = WORLD_TIER_RUNNERS[tier];
     if (!runner) return;
+    // Unlike the real tiers (which MERGE into existing state), a World Rules
+    // refresh REPLACES the whole list — including any hand-verified edits, which
+    // are exactly the corrections the editable list exists for. Never silently.
+    if (tier === "rules" && !confirm("Regenerate World Rules from the character card? This REPLACES the current list, including any manual edits.")) return;
 
     loadWorldData();
     Store.setWorldBusy(true);
@@ -2124,6 +2427,27 @@ export async function doRelationshipUpdate() {
         return;
     }
 
+    // Marks this analysis pass as CONSUMED: advances the checkpoint to the last
+    // message and resets the message-count cadence. Called for every successfully
+    // PARSED response — including a legitimate "nothing new this round" — but
+    // deliberately NOT for a parse failure, so handleMsg's ">= interval" cadence
+    // check keeps a genuinely failed call due and retries it on the next message
+    // instead of waiting out a whole fresh interval (same philosophy as the world
+    // tiers' accumulator rollback).
+    function consumeRelationshipCadence() {
+        if (liveChat.length > 0) {
+            var lastProcessed = liveChat[liveChat.length - 1];
+            // The anchor (first 40 chars of the last message) lets the next run detect
+            // index drift from message deletions/swipes and fall back to last-20.
+            Store.relationshipData._checkpointMsgIdx = liveChat.length - 1;
+            Store.relationshipData._checkpointAnchor = (lastProcessed && lastProcessed.mes)
+                ? String(lastProcessed.mes).slice(0, 40)
+                : "";
+        }
+        Store.setRelMsgCounter(0); // reset the per-interval counter
+        if (Store.storyData) Store.storyData._relMsgCount = 0;
+    }
+
     var rawData = cleanAndParseJSON(raw);
     var validated = Store.RelationshipAgent.applyRelationshipResponse(rawData);
     var data = { relationships: validated.relationships, characterBios: validated.characterBios };
@@ -2133,6 +2457,13 @@ export async function doRelationshipUpdate() {
     }
     if (data.relationships.length === 0 && data.characterBios.length === 0) {
         console.log("[Story Tracker] Relationship tick returned nothing new this round.");
+        // A parseable empty response is a COMPLETED analysis ("nothing changed"),
+        // not a failure — consume the cadence so the next auto-tick is a full
+        // interval away, and advance the checkpoint so the same already-reviewed
+        // messages aren't re-analyzed next time. (Previously neither happened,
+        // which quietly stretched the effective interval after every quiet tick.)
+        consumeRelationshipCadence();
+        saveRelationshipData();
         return;
     }
 
@@ -2278,18 +2609,8 @@ export async function doRelationshipUpdate() {
         if (!node.bio) node.bio = b.bio;
     });
 
-    // Save checkpoint: record the index and a content anchor of the last processed message.
-    // The anchor (first 40 chars of the last message) lets us detect index drift
-    // caused by message deletions or swipes, so we fall back to last-20 when stale.
-    if (liveChat.length > 0) {
-        var lastMsg = liveChat[liveChat.length - 1];
-        Store.relationshipData._checkpointMsgIdx = liveChat.length - 1;
-        Store.relationshipData._checkpointAnchor = (lastMsg && lastMsg.mes)
-            ? String(lastMsg.mes).slice(0, 40)
-            : "";
-        Store.setRelMsgCounter(0); // reset the per-interval counter
-        if (Store.storyData) Store.storyData._relMsgCount = 0;
-    }
+    // Save checkpoint + reset the cadence — see consumeRelationshipCadence above.
+    consumeRelationshipCadence();
     Store.relationshipData._initialized = true;
     trimRelationshipData();
     applyRelationshipDecay();
