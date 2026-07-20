@@ -2596,3 +2596,69 @@
 .st-rel-add-type {
     flex: 0 0 96px !important;
 }
+
+/* NPC entries are multi-line (change + goal + routine strip + current action),
+   so give this section more room than the shared 210px body cap while keeping
+   it viewport-aware, bounded, and internally scrollable. */
+.st-wsec-npc .st-collapse-body {
+    max-height: min(48vh, 430px) !important;
+}
+
+/* ─── View / Edit mode ──────────────────────────────────────────────────── */
+/* The modal opens read-only: every mutating control below is hidden until the
+   header pencil adds .st-edit-mode. One deliberate tap between browsing and
+   any deletion/regeneration — the tiny inline ×'s were too easy to fat-finger,
+   especially on touch. Non-mutating controls (collapse toggles, routine
+   expand, board filter/✕, footer actions, tabs) stay available in both modes. */
+#st-modal:not(.st-edit-mode) .st-npc-line-del,
+#st-modal:not(.st-edit-mode) .st-del-npc,
+#st-modal:not(.st-edit-mode) .st-del-codex,
+#st-modal:not(.st-edit-mode) .st-del-hist,
+#st-modal:not(.st-edit-mode) .st-cancel-pending-evt,
+#st-modal:not(.st-edit-mode) .st-pin-event-btn,
+#st-modal:not(.st-edit-mode) .st-wand-regen,
+#st-modal:not(.st-edit-mode) .st-world-rule-addrow,
+#st-modal:not(.st-edit-mode) #st-world-btn-add-event,
+#st-modal:not(.st-edit-mode) #st-world-add-event-popout,
+#st-modal:not(.st-edit-mode) #st-time-correct-btn,
+#st-modal:not(.st-edit-mode) #st-time-correct-popout,
+#st-modal:not(.st-edit-mode) .st-rel-editbtn,
+#st-modal:not(.st-edit-mode) .st-rel-add-bond,
+#st-modal:not(.st-edit-mode) .st-rel-del-node,
+#st-modal:not(.st-edit-mode) .st-rel-edit-block,
+#st-modal:not(.st-edit-mode) .st-rel-add-card {
+    display: none !important;
+}
+
+/* Strength sliders stay VISIBLE in view mode as read-only meters — just inert,
+   so scrolling a long bond list on a phone can't nudge a value. */
+#st-modal:not(.st-edit-mode) .st-rel-card-strength {
+    pointer-events: none !important;
+}
+
+/* Header actions group: chip + pencil + close sit together on the right. */
+.st-header-actions {
+    display: flex !important;
+    align-items: center !important;
+    gap: 4px !important;
+}
+
+.st-editmode-chip {
+    font-size: 8.5px !important;
+    letter-spacing: 0.1em !important;
+    text-transform: uppercase !important;
+    font-weight: 700 !important;
+    color: var(--st-custom-accent) !important;
+    background: var(--st-custom-accent-alpha-high) !important;
+    border-radius: 10px !important;
+    padding: 2px 8px !important;
+}
+
+#st-h-editmode.st-hdr-btn-active {
+    color: var(--st-custom-accent) !important;
+}
+
+/* Edit-mode frame cue: a thin accent ring layered onto the dialog's own shadow. */
+#st-modal.st-edit-mode .st-dialog {
+    box-shadow: 0 0 0 1.5px var(--st-custom-accent), 0 20px 50px rgba(0, 0, 0, 0.85) !important;
+}

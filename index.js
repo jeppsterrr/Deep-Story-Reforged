@@ -360,6 +360,14 @@ var routineExpandState = {};
 var relCardEditKey = null;
 var relBioEditOpen = false;
 var relAddOpen = false;
+// View/Edit mode for the whole modal (default: VIEW — read-only). Toggled by
+// the header pencil (see setModalEditMode in buildModal): in view mode every
+// mutating control — the tiny goal/routine ×'s, trashes, wands, pins,
+// add-forms, strength sliders — is hidden or inert via the
+// #st-modal:not(.st-edit-mode) rules in style.css, so one deliberate tap
+// always stands between browsing and an accidental deletion (the fat-finger
+// risk is worst on touch). Session-scoped; every page load starts in view.
+var modalEditMode = false;
 function worldCollapseSectionHtml(key, title, icon, tier, contentId, emptyText) {
     var collapsed = worldCollapseState[key] !== false;
     // tier is optional — sections not backed by a regenerable World Agent tier
@@ -398,7 +406,11 @@ function buildModal() {
     h += '<div class="st-title"><i class="fa-solid fa-pen-fancy"></i> Story tracker</div>';
     h += '<div class="st-subtitle" id="st-modal-subtitle">Field Notes</div>';
     h += '</div>';
+    h += '<div class="st-header-actions">';
+    h += '<span class="st-editmode-chip" id="st-editmode-chip" style="display:none;">Editing</span>';
+    h += '<button class="st-hdr-btn menu_button" id="st-h-editmode" title="Edit mode — reveal editing tools (deletes, regenerates, sliders)"><i class="fa-solid fa-pen"></i></button>';
     h += '<button class="st-hdr-btn menu_button" id="st-h-close" title="Close"><i class="fa-solid fa-xmark"></i></button>';
+    h += '</div>';
     h += '</div>';
     
     // Segmented Pill Tab Controls
@@ -543,6 +555,24 @@ function buildModal() {
     document.body.insertAdjacentHTML("beforeend", h);
 
     $(document).on("click", ".st-overlay, #st-h-close", function() { $("#st-modal").fadeOut(150); });
+
+    // --- View/Edit mode toggle (see the modalEditMode declaration for why) ---
+    // Leaving edit mode also closes any open inline editors/popouts, so view
+    // mode can never show a stranded form whose buttons are hidden.
+    function setModalEditMode(on) {
+        modalEditMode = !!on;
+        $("#st-modal").toggleClass("st-edit-mode", modalEditMode);
+        $("#st-h-editmode").toggleClass("st-hdr-btn-active", modalEditMode);
+        $("#st-editmode-chip").toggle(modalEditMode);
+        if (!modalEditMode) {
+            relCardEditKey = null; relBioEditOpen = false; relAddOpen = false;
+            $("#st-world-add-event-popout").hide();
+            $("#st-time-correct-popout").hide();
+        }
+        renderModal();
+        if ($("#st-tab-relations").is(":visible")) renderRelationshipGraph();
+    }
+    $(document).on("click", "#st-h-editmode", function() { setModalEditMode(!modalEditMode); });
     $(document).on("click", "#st-f-update", Pipeline.doManualUpdate);
     $(document).on("click", ".st-tab", function() {
         $(".st-tab").removeClass("st-tab-active"); $(this).addClass("st-tab-active");
@@ -1357,7 +1387,7 @@ function renderModal() {
     } else {
         rulesHtml = "<i>No world rules yet — distilled automatically when a new chat begins.</i>";
     }
-    rulesHtml += '<div style="display:flex;gap:5px;margin-top:8px;">' +
+    rulesHtml += '<div class="st-world-rule-addrow" style="display:flex;gap:5px;margin-top:8px;">' +
         '<input type="text" id="st-world-rule-input" class="text_pole" placeholder="Add a rule the world must respect…" style="flex:1;min-width:0;">' +
         '<button class="menu_button" id="st-world-rule-add" title="Add rule" style="flex:0 0 auto;"><i class="fa-solid fa-plus"></i></button></div>';
     $("#st-world-val-rules").html(rulesHtml);
@@ -1813,8 +1843,11 @@ function renderRelationshipGraph() {
                     HUD.renderHUD();
                 });
             } else {
+                var boardHint = modalEditMode
+                    ? 'tap a character to filter · slider = strength · ✎ = edit'
+                    : 'tap a character to filter · ✎ in the header to edit';
                 $head.html('<span class="st-rel-board-filter">All bonds · ' + shown.length + '</span>' +
-                    '<span class="st-rel-board-hint">tap a character to filter · slider = strength · ✎ = edit</span>');
+                    '<span class="st-rel-board-hint">' + boardHint + '</span>');
             }
 
             // --- card builders ---
