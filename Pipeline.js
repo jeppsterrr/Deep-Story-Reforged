@@ -954,7 +954,16 @@ export async function doLLMUpdate(timeAnchor) {
     // is also deliberately the only AUTOMATIC call that ever carries the raw card
     // text: afterwards the world tiers run on the distilled digest instead.
     var isGenesisSetup = !Store.storyData._initialized;
-    var genesisLoreText = isGenesisSetup ? getCharacterLoreText() : null;
+    var genesisLoreText = null;
+    if (isGenesisSetup) {
+        genesisLoreText = getCharacterLoreText();
+        // Fold in the optional world-seed lorebook so genesis distills the World
+        // Rules from card lore AND the chosen book. A lorebook-only seed (empty
+        // card) is fine — genesisLoreText becomes non-empty, so askLoreDigest below
+        // still fires.
+        var genesisSeedBook = Store.settings.worldEnabled ? await getSeedLorebookText() : "";
+        if (genesisSeedBook) genesisLoreText = genesisLoreText ? (genesisLoreText + "\n\n" + genesisSeedBook) : genesisSeedBook;
+    }
 
     var prompt = Store.SceneAgent.buildScenePrompt({
         currentTime: anchorState.currentTime,
@@ -1501,6 +1510,167 @@ function getCharacterLoreText() {
     }
 }
 
+// =============================================================================
+// PER-CHAT WORLD LOREBOOKS — two DISTINCT roles, chosen from the World tab and
+// stored in this chat's worldData (chat_metadata), so different cards/chats can
+// point at different books:
+//
+//   SEED  (worldData.seedLorebooks[]): the WHOLE of each selected book is
+//     distilled into the World Rules ONCE — at genesis and when the manual
+//     regenerate wand runs (see getCharacterLoreText's two callers). Never sent
+//     per tick: the whole point of the digest is that raw lore is distilled once
+//     and the tiers then run on the compact result (WorldAgent's WORLD RULES
+//     DIGEST header).
+//
+//   LIVE  (worldData.contextEntries[]): ONLY these specifically-picked entries
+//     are injected into every World Agent tier run, re-read FRESH each run so
+//     dynamic "memory-book" entries reflect their current content. The whole
+//     book is never injected per-run — that distinction is the entire point:
+//     seeding is bulk-once, live context is a curated few-every-time.
+//
+// All async because loadWorldInfo() fetches (then ST-caches, so repeat reads
+// across a run are cheap). Every function returns "" rather than throwing.
+// =============================================================================
+
+function _stContext() {
+    return (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function") ? SillyTavern.getContext() : null;
+}
+
+// Loads one WI book → { entries: [raw entry objects], subst: macro-substituter }.
+// Returns null if unavailable. Caller filters/sorts. loadWorldInfo is ST-cached.
+async function _loadBook(name) {
+    var context = _stContext();
+    if (!name || !context || typeof context.loadWorldInfo !== "function") return null;
+    try {
+        var book = await context.loadWorldInfo(String(name));
+        var entries = (book && book.entries && typeof book.entries === "object")
+            ? Object.keys(book.entries).map(function (k) { return book.entries[k]; })
+            : [];
+        // Card lore runs {{user}}/{{char}} substitution (see getCharacterLoreText);
+        // do the same for lorebook text so prompts never carry a literal "{{user}}".
+        var subst = (typeof context.substituteParams === "function") ? context.substituteParams : function (t) { return t; };
+        return { entries: entries, subst: subst };
+    } catch (e) {
+        console.warn("[Story Tracker] failed to load lorebook \"" + name + "\":", e);
+        return null;
+    }
+}
+
+function _sortWiEntries(list) {
+    return list.slice().sort(function (a, b) {
+        var ao = (typeof a.order === "number") ? a.order : 100;
+        var bo = (typeof b.order === "number") ? b.order : 100;
+        if (ao !== bo) return ao - bo;
+        return (a.uid || 0) - (b.uid || 0);
+    });
+}
+
+function _entryTitle(e, subst, i) {
+    var titleRaw = (e.comment && String(e.comment).trim())
+        || (Array.isArray(e.key) && e.key.length ? e.key.filter(Boolean).join(", ") : "");
+    return titleRaw ? String(subst(titleRaw)).trim() : ("Entry " + (i + 1));
+}
+
+// SEED: the whole of every selected book, distilled into the World Rules (genesis
+// + wand). Generous-but-bounded cap since it's a one-time payload, not per-tick.
+async function getSeedLorebookText() {
+    var books = (Store.worldData && Array.isArray(Store.worldData.seedLorebooks)) ? Store.worldData.seedLorebooks : [];
+    if (books.length === 0) return "";
+    var MAX_SEED_CHARS = 8000;
+    var out = [];
+    var total = 0;
+    var truncated = false;
+    for (var b = 0; b < books.length && !truncated; b++) {
+        var name = books[b];
+        var loaded = await _loadBook(name);
+        if (!loaded) continue;
+        // Only enabled entries with real content (a disabled entry is one the user
+        // switched off in the WI editor — respect that).
+        var usable = _sortWiEntries(loaded.entries.filter(function (e) { return e && !e.disable && e.content && String(e.content).trim(); }));
+        if (usable.length === 0) continue;
+        var parts = [];
+        for (var i = 0; i < usable.length; i++) {
+            var e = usable[i];
+            var block = "### " + _entryTitle(e, loaded.subst, i) + "\n" + String(loaded.subst(String(e.content))).trim();
+            if (total + block.length > MAX_SEED_CHARS) { truncated = true; break; }
+            parts.push(block);
+            total += block.length + 2;
+        }
+        if (parts.length > 0) out.push("=== World Lorebook: " + name + " ===\n" + parts.join("\n\n"));
+    }
+    if (truncated) out.push("[...additional lorebook entries omitted to keep the world seed concise...]");
+    return out.join("\n\n");
+}
+
+// LIVE: ONLY the specifically-picked entries, read fresh each run. Tighter cap
+// than SEED because this rides EVERY World Agent tier call, not a one-off.
+async function getLiveContextEntriesText() {
+    var picks = (Store.worldData && Array.isArray(Store.worldData.contextEntries)) ? Store.worldData.contextEntries : [];
+    if (picks.length === 0) return "";
+    // Group by book so each book loads once, preserving the user's pick order.
+    var order = [];
+    var byBook = {};
+    picks.forEach(function (p) {
+        if (!p || !p.book || p.uid == null) return;
+        var key = String(p.book);
+        if (!byBook[key]) { byBook[key] = []; order.push(key); }
+        byBook[key].push(p);
+    });
+    var MAX_LIVE_CHARS = 4000;
+    var out = [];
+    var total = 0;
+    var truncated = false;
+    for (var b = 0; b < order.length && !truncated; b++) {
+        var name = order[b];
+        var loaded = await _loadBook(name);
+        if (!loaded) continue;
+        var byUid = {};
+        loaded.entries.forEach(function (e) { if (e && e.uid != null) byUid[String(e.uid)] = e; });
+        var lines = [];
+        var group = byBook[name];
+        for (var i = 0; i < group.length; i++) {
+            var e = byUid[String(group[i].uid)];
+            // Entry deleted or switched off since it was picked — skip silently.
+            if (!e || e.disable || !e.content || !String(e.content).trim()) continue;
+            var block = "### " + _entryTitle(e, loaded.subst, i) + "\n" + String(loaded.subst(String(e.content))).trim();
+            if (total + block.length > MAX_LIVE_CHARS) { truncated = true; break; }
+            lines.push(block);
+            total += block.length + 2;
+        }
+        if (lines.length > 0) out.push("=== " + name + " ===\n" + lines.join("\n\n"));
+    }
+    if (out.length === 0) return "";
+    var body = out.join("\n\n");
+    if (truncated) body += "\n\n[...additional selected entries omitted to stay within the live-context budget...]";
+    return body;
+}
+
+// buildWorldTierContext() is synchronous but the live text needs an async fetch,
+// so it's resolved once per World Agent run into this chat-keyed cache and read
+// back synchronously while the tiers build their prompts. Refreshed (not just
+// read) each run so dynamic entries are always current; the chatId guard stops a
+// value resolved for one chat from leaking into another after a mid-flight switch.
+var _liveContextCache = { chatId: null, text: "" };
+async function refreshLiveContextCache() {
+    var chatId = Store.getCurrentChatId();
+    var text = "";
+    try { text = await getLiveContextEntriesText(); } catch (e) { text = ""; }
+    if (Store.getCurrentChatId() === chatId) _liveContextCache = { chatId: chatId, text: text || "" };
+    return _liveContextCache.text;
+}
+function getCachedLiveContextText() {
+    return (_liveContextCache && _liveContextCache.chatId === Store.getCurrentChatId()) ? (_liveContextCache.text || "") : "";
+}
+// Appends the live-context block (if any) to a tier's lore text. Kept distinct
+// from the distilled World Rules so the model treats it as current, possibly-
+// changing reference rather than baked-in ground truth.
+function appendLiveContextToLore(baseLoreText) {
+    var live = getCachedLiveContextText();
+    if (!live) return baseLoreText;
+    var block = "CURRENT LOREBOOK ENTRIES (hand-picked by the user for live reference — established, up-to-date facts that may change over time; prefer these over any older detail):\n" + live;
+    return baseLoreText ? (baseLoreText + "\n\n" + block) : block;
+}
+
 function buildWorldTierContext() {
     var originalChat = (Store.scriptModule && Store.scriptModule.chat) ? Store.scriptModule.chat : [];
     var worldLastCheckpoint = -1;
@@ -1672,8 +1842,13 @@ function buildWorldTierContext() {
         // user-verifiable/editable from the World tab. Raw cards are only sent
         // when no digest exists (pre-digest chats, world agent enabled after
         // genesis, digest section failed) — i.e. the previous behavior, unchanged.
-        characterLoreText: (Store.WorldAgent && Store.worldData && Store.WorldAgent.formatLoreDigestForPrompt(Store.worldData.loreDigest))
-            || getCharacterLoreText(),
+        // ...then the user's hand-picked live lorebook entries (if any) are appended,
+        // re-read fresh each run via the cache refreshed at the dispatch sites below —
+        // this is the ONLY place the per-entry live selection reaches the tiers.
+        characterLoreText: appendLiveContextToLore(
+            (Store.WorldAgent && Store.worldData && Store.WorldAgent.formatLoreDigestForPrompt(Store.worldData.loreDigest))
+            || getCharacterLoreText()
+        ),
         currentLoc: (Store.storyData && Store.storyData.location) ? Store.storyData.location : "Unknown",
         recentEv: (Store.storyData && Store.storyData.recent_events) ? Store.storyData.recent_events : "None.",
     };
@@ -1964,7 +2139,11 @@ async function runWorldTier(isBatch, elapsedMinutes, sharedCtx) {
 async function runLoreDigestRefresh(isBatch, elapsedMinutes, sharedCtx) {
     var tierChatId = Store.getCurrentChatId();
     var loreText = getCharacterLoreText();
-    if (!loreText) throw new Error("no character card lore available to distill");
+    // Fold in the optional world-seed lorebook (same source the genesis digest uses).
+    // With a book set, this can distill even when the card itself has no lore text.
+    var wandSeedBook = await getSeedLorebookText();
+    if (wandSeedBook) loreText = loreText ? (loreText + "\n\n" + wandSeedBook) : wandSeedBook;
+    if (!loreText) throw new Error("no character card lore or seed lorebook available to distill");
     var ctx = sharedCtx || buildWorldTierContext();
     var prompt = Store.WorldAgent.buildLoreDigestPrompt({
         characterLoreText: loreText,
@@ -2008,7 +2187,13 @@ export async function regenerateWorldSection(tier, $btn) {
     // Unlike the real tiers (which MERGE into existing state), a World Rules
     // refresh REPLACES the whole list — including any hand-verified edits, which
     // are exactly the corrections the editable list exists for. Never silently.
-    if (tier === "rules" && !confirm("Regenerate World Rules from the character card? This REPLACES the current list, including any manual edits.")) return;
+    if (tier === "rules") {
+        var seedBooks = (Store.worldData && Array.isArray(Store.worldData.seedLorebooks)) ? Store.worldData.seedLorebooks : [];
+        var srcDesc = seedBooks.length
+            ? ("the character card and " + seedBooks.length + " selected lorebook" + (seedBooks.length > 1 ? "s" : ""))
+            : "the character card";
+        if (!confirm("Regenerate World Rules from " + srcDesc + "? This REPLACES the current list, including any manual edits.")) return;
+    }
 
     loadWorldData();
     Store.setWorldBusy(true);
@@ -2021,6 +2206,9 @@ export async function regenerateWorldSection(tier, $btn) {
         // for THIS tier before zeroing it, so a regenerate fired well short of the tier's
         // normal interval reads as a light, correctly-scoped touch-up, not a full interval.
         var elapsedForRegenTier = (Store.worldData._schedulerAccumulated && Store.worldData._schedulerAccumulated[tier]) || 0;
+        // A single-tier regen also injects the live lorebook entries (harmless for the
+        // 'rules' tier, which builds its own seed text and ignores ctx.characterLoreText).
+        await refreshLiveContextCache();
         await runTrackerProfileSession(async function () {
             if (tier === "faction") {
                 await runFactionTier(false, null, elapsedForRegenTier);
@@ -2085,6 +2273,9 @@ export async function runDueWorldTiers(orderedDueTiers, timeBeforeMsg, rollbackT
     // saw a much shorter "since checkpoint" chat window than the first one did. Building the
     // context once up front and saving the checkpoint once at the end (below) means every
     // tier in this batch — sequential or parallel — sees the identical window.
+    // Resolve this chat's hand-picked live lorebook entries once for the whole batch
+    // (re-read fresh so dynamic entries are current); the tiers read it via the cache.
+    await refreshLiveContextCache();
     var sharedCtx = buildWorldTierContext();
 
     // One tier's full run+error-handling, factored out so both the sequential and
@@ -2252,6 +2443,7 @@ export async function runManualWorldTick() {
         // 4 tiers in this manual tick, rather than each of the 4 sequential calls below
         // reading a checkpoint the previous call already advanced — see the comment on
         // sharedCtx in runDueWorldTiers for the full explanation.
+        await refreshLiveContextCache(); // pull in the live lorebook entries for this manual tick
         var sharedCtx = buildWorldTierContext();
         await runTrackerProfileSession(async function () {
             await runNpcTier(false, elapsedNpc, sharedCtx);

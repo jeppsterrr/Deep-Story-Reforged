@@ -141,6 +141,12 @@ export function makeDefaultWorldData() {
         weatherTrend: "",
         locationCodex: {},
         loreDigest: [], // "World Rules" — genesis-distilled card lore; see WorldAgent's WORLD RULES DIGEST section
+        // PER-CHAT lorebook selections (see Pipeline's lorebook helpers):
+        //  seedLorebooks  — whole books distilled into the World Rules (genesis + regen wand).
+        //  contextEntries — specific {book,uid,comment} entries injected LIVE into every World Agent run
+        //                   (only these, never a whole book per-run — that's what seedLorebooks is for).
+        seedLorebooks: [],
+        contextEntries: [],
         _initialized: false,
         _schedulerAccumulated: { scene: 0, npc: 0, weather: 0, faction: 0, world: 0 },
         _eventQueue: []
@@ -329,6 +335,13 @@ export function loadWorldData() {
         if (worldData.weatherTrend === undefined) worldData.weatherTrend = "";
         if (!worldData.locationCodex) worldData.locationCodex = {};
         if (!Array.isArray(worldData.loreDigest)) worldData.loreDigest = [];
+        // Lorebook selections, with a one-time migration from the earlier single-book
+        // field (worldData.seedLorebook, a string) to the multi-book array.
+        if (!Array.isArray(worldData.seedLorebooks)) {
+            worldData.seedLorebooks = (typeof worldData.seedLorebook === "string" && worldData.seedLorebook) ? [worldData.seedLorebook] : [];
+        }
+        if (typeof worldData.seedLorebook !== "undefined") delete worldData.seedLorebook;
+        if (!Array.isArray(worldData.contextEntries)) worldData.contextEntries = [];
         if (!worldData._schedulerAccumulated) worldData._schedulerAccumulated = { scene: 0, npc: 0, weather: 0, faction: 0, world: 0 };
         if (!worldData._eventQueue) worldData._eventQueue = [];
     } else {

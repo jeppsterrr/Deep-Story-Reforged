@@ -287,21 +287,34 @@
 /* ─── Calendar-style "Add Scheduled Event" popout (HUD-style floating card) ── */
 
 .st-add-event-popout {
-    position: absolute !important;
-    top: calc(100% + 8px) !important;
-    right: 0 !important;
-    width: 280px !important;
-    max-width: 90vw !important;
+    /* Centered on-screen dialog. Previously anchored just below its section, which on
+       a long World tab meant scrolling to the bottom to reach it (bad on mobile).
+       Reparented to #st-modal at build time (see buildModal) so this fixed positioning
+       is viewport-relative and NOT clipped by .st-dialog's transform + overflow:hidden. */
+    position: fixed !important;
+    top: 50% !important;
+    left: 50% !important;
+    right: auto !important;
+    transform: translate(-50%, -50%) !important;
+    width: 340px !important;
+    max-width: 92vw !important;
+    max-height: 85vh !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
     background: var(--st-journal-bg) !important;
     border: 1px solid rgba(255, 255, 255, 0.12) !important;
-    border-radius: 12px !important;
+    border-radius: 16px !important;
     backdrop-filter: blur(25px) !important;
     -webkit-backdrop-filter: blur(25px) !important;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6) !important;
-    z-index: 20 !important;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75) !important;
+    z-index: 10002 !important;
 }
 
 .st-add-event-popout-head {
+    /* Sticky so the close button stays reachable when a long entry list scrolls. */
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 1 !important;
     display: flex !important;
     align-items: center !important;
     justify-content: space-between !important;
@@ -310,9 +323,9 @@
     font-size: 12px !important;
     font-weight: 600 !important;
     color: var(--st-custom-accent) !important;
-    background: rgba(255, 255, 255, 0.02) !important;
+    background: var(--st-journal-bg) !important;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
-    border-radius: 12px 12px 0 0 !important;
+    border-radius: 16px 16px 0 0 !important;
 }
 
 .st-add-event-popout-body {

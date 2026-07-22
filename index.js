@@ -96,6 +96,9 @@ var DEFAULT_SETTINGS = {
     worldEnabled: false,
     useWorldProfile: false,
     worldConnectionProfile: "",
+    // NOTE: the world-seed lorebook is intentionally NOT here — it's PER-CHAT
+    // (stored in worldData, chosen from the World tab), since different cards/chats
+    // use different books. See Pipeline.getSeedLorebookText / makeDefaultWorldData.
     maxWorldTicks: 3, // per-tier catchup cap, passed to Scheduler.evaluate() as maxCatchupTicks
 
     // When multiple world tiers are due on the same message (common after a big time
@@ -473,6 +476,24 @@ function buildModal() {
     
     // World Tab
     h += '<div id="st-tab-world" style="display:none;">';
+
+    // World Lorebooks panel (per chat) — lifted to the very top of the World tab.
+    // Body filled by renderWorldLorebooksPanel() (view summary / edit controls); the
+    // entry-picker popout is a static sibling so it survives body re-renders.
+    h += '  <div class="st-journal-section st-worldbooks-panel" style="position:relative;">' +
+         '    <div class="st-sec-title-row"><div class="st-journal-sec-title"><i class="fa-solid fa-book"></i> World Lorebooks <span style="opacity:.55;font-weight:normal;font-size:.8em;">— this chat</span></div></div>' +
+         '    <div id="st-worldbooks-body"></div>' +
+         '    <div id="st-worldbooks-entry-popout" class="st-add-event-popout" style="display:none;">' +
+         '      <div class="st-worldbooks-entry-stickytop" style="position:sticky;top:0;z-index:1;background:var(--st-journal-bg);border-radius:16px 16px 0 0;">' +
+         '        <div class="st-add-event-popout-head" style="border-radius:16px 16px 0 0;"><span><i class="fa-solid fa-list-check"></i> Live entries — <span id="st-worldbooks-entry-popout-book"></span></span><button id="st-worldbooks-entry-close" class="st-hdr-btn" title="Close" style="min-width:28px;min-height:28px;font-size:14px;"><i class="fa-solid fa-xmark"></i></button></div>' +
+         '        <div style="padding:8px 10px;">' +
+         '          <input type="text" id="st-worldbooks-entry-search" class="text_pole" placeholder="Search entries…" style="width:100%;box-sizing:border-box;" autocomplete="off">' +
+         '        </div>' +
+         '      </div>' +
+         '      <div class="st-add-event-popout-body" id="st-worldbooks-entry-list"></div>' +
+         '    </div>' +
+         '  </div>';
+
     // Briefing card (Direction B): summary, season chip, weather trend, and an
     // "as of" clock stamp merged into ONE card — the old separate status strip +
     // summary box read as two disconnected surfaces. Existing element IDs are
@@ -554,7 +575,25 @@ function buildModal() {
     h += '</div></div></div>';
     document.body.insertAdjacentHTML("beforeend", h);
 
-    $(document).on("click", ".st-overlay, #st-h-close", function() { $("#st-modal").fadeOut(150); });
+    // Reparent the popouts up to #st-modal (out of .st-dialog, which has a transform +
+    // overflow:hidden that would trap AND clip a centered position:fixed child). At the
+    // #st-modal level (fixed, inset:0, no transform) they center on the viewport instead
+    // of dropping to the bottom of the scrollable dialog. All their handlers are
+    // id-delegated, so moving the DOM location changes nothing else.
+    (function reparentPopoutsToModal() {
+        var modalEl = document.getElementById("st-modal");
+        if (!modalEl) return;
+        ["st-world-add-event-popout", "st-worldbooks-entry-popout"].forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el) modalEl.appendChild(el);
+        });
+    })();
+
+    $(document).on("click", ".st-overlay, #st-h-close", function() {
+        // Don't leave a centered popout floating over the next open of the modal.
+        $("#st-world-add-event-popout, #st-worldbooks-entry-popout").hide();
+        $("#st-modal").fadeOut(150);
+    });
 
     // --- View/Edit mode toggle (see the modalEditMode declaration for why) ---
     // Leaving edit mode also closes any open inline editors/popouts, so view
@@ -568,6 +607,7 @@ function buildModal() {
             relCardEditKey = null; relBioEditOpen = false; relAddOpen = false;
             $("#st-world-add-event-popout").hide();
             $("#st-time-correct-popout").hide();
+            $("#st-worldbooks-entry-popout").hide();
         }
         renderModal();
         if ($("#st-tab-relations").is(":visible")) renderRelationshipGraph();
@@ -986,6 +1026,134 @@ function buildModal() {
         $("#st-world-rule-input").focus();
     }
     $(document).on("click", "#st-world-rule-add", addWorldRuleFromInput);
+
+    // --- World Lorebooks panel (top of the World tab, per-chat) --------------
+    // seedLorebooks[]  = books distilled (whole) into the World Rules at genesis + wand.
+    // contextEntries[] = specific {book,uid,comment} entries fed LIVE to every World
+    // Agent run. Both live in worldData; the controls render only in edit mode.
+
+    // Live-filter the lorebook list (edit mode) by book name as the user types.
+    $(document).on("input", "#st-worldbooks-book-search", function() {
+        var q = String(this.value || "").trim().toLowerCase();
+        var $rows = $(".st-worldbook-row");
+        if (!q) { $rows.show(); $("#st-worldbooks-book-noresults").hide(); return; }
+        var visible = 0;
+        $rows.each(function() {
+            var hit = ($(this).attr("data-search") || "").indexOf(q) !== -1;
+            $(this).toggle(hit);
+            if (hit) visible++;
+        });
+        $("#st-worldbooks-book-noresults").toggle(visible === 0);
+    });
+
+    // Toggle a book as a SEED book (whole book → World Rules distillation).
+    $(document).on("change", ".st-worldbook-seed", function() {
+        if (!Store.worldData) { if (typeof toastr !== "undefined") toastr.warning("No active chat is open."); return; }
+        if (!Array.isArray(Store.worldData.seedLorebooks)) Store.worldData.seedLorebooks = [];
+        var book = String($(this).data("book"));
+        var arr = Store.worldData.seedLorebooks;
+        var i = arr.indexOf(book);
+        if (this.checked) { if (i === -1) arr.push(book); }
+        else if (i !== -1) arr.splice(i, 1);
+        Persistence.saveWorldData();
+        renderModal();
+    });
+
+    // Open the live-entry picker popout for one book (loads its entries on demand).
+    $(document).on("click", ".st-worldbook-entries", async function() {
+        var book = String($(this).data("book") || "");
+        if (!book) return;
+        var $pop = $("#st-worldbooks-entry-popout");
+        var $list = $("#st-worldbooks-entry-list");
+        var $search = $("#st-worldbooks-entry-search");
+        $("#st-worldbooks-entry-popout-book").text(book);
+        $list.html('<div style="opacity:.6;padding:10px;">Loading entries…</div>');
+        $search.val(""); // fresh book, fresh search
+        $pop.show();
+        var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function") ? SillyTavern.getContext() : null;
+        var data = null;
+        try { if (context && typeof context.loadWorldInfo === "function") data = await context.loadWorldInfo(book); } catch (e) { data = null; }
+        // The user may have opened another book, or closed the popout, while this awaited.
+        if ($("#st-worldbooks-entry-popout-book").text() !== book || $pop.is(":hidden")) return;
+        var entries = (data && data.entries && typeof data.entries === "object") ? Object.keys(data.entries).map(function(k){ return data.entries[k]; }) : [];
+        if (entries.length === 0) { $list.html('<div style="opacity:.6;padding:10px;">This lorebook has no entries.</div>'); return; }
+        entries.sort(function(a,b){ var ao=(typeof a.order==="number")?a.order:100, bo=(typeof b.order==="number")?b.order:100; return ao!==bo?ao-bo:((a.uid||0)-(b.uid||0)); });
+        var picks = (Store.worldData && Array.isArray(Store.worldData.contextEntries)) ? Store.worldData.contextEntries : [];
+        var pickedUid = {}; picks.forEach(function(p){ if (p && String(p.book) === book) pickedUid[String(p.uid)] = true; });
+        var html = '';
+        entries.forEach(function(e, idx){
+            if (!e || e.uid == null) return;
+            var keysArr = Array.isArray(e.key) ? e.key.filter(Boolean) : [];
+            var title = (e.comment && String(e.comment).trim()) || (keysArr.length ? keysArr.join(", ") : ("Entry " + (idx + 1)));
+            var preview = String(e.content || "").replace(/\s+/g, " ").trim().slice(0, 160);
+            var off = e.disable ? ' <span style="opacity:.5;">(off — won\'t inject while disabled)</span>' : '';
+            var checked = pickedUid[String(e.uid)] ? ' checked' : '';
+            // Search haystack: title + keywords + FULL content (not just the truncated
+            // preview) so a match deep in a long entry still surfaces it. Lowercased and
+            // placed in a data attribute so filtering (see the search-input handler) is a
+            // cheap indexOf per keystroke instead of re-walking the DOM text each time.
+            var searchText = (title + " " + keysArr.join(" ") + " " + String(e.content || "")).toLowerCase();
+            html += '<label class="st-worldbook-entry-item" data-search="' + esc(searchText) + '" style="display:flex;gap:8px;padding:6px 2px;align-items:flex-start;border-top:1px solid rgba(128,128,128,.14);">' +
+                '<input type="checkbox" class="st-worldbook-entry-chk" data-book="' + esc(book) + '" data-uid="' + esc(String(e.uid)) + '"' + checked + '>' +
+                '<span style="flex:1;min-width:0;"><b>' + esc(title) + '</b>' + off + (preview ? '<br><span style="opacity:.65;font-size:.82em;">' + esc(preview) + (preview.length >= 160 ? '…' : '') + '</span>' : '') + '</span>' +
+            '</label>';
+        });
+        html += '<div id="st-worldbooks-entry-noresults" style="display:none;opacity:.6;padding:10px;">No entries match your search.</div>';
+        $list.html(html);
+    });
+
+    // Live-filter the open book's entries as the user types. Matches against each
+    // entry's data-search text (title + keywords + full content, not just the
+    // truncated preview shown on screen).
+    $(document).on("input", "#st-worldbooks-entry-search", function() {
+        var q = String(this.value || "").trim().toLowerCase();
+        var $items = $("#st-worldbooks-entry-list .st-worldbook-entry-item");
+        if (!q) { $items.show(); $("#st-worldbooks-entry-noresults").hide(); return; }
+        var visible = 0;
+        $items.each(function() {
+            var hit = ($(this).attr("data-search") || "").indexOf(q) !== -1;
+            $(this).toggle(hit);
+            if (hit) visible++;
+        });
+        $("#st-worldbooks-entry-noresults").toggle(visible === 0);
+    });
+
+    // Toggle one entry's live-context membership. No full re-render mid-picking; the
+    // per-book "(N)" count and summary refresh when the popout closes.
+    $(document).on("change", ".st-worldbook-entry-chk", function() {
+        if (!Store.worldData) return;
+        if (!Array.isArray(Store.worldData.contextEntries)) Store.worldData.contextEntries = [];
+        var book = String($(this).data("book"));
+        var uidRaw = $(this).data("uid");
+        var uid = (typeof uidRaw === "number") ? uidRaw : (/^\d+$/.test(String(uidRaw)) ? parseInt(uidRaw, 10) : uidRaw);
+        var arr = Store.worldData.contextEntries;
+        var idx = -1;
+        for (var i = 0; i < arr.length; i++) { if (arr[i] && String(arr[i].book) === book && String(arr[i].uid) === String(uid)) { idx = i; break; } }
+        if (this.checked) {
+            if (idx === -1) {
+                var comment = $(this).closest(".st-worldbook-entry-item").find("b").first().text() || "";
+                arr.push({ book: book, uid: uid, comment: comment });
+            }
+        } else if (idx !== -1) {
+            arr.splice(idx, 1);
+        }
+        Persistence.saveWorldData();
+    });
+
+    $(document).on("click", "#st-worldbooks-entry-close", function() {
+        $("#st-worldbooks-entry-popout").hide();
+        renderModal(); // refresh per-book entry counts / the view-mode summary
+    });
+    // Tap outside to dismiss (mirrors the Add Event popout). Excludes the "entries"
+    // buttons so a click that opens one doesn't immediately close it.
+    $(document).on("click", function(e) {
+        var $pop = $("#st-worldbooks-entry-popout");
+        if (!$pop.is(":visible")) return;
+        if ($(e.target).closest("#st-worldbooks-entry-popout, .st-worldbook-entries").length === 0) {
+            $pop.hide();
+            renderModal();
+        }
+    });
     $(document).on("keydown", "#st-world-rule-input", function(e) {
         if (e.key === "Enter") { e.preventDefault(); addWorldRuleFromInput(); }
     });
@@ -1390,8 +1558,13 @@ function renderModal() {
     rulesHtml += '<div class="st-world-rule-addrow" style="display:flex;gap:5px;margin-top:8px;">' +
         '<input type="text" id="st-world-rule-input" class="text_pole" placeholder="Add a rule the world must respect…" style="flex:1;min-width:0;">' +
         '<button class="menu_button" id="st-world-rule-add" title="Add rule" style="flex:0 0 auto;"><i class="fa-solid fa-plus"></i></button></div>';
+    // (Lorebook seeding for these rules is chosen in the "World Lorebooks" panel at
+    // the top of this tab — see renderWorldLorebooksPanel.)
     $("#st-world-val-rules").html(rulesHtml);
     setWorldCollapseCount("st-world-val-rules", rulesList.length);
+
+    // World Lorebooks panel (top of the World tab) — view summary or edit controls.
+    $("#st-worldbooks-body").html(renderWorldLorebooksPanel());
 
     // Tab-state chips (Direction C): edge count on Relations, due-dot on World.
     var relEdgeCount = (Store.settings.relationsEnabled && Store.relationshipData && Store.relationshipData.edges)
@@ -2493,6 +2666,9 @@ function buildSettingsPanel() {
     h += '<div style="display:flex;gap:5px;align-items:center;"><select id="st-s-world-profile" class="text_pole" style="flex:1"></select>';
     h += '<button class="menu_button" id="st-s-world-profile-refresh" title="Refresh profile list" style="flex:0 0 auto;"><i class="fa-solid fa-rotate"></i></button></div></div>';
 
+    // (World-seed lorebook is chosen PER-CHAT from the World tab, not here — see the
+    // World Rules section in renderModal. A global setting can't be per-chat.)
+
     // The old single "World Tick Frequency" dropdown is gone — the World Agent is now 4
     // independent tiers (npc/weather/faction/world), each with its own RP-time cadence, run
     // by the Scheduler. Exposed here as advanced sub-settings under the single World toggle,
@@ -2796,6 +2972,70 @@ function toggleChatButtonVisibility() {
             $trigger.hide();
         }
     }
+}
+
+// Body of the top-of-World-tab "World Lorebooks" panel (per chat). VIEW mode: a
+// read-only summary. EDIT mode: a checkbox per available book (seed on/off) + an
+// "entries" button that opens the live-entry picker popout. Rebuilt on every
+// renderModal (like the rest of the World tab), so it always reflects the live WI
+// list and the current worldData selections. Handlers are delegated (see bindEvents).
+function renderWorldLorebooksPanel() {
+    var wd = Store.worldData;
+    var seedBooks = (wd && Array.isArray(wd.seedLorebooks)) ? wd.seedLorebooks : [];
+    var picks = (wd && Array.isArray(wd.contextEntries)) ? wd.contextEntries : [];
+
+    if (!modalEditMode) {
+        if (seedBooks.length === 0 && picks.length === 0) {
+            return '<div style="opacity:.6;font-size:.85em;">No lorebooks selected for this chat. Tap the <i class="fa-solid fa-pen-to-square"></i> edit toggle (top-right) to choose books that seed the world.</div>';
+        }
+        var s = '<div style="font-size:.86em;line-height:1.5;">';
+        s += '<div><b>Seeding World Rules:</b> ' + (seedBooks.length ? seedBooks.map(esc).join(', ') : '<span style="opacity:.6;">none</span>') + '</div>';
+        s += '<div><b>Live entries → World Agent:</b> ' + (picks.length ? (esc(String(picks.length)) + ' selected') : '<span style="opacity:.6;">none</span>') + '</div>';
+        s += '</div>';
+        return s;
+    }
+
+    // Edit mode
+    var names = [];
+    try {
+        var context = (typeof SillyTavern !== "undefined" && typeof SillyTavern.getContext === "function") ? SillyTavern.getContext() : null;
+        if (context && typeof context.getWorldInfoNames === "function") names = context.getWorldInfoNames() || [];
+    } catch (e) { names = []; }
+
+    var h = "";
+    if (names.length === 0) {
+        h += '<div style="opacity:.7;font-size:.85em;">No lorebooks found. Create one in SillyTavern\'s <b>World Info</b>, then reopen this panel.</div>';
+    } else {
+        var rows = "";
+        names.forEach(function (n) {
+            if (!n) return;
+            var isSeed = seedBooks.indexOf(n) !== -1;
+            var cnt = picks.filter(function (p) { return p && String(p.book) === n; }).length;
+            rows += '<div class="st-worldbook-row" data-search="' + esc(n.toLowerCase()) + '" style="display:flex;align-items:center;gap:8px;padding:3px 0;">' +
+                '<label class="checkbox_label" style="flex:1;min-width:0;margin:0;">' +
+                    '<input type="checkbox" class="st-worldbook-seed" data-book="' + esc(n) + '"' + (isSeed ? ' checked' : '') + '>' +
+                    '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(n) + '</span>' +
+                '</label>' +
+                '<button class="menu_button st-worldbook-entries" data-book="' + esc(n) + '" title="Pick specific entries fed live to the World Agent" style="flex:0 0 auto;">' +
+                    '<i class="fa-solid fa-list-check"></i> entries' + (cnt ? ' (' + cnt + ')' : '') + '</button>' +
+            '</div>';
+        });
+        // Search box to filter the list below by book name — most useful once there
+        // are enough books that the scroll box (next) actually needs scrolling.
+        if (names.length > 4) {
+            h += '<input type="text" id="st-worldbooks-book-search" class="text_pole" placeholder="Search lorebooks…" autocomplete="off" style="width:100%;box-sizing:border-box;margin-bottom:6px;">';
+        }
+        // Cap the height so a large lorebook collection doesn't sprawl down the tab —
+        // scroll within this box instead.
+        h += '<div class="st-worldbooks-list" style="max-height:168px;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid rgba(128,128,128,.18);border-radius:8px;padding:2px 9px;">' + rows +
+            '<div id="st-worldbooks-book-noresults" style="display:none;opacity:.6;padding:6px 2px;">No lorebooks match your search.</div>' +
+        '</div>';
+    }
+    h += '<div style="opacity:.65;font-size:.8em;margin-top:7px;line-height:1.4;">' +
+        '<b>Checked</b> books are distilled — in full — into the <b>World Rules</b> below: once at a new chat\'s genesis, and whenever you regenerate the rules. ' +
+        '<b>Entries</b> lets you pick specific entries that are then fed to the World Agent on <i>every</i> run — only those, never the whole book — ideal for dynamic memory-book entries. ' +
+        'After changing books, regenerate the World Rules (its wand, in edit mode) to re-seed this chat.</div>';
+    return h;
 }
 
 function populateProfileDropdown() {
