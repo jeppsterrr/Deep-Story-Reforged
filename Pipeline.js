@@ -1573,9 +1573,23 @@ function _entryTitle(e, subst, i) {
 
 // SEED: the whole of every selected book, distilled into the World Rules (genesis
 // + wand). Generous-but-bounded cap since it's a one-time payload, not per-tick.
+// EXCLUDES any entry that's also picked as a LIVE context entry (worldData.
+// contextEntries) — without this, a book checked as both Seed and a source of
+// live-picked entries would bake the same entry's content into the World Rules
+// (compressed) AND re-inject it raw on every tier run, doubling it up in every
+// World Agent prompt. The live pick already covers that entry going forward
+// (and does so with fresher content), so the one-time seed just skips it.
 async function getSeedLorebookText() {
     var books = (Store.worldData && Array.isArray(Store.worldData.seedLorebooks)) ? Store.worldData.seedLorebooks : [];
     if (books.length === 0) return "";
+    var picks = (Store.worldData && Array.isArray(Store.worldData.contextEntries)) ? Store.worldData.contextEntries : [];
+    var pickedUidsByBook = {};
+    picks.forEach(function (p) {
+        if (!p || !p.book || p.uid == null) return;
+        var key = String(p.book);
+        if (!pickedUidsByBook[key]) pickedUidsByBook[key] = {};
+        pickedUidsByBook[key][String(p.uid)] = true;
+    });
     var MAX_SEED_CHARS = 8000;
     var out = [];
     var total = 0;
@@ -1584,9 +1598,15 @@ async function getSeedLorebookText() {
         var name = books[b];
         var loaded = await _loadBook(name);
         if (!loaded) continue;
+        var pickedUids = pickedUidsByBook[String(name)] || null;
         // Only enabled entries with real content (a disabled entry is one the user
-        // switched off in the WI editor — respect that).
-        var usable = _sortWiEntries(loaded.entries.filter(function (e) { return e && !e.disable && e.content && String(e.content).trim(); }));
+        // switched off in the WI editor — respect that), minus any already picked
+        // for live context (see this function's header comment).
+        var usable = _sortWiEntries(loaded.entries.filter(function (e) {
+            if (!e || e.disable || !e.content || !String(e.content).trim()) return false;
+            if (pickedUids && e.uid != null && pickedUids[String(e.uid)]) return false;
+            return true;
+        }));
         if (usable.length === 0) continue;
         var parts = [];
         for (var i = 0; i < usable.length; i++) {

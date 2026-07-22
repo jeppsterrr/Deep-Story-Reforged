@@ -3034,6 +3034,7 @@ function renderWorldLorebooksPanel() {
     h += '<div style="opacity:.65;font-size:.8em;margin-top:7px;line-height:1.4;">' +
         '<b>Checked</b> books are distilled — in full — into the <b>World Rules</b> below: once at a new chat\'s genesis, and whenever you regenerate the rules. ' +
         '<b>Entries</b> lets you pick specific entries that are then fed to the World Agent on <i>every</i> run — only those, never the whole book — ideal for dynamic memory-book entries. ' +
+        'An entry picked as a live entry is automatically left out of the World Rules distillation, so it\'s never sent twice. ' +
         'After changing books, regenerate the World Rules (its wand, in edit mode) to re-seed this chat.</div>';
     return h;
 }
