@@ -47,7 +47,7 @@
  */
 
 import { applyTimeResolverResponse, PACING_EXAMPLE_GUIDE, TIME_ANCHOR_GUIDE, formatTimeForPrompt, parseDateTime, formatDate } from "./TimelineEngine.js";
-import { LORE_DIGEST_GUIDE } from "./WorldAgent.js";
+import { LORE_DIGEST_GUIDE, SHARED_OUTPUT_RULES } from "./WorldAgent.js";
 
 // =============================================================================
 // PREVIOUS STATE BLOCK
@@ -196,17 +196,31 @@ export function buildScenePrompt(input) {
         : "";
 
     return (
-        "[OOC: You are a narrative assistant. Analyze the roleplay chat so far, determine the current scene context, AND decide how much real narrative time has passed.\n\n" +
-        "CLOCK AS OF THE LAST UPDATE (your reference point — decide in time_advance below how much time has passed since then, if any):\n" +
-        "Time: " + formatTimeForPrompt(input.currentTime) + " | Date: " + input.currentDate + "\n\n" +
-        "1. WEATHER & TEMPERATURE: Given the current Location and the time of day once time_advance is applied, deduce the current Temperature (e.g. '18°C' or '64°F') and Weather conditions (e.g. 'Clear', 'Rainy', 'Overcast', 'Snowing', 'Stormy', 'Hot', 'Foggy'). If indoors or weather is unspecified, infer from context or write 'Unknown'." + weatherGroundingLine + "\n" +
+        // ---- STABLE PREFIX: identical on every scene tick (see WorldAgent's PROMPT LAYOUT) ----
+        "[OOC: You are a narrative assistant. Analyze the roleplay chat so far, determine the current scene context, AND decide how much real narrative time has passed. Everything you need — the clock, the previous state, the lore and the chat — is in the CURRENT DATA section at the end of this message.\n\n" +
+        "1. WEATHER & TEMPERATURE — SHORT LABELS, NOT SENTENCES. Given the current Location and the time of day once time_advance is applied, deduce the current Temperature and Weather.\n" +
+        "   - \"temperature\": a bare reading, e.g. '18°C' or '64°F'. Nothing else.\n" +
+        "   - \"weather\": 1-4 words naming the condition, e.g. 'Clear', 'Rainy', 'Overcast', 'Snowing', 'Stormy', 'Foggy', 'Light drizzle', 'Cold and windy'. This renders as a small chip in a status panel — a sentence WILL be truncated.\n" +
+        "   BAD: \"The sky above the harbor has grown heavy and grey, and a light drizzle has begun to fall across the rooftops\"  <- a sentence, not a label\n" +
+        "   BAD: \"It is currently raining.\"  <- still a sentence; drop the framing\n" +
+        "   GOOD: \"Light drizzle\"   GOOD: \"Overcast\"   GOOD: \"Clear\"\n" +
+        "   If indoors or genuinely unspecified, infer from context, or write 'Unknown' for weather only (never for city/country — see rule 2). If a REGIONAL WEATHER TREND appears in CURRENT DATA, use it as grounding rather than copying it verbatim.\n" +
         "2. CITY & COUNTRY — MANDATORY, NEVER USE 'Unknown': You MUST always fill both 'city' and 'country' fields with a real or invented name. Rules:\n" +
         "   - Real-world setting -> use the actual city and country (e.g. 'Paris' / 'France').\n" +
         "   - Fantasy / sci-fi / fictional world -> INVENT fitting names based on the story tone, character names, culture, architecture, language style. Be creative and specific (e.g. 'Myrenveld' / 'Sovereign Realms of Drak'hara').\n" +
         "   - Known fictional universe (Westeros, Middle-earth, etc.) -> use canonical place names.\n" +
         "   - Setting is ambiguous or unspecified -> make your BEST GUESS or freely invent. 'Unknown' is NOT an acceptable value under any circumstances.\n" +
-        "3. CHARACTER POSITIONS: List every character present in the current scene (including " + userName + " the player). Use the player's actual name as it appears in the chat - NOT the word 'User'. State exactly where they are and what their physical posture/action is right now.\n" +
-        "4. RECENT EVENTS: Write a brief, factual 1-2 sentence summary of what just changed or happened in the last few messages. Use the player's actual name, not 'User'.\n" +
+        "3. CHARACTER POSITIONS: List every character present in the current scene (including " + userName + " the player). Use the player's actual name as it appears in the chat - NOT the word 'User'.\n" +
+        "   Each \"state\" must say WHAT THEY ARE PHYSICALLY DOING and WHERE, in 2-12 words. Every character in the list is by definition present, so \"present\" conveys nothing and is never an acceptable answer:\n" +
+        "   BAD: \"present\" / \"here\" / \"in the scene\" / \"nearby\" / \"standing\" / \"unknown\"  <- states nothing; these are rejected\n" +
+        "   BAD: \"Ara stands there, her mind turning over the weight of everything that has happened since the harbor\"  <- internal thoughts and prose, not a physical position\n" +
+        "   GOOD: \"sitting on the floor by the hearth\"\n" +
+        "   GOOD: \"standing in the doorway, blocking it\"\n" +
+        "   GOOD: \"kneeling beside the wounded guard\"\n" +
+        "   If the text genuinely never says what someone is doing, infer the most plausible concrete posture from the scene rather than falling back on a placeholder.\n" +
+        "4. RECENT EVENTS: A factual 1-2 sentence summary of what just changed in the last few messages — 40 words MAXIMUM. Plain and concrete; no atmosphere or introspection. Use the player's actual name, not 'User'.\n" +
+        "   BAD: \"A tension hung in the air between them, unspoken yet palpable, as the weight of old wounds settled over the room like dust\"  <- atmosphere, no actual events\n" +
+        "   GOOD: \"Char1 entered the living room and confronted Jepp about the missing key. Jepp denied taking it.\"\n" +
         "5. TIME_ADVANCE: Decide which ONE of four cases applies to how much real time passed across the messages you just reviewed, and fill the `time_advance` field accordingly. This replaces the flat per-message clock tick for this span rather than stacking on top of it, so be realistic and use the whole span, not just the last line.\n" +
         startingTimeInstruction +
         startingDateInstruction +
@@ -216,10 +230,6 @@ export function buildScenePrompt(input) {
         loreDigestInstruction + "\n" +
         PACING_EXAMPLE_GUIDE + "\n" +
         TIME_ANCHOR_GUIDE + "\n" +
-        revealsSection +
-        loreBlock +
-        "PENDING SCHEDULED EVENTS (things already queued to happen in the future — reference one by its number if the scene is explicitly filling time until it):\n" +
-        pendingEventsText + "\n\n" +
         "The four time_advance cases:\n" +
         "a. Real time elapsed across this span (add up what realistically happened — this does not require an explicit \"skip\" phrase, ordinary beats still add up to real minutes; a stated present-moment marker like \"it's now afternoon\" or \"noon has come\" also belongs here — use the TIME-OF-DAY ANCHOR HOURS table below to compute exact minutes to that target):\n" +
         "   {\"type\":\"elapsed\",\"minutes\":14,\"reason\":\"one sentence\"}\n" +
@@ -227,7 +237,7 @@ export function buildScenePrompt(input) {
         "   {\"type\":\"elapsed\",\"minutes\":262800,\"explicit_skip\":true,\"reason\":\"the text states six months passed\"}\n" +
         "b. Someone stated a FUTURE promise/ETA that hasn't happened yet (\"the ship will arrive in three hours\") — nothing has elapsed, this is something to schedule for later:\n" +
         "   {\"type\":\"schedule\",\"minutes\":180,\"description\":\"what happens when it resolves, one sentence\"}\n" +
-        "c. The scene is explicitly passing time UNTIL one of the PENDING SCHEDULED EVENTS above (\"they talk until dinner\" and a dinner event is already pending) — reference it by its list number:\n" +
+        "c. The scene is explicitly passing time UNTIL one of the PENDING SCHEDULED EVENTS listed in CURRENT DATA (\"they talk until dinner\" and a dinner event is already pending) — reference it by its list number:\n" +
         "   {\"type\":\"advance_to_event\",\"eventIndex\":1,\"reason\":\"one sentence\"}\n" +
         "d. Nothing notable beyond ordinary real-time dialogue/action at normal pace:\n" +
         "   {\"type\":\"none\",\"reason\":\"one sentence\"}\n\n" +
@@ -235,10 +245,10 @@ export function buildScenePrompt(input) {
         "- A statement about the PAST (\"a few hours ago\", \"already\", \"last night\", something recalled or dreamed) is NEVER \"elapsed\" — it describes time before now. Treat it as \"none\".\n" +
         "- A statement of REMAINING distance/time (\"three hours away\", \"until we arrive\") is NEVER \"elapsed\" — that's a \"schedule\" case.\n" +
         "- Be realistic and conservative with \"minutes\" for ORDINARY pacing (case a) — when genuinely uncertain about an everyday beat, prefer the smaller/more conservative answer. This does NOT apply to an explicit_skip (case a2): if the text plainly states a duration or target beyond a single day, report the full real minutes for it — rounding an explicit skip down to \"stay safe\" is the mistake, not a virtue.\n" +
-        "- \"advance_to_event\" only applies when a PENDING SCHEDULED EVENT is listed above AND the text explicitly uses it as a time-filler (\"until\", \"waiting for\"). If nothing is pending, this option is not available.\n" +
+        "- \"advance_to_event\" only applies when a PENDING SCHEDULED EVENT is listed in CURRENT DATA AND the text explicitly uses it as a time-filler (\"until\", \"waiting for\"). If nothing is pending, this option is not available.\n" +
         "- Only set explicit_skip:true when the text ITSELF states the duration or a calendar/seasonal target — never for your own inference about how long an unstated gap \"probably\" was.\n" +
-        "- RECONCILE AGAINST STATED TIME-OF-DAY: if the reviewed text states or clearly implies the current time-of-day — including PASSIVELY, with no \"it's now X\" phrasing (e.g. \"the morning light spilled across the room\", \"the afternoon sun beat down\", \"night had fully descended\") — and that's inconsistent with where your computed \"minutes\" would land relative to the clock stated above, let the STATED time-of-day win. Recompute \"minutes\" to land at the matching hour in the TIME-OF-DAY ANCHOR HOURS table instead of your original estimate. The prose is the source of truth for what time it visibly is; your minute-math is only a tool for estimating that, never an authority that overrides what the story already said.\n\n" +
-        prevStateBlock + "\n\n" +
+        "- RECONCILE AGAINST STATED TIME-OF-DAY: if the reviewed text states or clearly implies the current time-of-day — including PASSIVELY, with no \"it's now X\" phrasing (e.g. \"the morning light spilled across the room\", \"the afternoon sun beat down\", \"night had fully descended\") — and that's inconsistent with where your computed \"minutes\" would land relative to the clock given in CURRENT DATA, let the STATED time-of-day win. Recompute \"minutes\" to land at the matching hour in the TIME-OF-DAY ANCHOR HOURS table instead of your original estimate. The prose is the source of truth for what time it visibly is; your minute-math is only a tool for estimating that, never an authority that overrides what the story already said.\n\n" +
+        SHARED_OUTPUT_RULES + "\n" +
         "Respond ONLY with valid JSON in the story's language. IMPORTANT: In the characters array, use the player's actual name from the chat - never write 'User'. Do NOT include a \"time\" or \"date\" field anywhere in your response — only the time_advance object above decides elapsed time, and it will be ignored if a raw time/date field is present instead. Use this exact structure (city and country MUST be non-empty strings, never 'Unknown'):\n" +
         "{\"location\":\"Living room\", \"city\":\"Myrenveld\", \"country\":\"Sovereign Realms of Drak'hara\", \"temperature\":\"18°C\", \"weather\":\"Cloudy\", \"characters\":[{\"name\":\"Jepp\", \"state\":\"sitting on floor\"}, {\"name\":\"Char1\", \"state\":\"standing near Jepp\"}], \"recent_events\":\"Char1 entered the living room and spoke to Jepp.\", \"time_advance\":{\"type\":\"elapsed\",\"minutes\":14,\"reason\":\"a short conversation and a walk to the door\"}" +
         (input.askStartingTime ? ", \"starting_time\":\"19:30\"" : "") +
@@ -247,10 +257,23 @@ export function buildScenePrompt(input) {
         (input.askWorldSeed ? ", \"world_seed\":{\"summary\":\"2-3 sentence world snapshot.\",\"weather_trend\":\"One-sentence regional trend.\",\"npc_states\":[{\"name\":\"Balthor\",\"change\":\"working his forge across town\"}],\"pending_reveals\":[]}" : "") +
         (input.askRelationshipSeed ? ", \"relationship_seed\":{\"relationships\":[{\"from\":\"CharA\",\"to\":\"CharB\",\"type\":\"alliance\",\"strength\":0.5,\"summary\":\"Sworn shield-brothers per the lore\"}],\"character_bios\":[]}" : "") +
         (input.askLoreDigest ? ", \"lore_digest\":[\"One short factual world rule per entry.\"]" : "") +
-        "}\n" +
-        "]\n\n" +
-        "[Player character name: " + userName + ". Always use this exact name in the JSON output, never write 'User'.]\n" +
-        "Recent chat:\n" + chatText
+        "}\n\n" +
+        "[Player character name: " + userName + ". Always use this exact name in the JSON output, never write 'User'.]\n\n" +
+        // ---- VOLATILE SUFFIX: everything below changes tick to tick ----
+        "=== CURRENT DATA ===\n\n" +
+        "CLOCK AS OF THE LAST UPDATE (your reference point — decide in time_advance how much time has passed since then, if any):\n" +
+        "Time: " + formatTimeForPrompt(input.currentTime) + " | Date: " + input.currentDate + "\n\n" +
+        (weatherGroundingLine
+            ? ("REGIONAL WEATHER TREND (see rule 1):" + weatherGroundingLine + "\n\n")
+            : "") +
+        revealsSection +
+        loreBlock +
+        "PENDING SCHEDULED EVENTS (things already queued to happen in the future — reference one by its number if the scene is explicitly filling time until it):\n" +
+        pendingEventsText + "\n\n" +
+        prevStateBlock + "\n\n" +
+        "Recent chat:\n" + chatText + "\n\n" +
+        "Now produce the JSON object described above for this CURRENT DATA. Obey every stated word limit, and never emit a filler value such as \"present\" or \"unknown\" where a real answer is required.\n" +
+        "]"
     );
 }
 
@@ -285,10 +308,66 @@ function cleanScalarField(value, maxChars) {
     return trimmed.length > maxChars ? trimmed.slice(0, maxChars) : trimmed;
 }
 
-export function applySceneResponse(data) {
+// --- Label/filler enforcement ------------------------------------------------
+// The prompt now spells out that weather/temperature are LABELS and that a
+// character "state" may never be a placeholder, but prompt wording is a request,
+// not a guarantee — fast/non-thinking models comply far less reliably than
+// reasoning ones. These are the enforcement half, in the same "the model
+// proposes, JS decides" spirit as the time_advance contract: whatever the model
+// returns, what reaches storage (and therefore the HUD and every future prompt
+// injection) is bounded and useful.
+
+// Sentence framing models habitually prepend to a label field.
+var LEADING_FILLER_RE = /^(?:it\s+is\s+currently|it's\s+currently|it\s+is|it's|currently|right\s+now|presently)\s+/i;
+var LABEL_PREFIX_RE = /^(?:the\s+)?(?:current\s+)?(?:weather|temperature|conditions|sky|air)\s+(?:is|are|remains?|feels?)\s+/i;
+
+/**
+ * normalizeLabel(value, maxWords, maxChars)
+ * Turns a chatty answer back into the compact label the field is supposed to be:
+ * strips the "It is currently..." / "The weather is..." framing, keeps only the
+ * first clause, and hard-caps the word count. The clause split deliberately only
+ * fires on sentence punctuation followed by whitespace/end, so a decimal reading
+ * like "18.5°C" is never cut at its own decimal point.
+ */
+function normalizeLabel(value, maxWords, maxChars) {
+    var s = cleanScalarField(value, maxChars);
+    if (!s) return null;
+    s = s.replace(/\s+/g, " ").trim();
+    s = s.replace(LEADING_FILLER_RE, "").replace(LABEL_PREFIX_RE, "").trim();
+    s = s.split(/[.;](?=\s|$)/)[0].trim();          // first sentence/clause only
+    s = s.split(/\s+[–—-]\s+/)[0].trim();           // drop " - trailing elaboration"
+    var words = s.split(/\s+/);
+    if (words.length > maxWords) s = words.slice(0, maxWords).join(" ");
+    s = s.replace(/[,;:\s]+$/, "").trim();
+    if (!s) return null;
+    return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// Character states that convey nothing. "present" is the one models reach for
+// most — every character in the list is present by definition, so it's pure
+// filler — but the bare postures are just as useless in the HUD.
+var FILLER_STATE_RE = /^(?:present|here|there|nearby|around|in\s+the\s+(?:scene|room|area)|on\s+scene|on-scene|unknown|unspecified|n\/?a|none|idle|active|standing|sitting|waiting|-+|\.+|\?+)$/i;
+
+function isFillerState(s) {
+    if (!s || typeof s !== "string") return true;
+    return FILLER_STATE_RE.test(s.trim().replace(/[.!,]+$/, ""));
+}
+
+export function applySceneResponse(data, previousCharacters) {
     if (!data) return null;
 
     var patch = {};
+
+    // Previously-known GOOD states, so a lazy "present" this tick can't erase a
+    // real one we already had for that character (see isFillerState).
+    var prevStateByName = {};
+    if (Array.isArray(previousCharacters)) {
+        previousCharacters.forEach(function (c) {
+            if (c && typeof c.name === "string" && c.name.trim() && !isFillerState(c.state)) {
+                prevStateByName[c.name.trim().toLowerCase()] = c.state;
+            }
+        });
+    }
 
     // Deliberately absent: patch.time, patch.date. Do not add them here —
     // see file header for why.
@@ -299,9 +378,10 @@ export function applySceneResponse(data) {
     if (city && city !== "Unknown") patch.city = city;
     var country = cleanScalarField(data.country, 120);
     if (country && country !== "Unknown") patch.country = country;
-    var temperature = cleanScalarField(data.temperature, 60);
+    // Labels, not sentences — see normalizeLabel.
+    var temperature = normalizeLabel(data.temperature, 4, 60);
     if (temperature) patch.temperature = temperature;
-    var weather = cleanScalarField(data.weather, 120);
+    var weather = normalizeLabel(data.weather, 6, 120);
     if (weather) patch.weather = weather;
     // Characters are validated per-entry, never passed through raw: a malformed
     // array (bare name strings, entries missing `name`) previously went straight
@@ -310,14 +390,21 @@ export function applySceneResponse(data) {
     if (Array.isArray(data.characters)) {
         var characters = data.characters
             .map(function (c) {
-                if (typeof c === "string" && c.trim()) return { name: cleanScalarField(c, 100), state: "present" };
-                if (c && typeof c === "object" && typeof c.name === "string" && c.name.trim()) {
-                    return {
-                        name: cleanScalarField(c.name, 100),
-                        state: cleanScalarField(c.state, 300) || "present",
-                    };
+                var name = null, state = null;
+                if (typeof c === "string" && c.trim()) {
+                    name = cleanScalarField(c, 100);
+                } else if (c && typeof c === "object" && typeof c.name === "string" && c.name.trim()) {
+                    name = cleanScalarField(c.name, 100);
+                    state = cleanScalarField(c.state, 300);
                 }
-                return null;
+                if (!name) return null;
+                // A placeholder state ("present", a bare posture) must not overwrite a
+                // real one we already had for this character — carry the old one forward
+                // instead. Only when there's no better option does "present" survive.
+                if (isFillerState(state)) {
+                    state = prevStateByName[name.toLowerCase()] || state || "present";
+                }
+                return { name: name, state: state };
             })
             .filter(function (c) { return c && c.name; });
         if (characters.length > 0) patch.characters = characters;

@@ -13,6 +13,8 @@
  * ---------------------------------------------------------------------------
  */
 
+import { SHARED_OUTPUT_RULES } from "./WorldAgent.js";
+
 export var VALID_TYPES = ["romance", "friendship", "family", "alliance", "rivalry", "hostile", "mentor", "neutral"];
 
 /**
@@ -53,30 +55,29 @@ export function capRelationshipSummary(text, maxChars) {
 export function buildRelationshipPrompt(input) {
     input = input || {};
     return (
-        "[OOC: You are a Relationship Dynamics Tracker for a roleplay narrative. Analyze the recent chat and extract character relationship data.\n\n" +
-        "CHARACTERS CURRENTLY IN SCENE:\n" + (input.sceneCharactersText || "Unknown.") + "\n\n" +
-        "HIGHLIGHTED RELATIONSHIPS (pairs involving someone in the current scene or recent chat — full detail, evolve these based on new evidence. The \u2192 shows 'from \u2192 to' but represents a MUTUAL relationship unless explicitly marked one-sided — see rule 4b below):\n" +
-        (input.highlightedRelationshipsText || "None yet.") + "\n\n" +
-        "OTHER TRACKED RELATIONSHIPS (background pairs not currently active — shown compactly to save space; these are ESTABLISHED FACTS, not up for you to re-derive. Do NOT rewrite or contradict one of these unless the recent chat directly involves that pair):\n" +
-        (input.backgroundRelationshipsText || "None.") + "\n\n" +
-        (input.charactersNeedingBioText ? ("CHARACTERS NEEDING A ONE-SENTENCE BIO (only these — everyone else already has one; skip any of these you don't have enough info on yet):\n" + input.charactersNeedingBioText + "\n\n") : "") +
-        (input.orphanCharactersText ? ("CHARACTERS WITH NO TRACKED RELATIONSHIP YET (double-check the recent chat carefully for ANY interaction involving these specific people — even one small moment is enough for a first entry; see rule 1b below):\n" + input.orphanCharactersText + "\n\n") : "") +
-        "RECENT CHAT HISTORY (LAST 15 MESSAGES — identify relationship interactions here):\n" + (input.recentChatText || "No messages yet.") + "\n\n" +
+        // ---- STABLE PREFIX: identical every tick (see WorldAgent's PROMPT LAYOUT) ----
+        "[OOC: You are a Relationship Dynamics Tracker for a roleplay narrative. Analyze the recent chat and extract character relationship data, working from the CURRENT DATA section at the end of this message.\n\n" +
         "Instructions:\n" +
         "1. Identify all meaningful relationships between named characters evidenced in the recent chat.\n" +
-        "1b. If a CHARACTERS WITH NO TRACKED RELATIONSHIP list is present above, give those names extra scrutiny — check specifically whether the recent chat shows them interacting with, being addressed by, or being affected by anyone, even briefly. That's enough evidence for a first entry. This is a closer look, not a lower bar: still don't invent one if the text genuinely gives nothing to go on for that character yet.\n" +
+        "1b. If a CHARACTERS WITH NO TRACKED RELATIONSHIP list is present in CURRENT DATA, give those names extra scrutiny — check specifically whether the recent chat shows them interacting with, being addressed by, or being affected by anyone, even briefly. That's enough evidence for a first entry. This is a closer look, not a lower bar: still don't invent one if the text genuinely gives nothing to go on for that character yet.\n" +
         "2. For each pair that interacts or is referenced, determine the relationship type and current emotional strength.\n" +
         "3. If a relationship already exists in HIGHLIGHTED RELATIONSHIPS, UPDATE its strength and summary based on new evidence. The tool automatically snapshots the PREVIOUS summary into a separate history log before you overwrite it — that history log is where evolution over time actually lives, so you never need to preserve old wording in 'summary' itself. Build the new 'summary' FROM the existing one, but COMPRESS as you go: drop whatever is no longer the most important thing about this pair, and replace it with what matters now, rather than appending a new clause on top of the old ones every tick. If nothing meaningful changed, return the summary essentially as-is rather than padding it.\n" +
         "4. Only include pairs with meaningful narrative evidence. Do NOT invent connections not shown in the text, and do NOT re-list an OTHER TRACKED RELATIONSHIP pair just to restate it unchanged — leave those alone entirely unless the chat gives new evidence about that specific pair.\n" +
-        "4a. It is normal, and expected, for most possible PAIRS among the characters listed above to have NO entry at all. Being in the same scene, being mentioned in the same breath, or simply being aware of each other is NOT evidence of a relationship on its own — real people share space with countless others they have no particular relationship with, and these characters should too. Do NOT manufacture a 'neutral'/0.0 placeholder just so a pair has SOME entry.\n" +
+        "4a. It is normal, and expected, for most possible PAIRS among the characters listed in CURRENT DATA to have NO entry at all. Being in the same scene, being mentioned in the same breath, or simply being aware of each other is NOT evidence of a relationship on its own — real people share space with countless others they have no particular relationship with, and these characters should too. Do NOT manufacture a 'neutral'/0.0 placeholder just so a pair has SOME entry.\n" +
         "    This is about not connecting every character to every OTHER character — it is NOT permission to leave an active character with zero relationships tracked anywhere. Anyone who's an actual participant in the story (not a nameless one-line extra) has SOME relationship to SOMEONE — usually whoever they've actually spoken to, traveled with, opposed, or been affected by. Make sure every such character has at least one entry, even if it's their only one. Only output an entry — including a 'neutral' one — when the text has actually shown something specific about how the two people in THAT PAIR regard each other (warmth, tension, history, an explicit moment of indifference, etc); the fix for an under-connected character is finding the ONE pair the text actually supports, not inventing several.\n" +
         "4b. DIRECTIONALITY: 'from' and 'to' can represent a ONE-WAY feeling ('from's stance toward 'to'), not necessarily a mutual one. Almost all relationships are mutual — for those, output just ONE entry per pair and describe the shared dynamic (it doesn't matter which name you put in 'from' vs 'to'). Only output TWO separate entries for the same pair (A→B and B→A) when the story has made their feelings clearly ASYMMETRIC — e.g. unrequited attraction, one-sided resentment, a betrayal only one of them knows about. Each entry's 'summary' in that case should describe ONLY that one character's side, not both.\n" +
         "5. 'strength' is a decimal from -1.0 (completely hostile/broken) to 1.0 (deeply bonded/loving). 0.0 = neutral.\n" +
         "6. 'type' must be exactly one of: " + VALID_TYPES.join(", ") + ".\n" +
         "7. 'change' should be a single concise sentence describing what CHANGED, or 'Stable' if unchanged. This is the ONLY field that should narrate evolution — 'summary' never needs to say how things got this way, only where they stand now.\n" +
-        "7b. KEEP 'summary' SHORT — a single clause or short sentence, well under 20 words, describing their current dynamic in plain terms. It is NOT a running log of everything that's ever happened between them, and it should not grow longer tick over tick — think of it as a label you're relabeling, not a paragraph you're extending. If it's starting to read like more than one sentence, compress it rather than adding more.\n" +
+        "7b. KEEP 'summary' SHORT — a single clause describing their current dynamic in plain terms, 20 words MAXIMUM. It is NOT a running log of everything that's ever happened between them, and it must not grow longer tick over tick — think of it as a label you're relabeling, not a paragraph you're extending. If it reads like more than one sentence, compress it rather than adding more.\n" +
+        "   BAD: \"Ever since the night at the harbor, when everything they thought they knew about each other came undone, the two of them have circled one another with a wary, wounded sort of tenderness that neither will name aloud\"  <- prose, far over the limit\n" +
+        "   BAD: \"They know each other.\" / \"Neutral.\"  <- says nothing specific\n" +
+        "   GOOD: \"Wary allies since the ambush; trust not fully rebuilt\"\n" +
+        "   GOOD: \"Openly hostile after the betrayal at the docks\"\n" +
+        "   ('change' is the one field where a bare \"Stable\" IS the correct answer when nothing shifted — see rule 7.)\n" +
         "8. Always use the exact character names as they appear in the chat (case-sensitive).\n" +
-        "9. If asked for bios above, keep each to one plain sentence — who they are, not their relationship to anyone. Omit the field entirely for anyone you don't have enough information on.\n\n" +
+        "9. If asked for bios in CURRENT DATA, keep each to one plain sentence — who they are, not their relationship to anyone. Omit the field entirely for anyone you don't have enough information on.\n\n" +
+        SHARED_OUTPUT_RULES + "\n" +
         "Respond ONLY with valid JSON (no markdown, no preamble):\n" +
         "{\n" +
         "  \"relationships\": [\n" +
@@ -86,6 +87,17 @@ export function buildRelationshipPrompt(input) {
         "    { \"name\": \"CharA\", \"bio\": \"One plain sentence establishing who this character is.\" }\n" +
         "  ]\n" +
         "}\n" +
+        // ---- VOLATILE SUFFIX: everything below changes tick to tick ----
+        "\n=== CURRENT DATA ===\n\n" +
+        "CHARACTERS CURRENTLY IN SCENE:\n" + (input.sceneCharactersText || "Unknown.") + "\n\n" +
+        "HIGHLIGHTED RELATIONSHIPS (pairs involving someone in the current scene or recent chat — full detail, evolve these based on new evidence. The \u2192 shows 'from \u2192 to' but represents a MUTUAL relationship unless explicitly marked one-sided — see rule 4b above):\n" +
+        (input.highlightedRelationshipsText || "None yet.") + "\n\n" +
+        "OTHER TRACKED RELATIONSHIPS (background pairs not currently active — shown compactly to save space; these are ESTABLISHED FACTS, not up for you to re-derive. Do NOT rewrite or contradict one of these unless the recent chat directly involves that pair):\n" +
+        (input.backgroundRelationshipsText || "None.") + "\n\n" +
+        (input.charactersNeedingBioText ? ("CHARACTERS NEEDING A ONE-SENTENCE BIO (only these — everyone else already has one; skip any of these you don't have enough info on yet):\n" + input.charactersNeedingBioText + "\n\n") : "") +
+        (input.orphanCharactersText ? ("CHARACTERS WITH NO TRACKED RELATIONSHIP YET (double-check the recent chat carefully for ANY interaction involving these specific people — even one small moment is enough for a first entry; see rule 1b above):\n" + input.orphanCharactersText + "\n\n") : "") +
+        "RECENT CHAT HISTORY (LAST 15 MESSAGES — identify relationship interactions here):\n" + (input.recentChatText || "No messages yet.") + "\n\n" +
+        "Now produce the JSON object described above for this CURRENT DATA. Obey every stated word limit, and never emit a filler value \u2014 omit the entry instead.\n" +
         "]"
     );
 }

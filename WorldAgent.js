@@ -38,6 +38,61 @@
 import { formatTimeForPrompt } from "./TimelineEngine.js";
 
 // =============================================================================
+// SHARED PROMPT VOCABULARY — spliced into every tracker's prompt, including
+// SceneAgent's and RelationshipAgent's (this module is already the common home
+// for cross-tracker prompt text; see LORE_DIGEST_GUIDE further down, which
+// SceneAgent imports for its genesis ask).
+//
+// WHY THIS EXISTS: every tracker's output is STRUCTURED DATA that gets rendered
+// into a compact HUD and re-injected into later prompts — it is not prose for a
+// reader. A reasoning model infers that from the JSON schema on its own; a fast
+// or thinking-disabled model (Flash-class, GLM with thinking off) does not, and
+// drifts toward two specific failures:
+//   1. padding a short LABEL field into a full sentence ("weather": "The sky is
+//      overcast and a light drizzle has begun to fall over the harbor")
+//   2. filling a field it can't confidently answer with a placeholder —
+//      "present", "unknown", "same as before" — instead of a real value
+// Both are closed by stating the ban explicitly AND showing a rejected example
+// beside a good one: non-reasoning models pattern-match off concrete examples
+// far more reliably than off adjectives like "concise" or "specific".
+// =============================================================================
+// =============================================================================
+// PROMPT LAYOUT — why every builder puts its rules FIRST and its data LAST
+//
+// Providers that cache prompts (OpenAI's automatic caching, DeepSeek, Google)
+// match on the longest IDENTICAL PREFIX between calls. These prompts used to
+// open with the live clock ("It is now 14:32 03/07/2026..."), which meant the
+// shared prefix between two consecutive ticks ended after ~150 characters and
+// the multi-thousand-token rule block that follows it — byte-identical every
+// single tick — was re-billed at full price forever.
+//
+// So the layout is now, in order:
+//   1. role line + numbered rules + SHARED_OUTPUT_RULES + JSON schema/examples
+//      -> completely static for a given tier; this is the cacheable prefix
+//   2. "=== CURRENT DATA ===" and everything volatile (clock, NPC states,
+//      chat slice, lore, pending events)
+//   3. one short closing instruction
+// Same tokens sent either way — only the order changed — but the static half
+// is now a stable prefix instead of being stranded behind the first volatile
+// character. Providers without prefix caching are unaffected either way.
+//
+// Two consequences to preserve when editing any builder:
+//   - Rules must refer to data as "in CURRENT DATA", never "above"; data
+//     sections must refer to rules as "above", never "below".
+//   - The closing line after the data restates the critical constraints. That
+//     is deliberate: instructions immediately before generation are followed
+//     more reliably by weak models, which is exactly what the rest of these
+//     prompts are tuned for. Do not delete it to save tokens.
+// =============================================================================
+export var SHARED_OUTPUT_RULES =
+    "OUTPUT DISCIPLINE (applies to EVERY field below):\n" +
+    "- You are filling in a compact status panel, not writing prose. Plain and factual. No atmosphere, no metaphors, no flourishes.\n" +
+    "- Obey every stated length limit. A field with a word limit is a LABEL — exceeding it is an error, not extra helpfulness.\n" +
+    "- NEVER write a filler or placeholder value: \"present\", \"here\", \"nearby\", \"unknown\", \"N/A\", \"same as before\", \"nothing\", \"TBD\", \"-\", \"...\". Either give the real answer, or omit that entry entirely. An omitted entry is always better than a placeholder one. (The only exceptions are values a specific rule below explicitly permits.)\n" +
+    "- Never invent detail to fill space. Fewer accurate entries beat padded ones.\n" +
+    "- Reply with ONE valid JSON object and nothing else: no markdown fences, no preamble, no commentary, no trailing notes. Use exactly the keys shown.\n";
+
+// =============================================================================
 // SHARED UTILITIES (ported from the pre-rewrite index.js, made pure/testable)
 // =============================================================================
 
@@ -866,7 +921,37 @@ export function buildNpcTickPrompt(input) {
     var isBatch = !!input.isBatch;
 
     return (
-        "[OOC: You are the NPC Offscreen Behavior tracker. You extract/extend background NPC activity — you do NOT continue or advance the current onscreen scene. " +
+        // ---- STABLE PREFIX: byte-identical on every npc tick (see PROMPT LAYOUT) ----
+        "[OOC: You are the NPC Offscreen Behavior tracker. You extract/extend background NPC activity — you do NOT continue or advance the current onscreen scene. Everything you report is based on the CURRENT DATA section at the end of this message.\n\n" +
+        "Rules:\n" +
+        "1. Do NOT write dialogue or narrate the active scene, and do NOT continue/advance/resolve whatever plot thread is currently playing out onscreen. This is background noise happening in parallel, elsewhere.\n" +
+        "2. Every 'change' should feel like a natural continuation of the NPC's last interaction, not a random new activity or a leap forward in the plot.\n" +
+        "3. Do NOT invent brand-new named NPCs, factions, or locations that have no basis in the states/chat in CURRENT DATA — extend what already exists.\n" +
+        "4. If ESTABLISHED CHARACTER CARD LORE is provided in CURRENT DATA, treat it as ground truth for that character's personality, background, and affiliations — do not write behavior that contradicts it.\n" +
+        "5. Give an update for MOST tracked, currently-offscreen NPCs — even a small, mundane continuation of their last known activity counts as a valid update and is preferred over saying nothing (e.g. \"still tending the shop, restocking shelves\", \"continues traveling toward the outpost, another day closer\"). This is the SAME NPC's entry continuing to evolve, not a new one — do not invent a fresh unrelated activity just to have something to say, extend what they were already doing. Only skip an NPC, or return fewer updates than listed, when there truly is no plausible continuation at all (e.g. an NPC whose last known state already resolved and nothing new applies). An empty list should be the rare exception, not the default — reserve it for when there are genuinely no tracked, offscreen NPCs worth reporting on this tick.\n" +
+        "6. Do not include a time or date field — it is not needed here.\n" +
+        "7. OPTIONAL — SCHEDULED/DELAYED ACTIONS: if an NPC sets off on something that realistically takes time to play out (a journey, a stakeout, waiting on a reply), you MAY add \"duration_minutes\" (integer minutes until it completes, measured from THIS tick's current time given in CURRENT DATA) and \"resolution\" (one sentence describing what that NPC has done/become once it completes). Only use this when the action genuinely spans meaningful time — omit both fields for anything already resolved this tick.\n" +
+        "8. For NPCs in the MENTIONED BY NAME ONLY section of CURRENT DATA: give a short, LOW-KEY state that a reasonable person would infer from the current time of day and that NPC's last known state/role (e.g. likely asleep at this hour, likely still at their usual post, likely still en route) — a plausible guess, not a new plot beat. Do not escalate, complicate, or introduce anything not already implied by what's established. Skip an NPC here entirely if there isn't enough established info (role, last known state, lore) to make a reasonable guess — inventing one from nothing is worse than omitting it.\n" +
+        "9. OPTIONAL — GOAL: for an NPC listed under NPCs THAT COULD USE A ONE-SENTENCE GOAL in CURRENT DATA (and ONLY those), you MAY add a \"goal\" field — one short sentence naming something concrete they're working toward, grounded in what's already established (their role, lore, recent activity). This is set ONCE and never revisited, so only include it if there's real evidence to base it on; skip it rather than invent a generic one. NEVER add \"goal\" for any NPC not in that list — they either already have one or there isn't enough established about them yet.\n" +
+        "10. OPTIONAL — DAILY ROUTINE: for an NPC listed under NPCs THAT COULD USE A DAILY ROUTINE in CURRENT DATA (and ONLY those), you MAY add a \"routine\" field — 2 to 5 entries of {\"time\":\"HH:MM\",\"activity\":\"...\"} describing an ordinary repeating day grounded in their established role (a blacksmith opens the forge, a guard walks a shift — nothing plot-driven). Each activity should be a short phrase naming where they are / what they do from that hour onward. Like goals, a routine is set ONCE and never revisited — skip an NPC rather than invent a routine their role doesn't support, and NEVER add one for a name not in that list.\n" +
+        "11. RESPECT ESTABLISHED ROUTINES: where a tracked NPC's state in CURRENT DATA shows a [daily routine: ...], their offscreen 'change' should normally be consistent with what that routine says they're doing at the current hour — deviate only when something already established plausibly pulls them away, and say so in the 'change' text.\n" +
+        "12. 'change' FORMAT — one short phrase, 3 to 15 words, naming a CONCRETE activity (and where, if it matters). It is a status line, not a paragraph, and never a non-answer:\n" +
+        "   BAD: \"unchanged\" / \"nothing new\" / \"same as before\" / \"still around\" / \"continues as usual\"  <- says nothing; drop the NPC instead\n" +
+        "   BAD: \"Balthor, ever the stoic craftsman, labors on beneath the amber glow of his forge, lost in thought about the road north\"  <- prose, far too long\n" +
+        "   GOOD: \"hammering out horseshoes at the forge\"\n" +
+        "   GOOD: \"riding north toward the outpost, roughly half a day out\"\n" +
+        "   If the honest answer for an NPC is \"nothing worth reporting\", leave that NPC out of the array entirely — that is the correct move, not a filler entry.\n\n" +
+        SHARED_OUTPUT_RULES + "\n" +
+        "Respond ONLY with valid JSON (an empty array is a valid, often correct, response):\n" +
+        "{\"npc_updates\":[{\"name\":\"NPC name\",\"change\":\"what they are doing offscreen\"}]}\n" +
+        "Example of a SCHEDULED NPC action (only include duration_minutes/resolution when genuinely applicable):\n" +
+        "{\"npc_updates\":[{\"name\":\"Captain Reyes\",\"change\":\"sets out toward the northern outpost to investigate the reports\",\"duration_minutes\":360,\"resolution\":\"Captain Reyes reaches the northern outpost and confirms the reports were accurate.\"}]}\n" +
+        "Example of a NEW goal (only for a name listed under NPCs THAT COULD USE A ONE-SENTENCE GOAL):\n" +
+        "{\"npc_updates\":[{\"name\":\"Mira\",\"change\":\"still tending the shop, restocking shelves\",\"goal\":\"saving up enough coin for passage north before winter closes the roads\"}]}\n" +
+        "Example of a NEW daily routine (only for a name listed under NPCs THAT COULD USE A DAILY ROUTINE):\n" +
+        "{\"npc_updates\":[{\"name\":\"Balthor\",\"change\":\"hammering out a batch of horseshoes\",\"routine\":[{\"time\":\"07:00\",\"activity\":\"opens the forge and stokes the fires\"},{\"time\":\"13:00\",\"activity\":\"breaks for a meal at the tavern\"},{\"time\":\"14:00\",\"activity\":\"back at the forge taking commissions\"},{\"time\":\"19:00\",\"activity\":\"closes up and heads home\"}]}]}\n\n" +
+        // ---- VOLATILE SUFFIX: everything below changes tick to tick ----
+        "=== CURRENT DATA ===\n\n" +
         (isBatch
             ? "A gap of in-story time has passed (" + formatTimeForPrompt(input.currentTime) + " " + input.currentDate + " is now current). Describe what tracked NPCs did ACROSS THE WHOLE GAP, as one continuous arc — do not repeat the same action, show progression."
             : "It is now " + formatTimeForPrompt(input.currentTime) + " " + input.currentDate + " (fixed by the Timeline system, not by you). Describe what tracked NPCs are doing offscreen right now.") +
@@ -891,33 +976,14 @@ export function buildNpcTickPrompt(input) {
             ? ("RECENT WORLD-LEVEL DEVELOPMENTS (established facts from the faction/plot tier — background awareness only, so an NPC's offscreen activity can stay consistent with them; do NOT re-narrate one of these as an NPC action, and do NOT invent new plot consequences from them yourself):\n" + input.recentWorldEventsText + "\n\n")
             : "") +
         (input.npcsNeedingGoalText
-            ? ("NPCs THAT COULD USE A ONE-SENTENCE GOAL (see rule 9 below — ONLY these names, and only if you have enough grounded info; every other tracked NPC already has one or doesn't need one yet):\n" + input.npcsNeedingGoalText + "\n\n")
+            ? ("NPCs THAT COULD USE A ONE-SENTENCE GOAL (see rule 9 above — ONLY these names, and only if you have enough grounded info; every other tracked NPC already has one or doesn't need one yet):\n" + input.npcsNeedingGoalText + "\n\n")
             : "") +
         (input.npcsNeedingRoutineText
-            ? ("NPCs THAT COULD USE A DAILY ROUTINE (see rule 10 below — ONLY these names, and only where their role makes a regular day plausible; every other tracked NPC already has one or doesn't need one):\n" + input.npcsNeedingRoutineText + "\n\n")
+            ? ("NPCs THAT COULD USE A DAILY ROUTINE (see rule 10 above — ONLY these names, and only where their role makes a regular day plausible; every other tracked NPC already has one or doesn't need one):\n" + input.npcsNeedingRoutineText + "\n\n")
             : "") +
         "RECENT CHAT (for narrative context — do not narrate the onscreen scene, only offscreen NPC behavior):\n" +
         (input.recentChatText || "No messages yet.") + "\n\n" +
-        "Rules:\n" +
-        "1. Do NOT write dialogue or narrate the active scene, and do NOT continue/advance/resolve whatever plot thread is currently playing out onscreen. This is background noise happening in parallel, elsewhere.\n" +
-        "2. Every 'change' should feel like a natural continuation of the NPC's last interaction, not a random new activity or a leap forward in the plot.\n" +
-        "3. Do NOT invent brand-new named NPCs, factions, or locations that have no basis in the states/chat above — extend what already exists.\n" +
-        "4. If ESTABLISHED CHARACTER CARD LORE is provided above, treat it as ground truth for that character's personality, background, and affiliations — do not write behavior that contradicts it.\n" +
-        "5. Give an update for MOST tracked, currently-offscreen NPCs — even a small, mundane continuation of their last known activity counts as a valid update and is preferred over saying nothing (e.g. \"still tending the shop, restocking shelves\", \"continues traveling toward the outpost, another day closer\"). This is the SAME NPC's entry continuing to evolve, not a new one — do not invent a fresh unrelated activity just to have something to say, extend what they were already doing. Only skip an NPC, or return fewer updates than listed, when there truly is no plausible continuation at all (e.g. an NPC whose last known state already resolved and nothing new applies). An empty list should be the rare exception, not the default — reserve it for when there are genuinely no tracked, offscreen NPCs worth reporting on this tick.\n" +
-        "6. Do not include a time or date field — it is not needed here.\n" +
-        "7. OPTIONAL — SCHEDULED/DELAYED ACTIONS: if an NPC sets off on something that realistically takes time to play out (a journey, a stakeout, waiting on a reply), you MAY add \"duration_minutes\" (integer minutes until it completes, measured from THIS tick's current time above) and \"resolution\" (one sentence describing what that NPC has done/become once it completes). Only use this when the action genuinely spans meaningful time — omit both fields for anything already resolved this tick.\n" +
-        "8. For NPCs in the MENTIONED BY NAME ONLY section: give a short, LOW-KEY state that a reasonable person would infer from the current time of day and that NPC's last known state/role (e.g. likely asleep at this hour, likely still at their usual post, likely still en route) — a plausible guess, not a new plot beat. Do not escalate, complicate, or introduce anything not already implied by what's established. Skip an NPC here entirely if there isn't enough established info (role, last known state, lore) to make a reasonable guess — inventing one from nothing is worse than omitting it.\n" +
-        "9. OPTIONAL — GOAL: for an NPC listed under NPCs THAT COULD USE A ONE-SENTENCE GOAL above (and ONLY those), you MAY add a \"goal\" field — one short sentence naming something concrete they're working toward, grounded in what's already established (their role, lore, recent activity). This is set ONCE and never revisited, so only include it if there's real evidence to base it on; skip it rather than invent a generic one. NEVER add \"goal\" for any NPC not in that list — they either already have one or there isn't enough established about them yet.\n" +
-        "10. OPTIONAL — DAILY ROUTINE: for an NPC listed under NPCs THAT COULD USE A DAILY ROUTINE above (and ONLY those), you MAY add a \"routine\" field — 2 to 5 entries of {\"time\":\"HH:MM\",\"activity\":\"...\"} describing an ordinary repeating day grounded in their established role (a blacksmith opens the forge, a guard walks a shift — nothing plot-driven). Each activity should be a short phrase naming where they are / what they do from that hour onward. Like goals, a routine is set ONCE and never revisited — skip an NPC rather than invent a routine their role doesn't support, and NEVER add one for a name not in that list.\n" +
-        "11. RESPECT ESTABLISHED ROUTINES: where a tracked NPC's state above shows a [daily routine: ...], their offscreen 'change' should normally be consistent with what that routine says they're doing at the current hour — deviate only when something already established plausibly pulls them away, and say so in the 'change' text.\n\n" +
-        "Respond ONLY with valid JSON (an empty array is a valid, often correct, response):\n" +
-        "{\"npc_updates\":[{\"name\":\"NPC name\",\"change\":\"what they are doing offscreen\"}]}\n" +
-        "Example of a SCHEDULED NPC action (only include duration_minutes/resolution when genuinely applicable):\n" +
-        "{\"npc_updates\":[{\"name\":\"Captain Reyes\",\"change\":\"sets out toward the northern outpost to investigate the reports\",\"duration_minutes\":360,\"resolution\":\"Captain Reyes reaches the northern outpost and confirms the reports were accurate.\"}]}\n" +
-        "Example of a NEW goal (only for a name listed under NPCs THAT COULD USE A ONE-SENTENCE GOAL):\n" +
-        "{\"npc_updates\":[{\"name\":\"Mira\",\"change\":\"still tending the shop, restocking shelves\",\"goal\":\"saving up enough coin for passage north before winter closes the roads\"}]}\n" +
-        "Example of a NEW daily routine (only for a name listed under NPCs THAT COULD USE A DAILY ROUTINE):\n" +
-        "{\"npc_updates\":[{\"name\":\"Balthor\",\"change\":\"hammering out a batch of horseshoes\",\"routine\":[{\"time\":\"07:00\",\"activity\":\"opens the forge and stokes the fires\"},{\"time\":\"13:00\",\"activity\":\"breaks for a meal at the tavern\"},{\"time\":\"14:00\",\"activity\":\"back at the forge taking commissions\"},{\"time\":\"19:00\",\"activity\":\"closes up and heads home\"}]}]}\n" +
+        "Now produce the JSON object described above for this CURRENT DATA. Obey every stated word limit, and never emit a filler value — omit the entry instead.\n" +
         "]"
     );
 }
@@ -1009,9 +1075,14 @@ export function buildWeatherTickPrompt(input) {
         (input.recentChatText || "No messages yet.") + "\n\n" +
         "Rules:\n" +
         (isBatch
-            ? "1. One to two sentences, grounded and physically plausible given the previous trend — don't contradict it without reason.\n"
-            : "1. ONE short sentence, ideally under ~20 words — this is shown as a compact glanceable status line, not a paragraph. Grounded and physically plausible given the previous trend; don't contradict it without reason.\n") +
+            ? "1. One to two plain sentences, 35 words MAXIMUM total. Grounded and physically plausible given the previous trend — don't contradict it without reason.\n"
+            : "1. ONE plain sentence, 20 words MAXIMUM — this renders as a compact glanceable status line, not a paragraph. Grounded and physically plausible given the previous trend; don't contradict it without reason.\n") +
+        "   BAD: \"The heavens above the ancient capital churn with a restless, brooding malice, as if the very gods themselves were gathering their wrath over the storm-lashed spires\"  <- purple prose, way over the limit\n" +
+        "   BAD: \"Weather continues.\" / \"No significant change.\"  <- says nothing\n" +
+        "   GOOD: \"A coastal storm front is moving inland, expected to reach the capital by tomorrow.\"\n" +
+        "   GOOD: \"Dry autumn winds persist, with no rain forecast for several days.\"\n" +
         "2. Do not include a time or date field.\n\n" +
+        SHARED_OUTPUT_RULES + "\n" +
         "Respond ONLY with valid JSON:\n" +
         "{\"weather_trend\":\"A storm system is rolling in from the coast, expected to reach the capital within a day.\"}\n" +
         "]"
@@ -1060,7 +1131,33 @@ export function buildFactionTickPrompt(input) {
     }
 
     return (
-        "[OOC: You are the Faction & Plot Progression Agent. Simulate offscreen faction movements, plot developments, and background consequences.\n\n" +
+        // ---- STABLE PREFIX: identical every faction tick (see PROMPT LAYOUT) ----
+        "[OOC: You are the Faction & Plot Progression Agent. Simulate offscreen faction movements, plot developments, and background consequences, based on the CURRENT DATA section at the end of this message.\n\n" +
+        "Rules:\n" +
+        "1. Do NOT narrate the onscreen scene or speak as active characters, and do NOT resolve, escalate, or continue whatever plot thread is currently playing out onscreen. These are quiet, parallel developments happening elsewhere at the same time.\n" +
+        "1b. KEEP EACH \"event\" SHORT — ONE sentence, 20 words MAXIMUM. This renders as a compact, glanceable line in a HUD list, not a paragraph: state WHAT happened, not the full why/how. If it reads like two sentences or a run-on, cut it down. The same limit applies to \"resolution\" when you include one.\n" +
+        "   BAD: \"In the smoke-wreathed halls of the Ashen Compact, where old grudges are said to fester like untended wounds, the assembled captains argued long into the night over the fate of the northern trade routes\"  <- prose, three times the limit\n" +
+        "   BAD: \"Something happens somewhere.\" / \"Tensions continue.\"  <- too vague to be useful\n" +
+        "   GOOD: \"The Ashen Compact raises tolls on the northern trade routes.\"\n" +
+        "   GOOD: \"Flooding closes the river road south of Myrenveld for several days.\"\n" +
+        "2. Events do NOT have to be consequences of the onscreen characters' actions — that's one valid source, but not the only one. Anything already established in WORLD SUMMARY / PAST HISTORY / CHARACTER LORE is fair game to develop further on its own: a faction pursuing its own agenda, a region's situation progressing, a background rivalry playing out — none of it needs a thread back to what the player character(s) just did. The one hard requirement is GROUNDING: every event must connect to something already established in CURRENT DATA (a named faction, place, conflict, or figure from the world summary/history/lore), never to something invented wholesale. The goal is a world that feels like it's moving on its own around the characters, not a world that only reacts to them.\n" +
+        "3. Do NOT invent brand-new named characters, factions, or locations with no basis in the context provided. If nothing established gives you a thread to extend, keep the event small/vague (e.g. general unrest, routine movement) rather than fabricating a new named entity.\n" +
+        "4. If ESTABLISHED CHARACTER CARD LORE is provided in CURRENT DATA, treat it as ground truth — do not contradict a character's established background, affiliations, or the setting it implies.\n" +
+        "5. REALISTIC PACING: news/messengers travel at realistic speed — do not compress time.\n" +
+        "6. NO CHRONOLOGICAL COMPRESSION: parallel offscreen developments, not sequential steps of one action chain.\n" +
+        (isBatch ? "7. Cover EACH interval listed under TIME GAP TO COVER in CURRENT DATA at least once (a quiet interval is fine — use a low-importance event, or explicitly note nothing significant happened).\n" : "") +
+        "8. It is CORRECT and EXPECTED to return an empty \"events\" array (and/or empty \"pending_reveals\") if nothing meaningful/grounded is plausible right now — do not fabricate events just to fill the response.\n" +
+        "9. OPTIONAL — SCHEDULED/DELAYED EVENTS: if an event describes an action whose outcome realistically takes time to arrive (a messenger traveling, a ship sailing, an investigation being carried out), you MAY add \"duration_minutes\" (integer minutes until it completes) and \"resolution\" (one sentence describing what becomes known/happens once it completes). Only use this for events that genuinely have a meaningful delay — omit both fields for anything already complete or effectively instant.\n" +
+        "9b. Do NOT invent a new event that's really the same thing as something already listed under PENDING SCHEDULED EVENTS in CURRENT DATA, and do NOT jump ahead and narrate one of those as already resolved/arrived before its due time — the system handles that resolution automatically, exactly at the right moment, whether or not you mention it. It's fine to build a NEW, related development around an existing pending one (e.g. tension rising WHILE the messenger is still en route) as long as you don't resolve it early yourself.\n" +
+        "10. AMBIENT WORLD TEXTURE is a normal, welcome category of event, not just a last-resort filler for empty ticks — ordinary background continuing (a market opening, a patrol rotating through, a minor rumor circulating, a distant region's weather/harvest/festival) purely to keep the world feeling lived-in and populated beyond the immediate plot. Mix these in alongside plot-adjacent events rather than only reaching for them when nothing else fits. Still follow rule 3 (no new named characters/factions/locations) and must not advance or resolve the onscreen plot. This doesn't override rule 8 — a genuinely empty array is still correct whenever even ambient texture feels forced.\n" +
+        "\n" +
+        SHARED_OUTPUT_RULES + "\n" +
+        "Respond ONLY with valid JSON (an empty events array is a valid, often correct, response):\n" +
+        "{\"events\":[" + schemaEventLine + "],\"pending_reveals\":[\"A secret or rumor connected to recent events, not yet known to the main characters\"]}\n" +
+        "Example of a SCHEDULED event (only include duration_minutes/resolution when genuinely applicable):\n" +
+        "{\"event\":\"A messenger departs the capital for the border garrison.\",\"importance\":6,\"duration_minutes\":240,\"resolution\":\"The messenger reaches the garrison and delivers the sealed orders.\"}\n\n" +
+        // ---- VOLATILE SUFFIX: everything below changes tick to tick ----
+        "=== CURRENT DATA ===\n\n" +
         intervalBlock +
         "CURRENT SCENE DETAILS:\n" +
         "- Current Location: " + (input.currentLocation || "Unknown") + "\n" +
@@ -1078,26 +1175,9 @@ export function buildFactionTickPrompt(input) {
             ? ("ESTABLISHED RELATIONSHIPS (tracked separately by the relationship system — established facts about how these characters feel about each other, NOT up for you to re-derive, contradict, or develop further. Offscreen faction/plot developments involving these people must stay consistent with these dynamics — allies act like allies, rivals like rivals — and an event may plausibly grow OUT of a strong bond or grudge, but do NOT restate these lines or narrate the feelings themselves; the relationship system tracks that evolution on its own. A → arrow marks a ONE-SIDED feeling: the other party doesn't necessarily know or share it, and no development may have them act as if they do):\n" + input.relationshipsText + "\n\n")
             : "") +
         "PAST HISTORY TIMELINE:\n" + (input.historyTimelineText || "No history yet.") + "\n\n" +
-        "RECENT CHAT (additional grounding and tone — not the only valid source for an event; see rule 2 below):\n" +
+        "RECENT CHAT (additional grounding and tone — not the only valid source for an event; see rule 2 above):\n" +
         (input.recentChatText || "No messages yet.") + "\n\n" +
-        "Rules:\n" +
-        "1. Do NOT narrate the onscreen scene or speak as active characters, and do NOT resolve, escalate, or continue whatever plot thread is currently playing out onscreen. These are quiet, parallel developments happening elsewhere at the same time.\n" +
-        "1b. KEEP EACH \"event\" SHORT — ONE sentence, ideally under ~20 words. This is shown as a compact, glanceable line in a HUD list, not a paragraph: state WHAT happened, not the full why/how. If it's starting to read like two sentences or a run-on, cut it down. The same limit applies to \"resolution\" when you include one.\n" +
-        "2. Events do NOT have to be consequences of the onscreen characters' actions — that's one valid source, but not the only one. Anything already established in WORLD SUMMARY / PAST HISTORY / CHARACTER LORE is fair game to develop further on its own: a faction pursuing its own agenda, a region's situation progressing, a background rivalry playing out — none of it needs a thread back to what the player character(s) just did. The one hard requirement is GROUNDING: every event must connect to something already established somewhere above (a named faction, place, conflict, or figure from the world summary/history/lore), never to something invented wholesale. The goal is a world that feels like it's moving on its own around the characters, not a world that only reacts to them.\n" +
-        "3. Do NOT invent brand-new named characters, factions, or locations with no basis in the context provided. If nothing established gives you a thread to extend, keep the event small/vague (e.g. general unrest, routine movement) rather than fabricating a new named entity.\n" +
-        "4. If ESTABLISHED CHARACTER CARD LORE is provided above, treat it as ground truth — do not contradict a character's established background, affiliations, or the setting it implies.\n" +
-        "5. REALISTIC PACING: news/messengers travel at realistic speed — do not compress time.\n" +
-        "6. NO CHRONOLOGICAL COMPRESSION: parallel offscreen developments, not sequential steps of one action chain.\n" +
-        (isBatch ? "7. Cover EACH interval listed above at least once (a quiet interval is fine — use a low-importance event, or explicitly note nothing significant happened).\n" : "") +
-        "8. It is CORRECT and EXPECTED to return an empty \"events\" array (and/or empty \"pending_reveals\") if nothing meaningful/grounded is plausible right now — do not fabricate events just to fill the response.\n" +
-        "9. OPTIONAL — SCHEDULED/DELAYED EVENTS: if an event describes an action whose outcome realistically takes time to arrive (a messenger traveling, a ship sailing, an investigation being carried out), you MAY add \"duration_minutes\" (integer minutes until it completes) and \"resolution\" (one sentence describing what becomes known/happens once it completes). Only use this for events that genuinely have a meaningful delay — omit both fields for anything already complete or effectively instant.\n" +
-        "9b. Do NOT invent a new event that's really the same thing as something already listed in PENDING SCHEDULED EVENTS above, and do NOT jump ahead and narrate one of those as already resolved/arrived before its due time — the system handles that resolution automatically, exactly at the right moment, whether or not you mention it. It's fine to build a NEW, related development around an existing pending one (e.g. tension rising WHILE the messenger is still en route) as long as you don't resolve it early yourself.\n" +
-        "10. AMBIENT WORLD TEXTURE is a normal, welcome category of event, not just a last-resort filler for empty ticks — ordinary background continuing (a market opening, a patrol rotating through, a minor rumor circulating, a distant region's weather/harvest/festival) purely to keep the world feeling lived-in and populated beyond the immediate plot. Mix these in alongside plot-adjacent events rather than only reaching for them when nothing else fits. Still follow rule 3 (no new named characters/factions/locations) and must not advance or resolve the onscreen plot. This doesn't override rule 8 — a genuinely empty array is still correct whenever even ambient texture feels forced.\n" +
-        "\n" +
-        "Respond ONLY with valid JSON (an empty events array is a valid, often correct, response):\n" +
-        "{\"events\":[" + schemaEventLine + "],\"pending_reveals\":[\"A secret or rumor connected to recent events, not yet known to the main characters\"]}\n" +
-        "Example of a SCHEDULED event (only include duration_minutes/resolution when genuinely applicable):\n" +
-        "{\"event\":\"A messenger departs the capital for the border garrison.\",\"importance\":6,\"duration_minutes\":240,\"resolution\":\"The messenger reaches the garrison and delivers the sealed orders.\"}\n" +
+        "Now produce the JSON object described above for this CURRENT DATA. Obey every stated word limit, and never emit a filler value — omit the entry instead.\n" +
         "]"
     );
 }
@@ -1185,7 +1265,10 @@ export function buildWorldTickPrompt(input) {
         "1. This should be a SYNTHESIS, not a raw log — condense, don't just append. The RECENT FACTION/PLOT EVENTS above are already shown to the player as their own separate list, so do NOT restate one of those lines again here in similar wording — that reads as the same information twice. Instead, step back a level: what do these events, together with everything else above, now mean for the overall state of things (a rising tension, a shifting balance of power, a mood taking hold)? Reference specific story elements, but describe their CUMULATIVE EFFECT, not the events themselves.\n" +
         "2. Keep it grounded, chronicle-like. Avoid flowery language.\n" +
         "3. Do not include a time or date field.\n" +
-        "4. BE BRIEF. This is a short snapshot, not a chronicle entry — 2 to 3 sentences, roughly 40-60 words total. Say only what matters most right now; cut anything that isn't essential to understanding the current state of the world.\n\n" +
+        "4. BE BRIEF. This is a short snapshot, not a chronicle entry — 2 to 3 sentences, 60 words MAXIMUM. Say only what matters most right now; cut anything not essential to understanding the current state of the world.\n" +
+        "   BAD: \"Across the storm-wracked reaches of the realm, where ancient enmities smoulder like banked coals beneath a fragile peace, the great powers circle one another warily, each waiting for the other to blink first, while common folk go about their lives unaware of the gathering dark...\"  <- flowery, over the limit, says little\n" +
+        "   GOOD: \"The ceasefire is holding, but the Compact's new tolls have soured the northern towns. Grain is short after the floods, and two border garrisons have quietly doubled their watch.\"\n\n" +
+        SHARED_OUTPUT_RULES + "\n" +
         "Respond ONLY with valid JSON:\n" +
         "{\"summary\":\"A short (2-3 sentence) snapshot of the overall world state.\"}\n" +
         "]"

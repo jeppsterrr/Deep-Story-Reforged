@@ -1023,7 +1023,9 @@ export async function doLLMUpdate(timeAnchor) {
         weather: Store.storyData.weather, temperature: Store.storyData.temperature,
     };
 
-    var patch = Store.SceneAgent.applySceneResponse(data);
+    // prevScene.characters lets applySceneResponse carry a good previous state
+    // forward when the model answers with a placeholder like "present".
+    var patch = Store.SceneAgent.applySceneResponse(data, prevScene.characters);
     if (patch) Object.assign(Store.storyData, patch);
 
     // --- Genesis starting time/date: only consulted when this call was explicitly
@@ -1853,6 +1855,18 @@ function buildWorldTierContext() {
         interactedNPCsText: interactedNPCsText,
         mentionedNpcsText: mentionedNpcsText,
         npcStatesText: npcStatesText,
+        // How many OFFSCREEN people the npc tier could actually say anything about this
+        // tick: recently-interacted, mentioned-by-name, and already-tracked NPCs who
+        // aren't in the live scene. Zero means the prompt would list "None" in every
+        // population section and — since rule 3 forbids inventing new NPCs — the only
+        // valid answer is an empty array. runNpcTier skips the call entirely in that
+        // case rather than spending a full prompt to be told nothing happened.
+        // Onscreen characters deliberately don't count: the tier is explicitly told the
+        // scene itself already covers them.
+        npcWorkItems: recentNPCs.length + mentionedNPCs.length +
+            (Store.worldData.npcStates || []).filter(function (n) {
+                return n && n.name && !onscreenNames.has(n.name);
+            }).length,
         npcsNeedingGoalText: npcsNeedingGoalText,
         npcsNeedingRoutineText: npcsNeedingRoutineText,
         relationshipsText: relationshipsText,
@@ -1929,6 +1943,14 @@ function canonicalizeNpcName(npcStates, name) {
 async function runNpcTier(isBatch, elapsedMinutes, sharedCtx) {
     var tierChatId = Store.getCurrentChatId();
     var ctx = sharedCtx || buildWorldTierContext();
+    // Nothing offscreen to report on — see npcWorkItems in buildWorldTierContext. Returning
+    // normally (rather than throwing) counts this tick as SUCCEEDED on purpose: there was no
+    // work, so the accumulator should reset like any other completed tick instead of leaving
+    // the tier permanently "due" and re-attempting the same empty call every message.
+    if ((ctx.npcWorkItems || 0) === 0) {
+        console.log("[Story Tracker] npc tier: no offscreen NPCs to update — skipping the LLM call.");
+        return;
+    }
     // Cross-tier grounding: already-generated, already-stored faction/plot events, shown
     // as established background awareness only — see WorldAgent's CROSS-TIER GROUNDING
     // section for why this is safe (nothing here is freshly synthesized for the purpose).
